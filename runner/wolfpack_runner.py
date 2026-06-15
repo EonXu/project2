@@ -1,0 +1,1356 @@
+import numpy as np
+import torch
+import time
+from typing import Any, Dict, List, Optional, Tuple
+from runner.base_runner import RecRunner
+import os
+import pandas as pd
+
+# ===== 修改点 3：新增 run 前缀工具函数，供轨迹 CSV 使用 =====
+def _get_run_csv_path(path: str) -> str:
+    """
+    将写入 run 目录下的 CSV 路径改成带 run 前缀的文件名。
+
+    例如：
+      ".../run1/progress_train_num_players_traj.csv"
+      ->
+      ".../run1/run1_progress_train_num_players_traj.csv"
+    """
+    path = str(path)
+    dir_name = os.path.dirname(path)
+    file_name = os.path.basename(path)
+
+    if not file_name.endswith(".csv"):
+        return path
+
+    run_name = os.path.basename(dir_name.rstrip(os.sep))
+
+    # 防御：只对 run1/run2/run3 这类目录生效
+    if not run_name.startswith("run"):
+        return path
+
+    prefix = run_name + "_"
+    if file_name.startswith(prefix):
+        return path
+
+    return os.path.join(dir_name, prefix + file_name)
+
+# ===== 修改点 4：所有 wolfpack_runner 轨迹 CSV 自动带 run 前缀 =====
+def _append_df_csv(path: str, df: pd.DataFrame):
+    """
+    追加写入 CSV（如果文件不存在则写入表头；存在则不写表头，直接 append）。
+    文件名会自动加 run 前缀，例如 run1_progress_eval_num_players_traj.csv。
+    """
+    path = _get_run_csv_path(path)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        df.to_csv(path, index=False)
+    else:
+        df.to_csv(path, mode="a", header=False, index=False)
+
+
+class WolfpackRunner(RecRunner):
+
+    @staticmethod
+    def _extract_first_info_dict(infos, env_i=0):
+        """
+        Robustly extract a representative info dict from env wrappers.
+
+        Common shapes:
+        - ShareDummyVecEnv: infos is np.ndarray(dtype=object) with shape (num_envs, max_player_num)
+        - Some envs: infos is list[dict] (per-agent)
+        - Some wrappers: infos is list[list[dict]] (per-env, per-agent)
+        - Rare: infos is dict
+        """
+        import numpy as np
+
+        if isinstance(infos, dict):
+            return infos
+
+        # try per-env entry
+        try:
+            per_env = infos[env_i]
+        except Exception:
+            per_env = infos
+
+        if isinstance(per_env, dict):
+            return per_env
+
+        # ShareDummyVecEnv: np.ndarray of dicts
+        if isinstance(per_env, np.ndarray):
+            try:
+                if per_env.size > 0 and isinstance(per_env.flat[0], dict):
+                    return per_env.flat[0]
+            except Exception:
+                return {}
+
+        # list/tuple of dicts
+        if isinstance(per_env, (list, tuple)):
+            try:
+                if len(per_env) > 0 and isinstance(per_env[0], dict):
+                    return per_env[0]
+            except Exception:
+                return {}
+
+        return {}
+
+    @staticmethod
+    def _infer_active_masks_from_obs(obs: np.ndarray) -> np.ndarray:
+        """
+        通过 obs 中“全 -1 向量”判断空槽位。
+        返回 shape: (num_envs, num_agents, 1)，float32，1=存在，0=不存在
+        """
+        obs_arr = np.asarray(obs)
+        if obs_arr.ndim == 2:
+            obs_arr = obs_arr[None, ...]  # (1, num_agents, obs_dim)
+        is_pad = np.all(obs_arr == -1, axis=-1, keepdims=True)
+        return (~is_pad).astype(np.float32)
+
+    @staticmethod
+    def _extract_active_masks_batch(infos, num_envs: int, num_agents: int,
+                                    fallback_obs: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        优先从 infos 取 active_masks；若没有则 fallback 用 obs 推断。
+        """
+        active_masks = np.ones((num_envs, num_agents, 1), dtype=np.float32)
+        for e in range(num_envs):
+            info_dict = WolfpackRunner._extract_first_info_dict(infos, env_i=e)
+            am = info_dict.get("active_masks", None)
+            if am is not None:
+                active_masks[e] = np.asarray(am, dtype=np.float32).reshape(num_agents, 1)
+            elif fallback_obs is not None:
+                active_masks[e] = WolfpackRunner._infer_active_masks_from_obs(fallback_obs[e])
+        return active_masks
+
+    @staticmethod
+    def _mask_rnn_states_by_dones(rnn_states, dones):
+        """
+        将 done/pad 的 slot hidden 强制置 0，避免 hidden 漂移污染后续。
+
+        同时兼容：
+        1) SDDFG/DDFG policy 返回的 torch.Tensor hidden；
+        2) VDN/QMIX/QPLEX 等原始 baseline 返回的 numpy.ndarray hidden。
+        """
+        if rnn_states is None:
+            return rnn_states
+
+        dones_arr = np.asarray(dones)
+        if dones_arr.ndim == 2:
+            dones_arr = dones_arr[None, ...]
+
+        alive = (1.0 - dones_arr.astype(np.float32)).reshape(-1, 1)
+
+        if isinstance(rnn_states, torch.Tensor):
+            alive_t = torch.as_tensor(
+                alive,
+                device=rnn_states.device,
+                dtype=rnn_states.dtype
+            )
+            return rnn_states * alive_t
+
+        # VDN / QMIX / QPLEX baseline 的 hidden 可能是 numpy.ndarray
+        if isinstance(rnn_states, np.ndarray):
+            alive_np = alive.astype(rnn_states.dtype, copy=False)
+            return rnn_states * alive_np
+
+        raise TypeError(
+            f"Unsupported rnn_states type in _mask_rnn_states_by_dones: {type(rnn_states)}"
+        )
+
+    @staticmethod
+    def _calc_adj_metrics(adj, dones, num_agents: int) -> Dict[str, float]:
+        """
+        统计当前邻接图结构质量。兼容 DDFG 原邻接生成器与 SDDFG/GAT 邻接生成器。
+
+        adj:   [B, N, F] 或 [N, F]
+        dones: [B, N, 1] 或 [N, 1]，True=死亡/空槽
+        """
+        if adj is None:
+            return {}
+
+        try:
+            adj_t = adj.detach().float() if torch.is_tensor(adj) else torch.as_tensor(adj).float()
+            if adj_t.dim() == 2:
+                adj_t = adj_t.unsqueeze(0)
+
+            B, N, F = adj_t.shape
+
+            dones_arr = np.asarray(dones)
+            if dones_arr.ndim == 2:
+                dones_arr = dones_arr[None, ...]
+            dones_arr = dones_arr.reshape(B, num_agents, -1)[..., 0]
+
+            alive = torch.as_tensor(
+                (~dones_arr.astype(bool)).astype(np.float32),
+                device=adj_t.device,
+                dtype=torch.float32
+            ).unsqueeze(-1)  # [B, N, 1]
+
+            factor_order = adj_t.sum(dim=1)              # [B, F]
+            alive_count = (adj_t * alive).sum(dim=1)     # [B, F]
+            valid_factor = (factor_order > 0) & (alive_count == factor_order)
+
+            total = float(max(B * F, 1))
+            valid_num = float(valid_factor.float().sum().item())
+
+            return {
+                "adj_valid_factor_ratio": valid_num / total,
+                "adj_empty_factor_ratio": float((factor_order == 0).float().mean().item()),
+                "adj_order1_ratio": float(((factor_order == 1) & valid_factor).float().sum().item() / total),
+                "adj_order2_ratio": float(((factor_order == 2) & valid_factor).float().sum().item() / total),
+                "adj_order3_ratio": float(((factor_order == 3) & valid_factor).float().sum().item() / total),
+                "adj_invalid_factor_ratio": float(((factor_order > 0) & (~valid_factor)).float().sum().item() / total),
+                "adj_mean_order": float(factor_order[valid_factor].mean().item()) if valid_num > 0 else 0.0,
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _mask_adj_by_dones(adj: torch.Tensor,
+                           prob_adj: torch.Tensor,
+                           dones,
+                           num_agents: int,
+                           num_factor: int):
+        """
+        DDFG/SDDFG 通用 factor-level 邻接 mask。
+
+        目标：
+        1. 死亡/空槽 agent 的行清零；
+        2. 只要某个 factor 中包含死亡/空槽节点，整条 factor 清零；
+        3. 防止 {alive, dead} 被行级 mask 后退化成伪一阶 factor；
+        4. 同时支持 DDFG 原 adj_generator_new 与 SDDFG/GAT adj_generator。
+
+        adj:      [B, N, F] 或 [N, F]
+        prob_adj: [B, N, F] 或 [N, F]，可为 None
+        dones:    [B, N, 1] / [N, 1]，True=死亡/空槽
+        """
+        if adj is None:
+            return prob_adj, adj
+
+        if not torch.is_tensor(adj):
+            adj = torch.as_tensor(adj)
+
+        device = adj.device
+
+        squeeze_batch = False
+        if adj.dim() == 2:
+            adj = adj.unsqueeze(0)
+            squeeze_batch = True
+
+        if prob_adj is not None:
+            if not torch.is_tensor(prob_adj):
+                prob_adj = torch.as_tensor(prob_adj, device=device)
+            else:
+                prob_adj = prob_adj.to(device)
+            if prob_adj.dim() == 2:
+                prob_adj = prob_adj.unsqueeze(0)
+
+        B = adj.shape[0]
+
+        dones_arr = np.asarray(dones)
+        if dones_arr.ndim == 2:
+            dones_arr = dones_arr[None, ...]
+        dones_arr = dones_arr.reshape(B, num_agents, -1)[..., 0]
+
+        alive = torch.as_tensor(
+            (~dones_arr.astype(bool)).astype(np.float32),
+            device=device,
+            dtype=torch.float32
+        ).unsqueeze(-1)  # [B, N, 1]
+
+        adj_float = adj.float()
+
+        factor_size = adj_float.sum(dim=1, keepdim=True)  # [B, 1, F]
+        alive_count = (adj_float * alive).sum(dim=1, keepdim=True)
+
+        factor_valid = ((factor_size > 0.0) & (alive_count == factor_size)).float()
+
+        adj_masked = (adj_float * alive * factor_valid).long()
+
+        if prob_adj is not None:
+            prob_adj = prob_adj.float() * alive * factor_valid
+            # 未选中/非法位置保持极小概率，避免后续 log(0)
+            prob_adj = torch.where(
+                adj_masked > 0,
+                prob_adj.clamp_min(1e-8),
+                torch.zeros_like(prob_adj)
+            )
+
+        if squeeze_batch:
+            adj_masked = adj_masked.squeeze(0)
+            if prob_adj is not None:
+                prob_adj = prob_adj.squeeze(0)
+
+        return prob_adj, adj_masked
+
+    @staticmethod
+    def _build_alive_eye(num_agents: int, dones, device):
+        """
+        构造存活 agent 的 identity self-factor。
+        输出 [B, N, N]。
+        """
+        dones_arr = np.asarray(dones)
+        if dones_arr.ndim == 2:
+            dones_arr = dones_arr[None, ...]
+
+        B = dones_arr.shape[0]
+        alive = torch.as_tensor(
+            (~dones_arr.reshape(B, num_agents, -1)[..., 0].astype(bool)).astype(np.int64),
+            device=device,
+            dtype=torch.int64
+        ).unsqueeze(-1)  # [B, N, 1]
+
+        eye = torch.eye(num_agents, dtype=torch.int64, device=device).unsqueeze(0).repeat(B, 1, 1)
+        eye = eye * alive
+        return eye
+
+    def __init__(self, config):
+        super(WolfpackRunner, self).__init__(config)
+
+        # 预热：随机策略采样若干回合填充经验池
+        # 回放/可视化时可通过 args.skip_warmup=True 跳过预热，加快启动速度
+        skip_warmup = bool(getattr(self.args, "skip_warmup", False))
+        self.start = time.time()
+        if not skip_warmup:
+            num_warmup_episodes = max((self.batch_size, self.args.num_random_episodes))
+            self.warmup(num_warmup_episodes)
+        end = time.time()
+
+        denom = max((end - self.start), 1e-6)
+        print("\n Env {} Algo {} Exp {} runs total num timesteps {}/{}, FPS {}. \n"
+              .format(self.env_name,
+                      self.algorithm_name,
+                      self.args.experiment_name,
+                      self.total_env_steps,
+                      self.num_env_steps,
+                      int(self.total_env_steps / denom)))
+
+        self.log_clear()
+        # 防御式初始化：避免在第一次训练更新发生前触发 log() 时崩溃
+        self.train_infos = [dict() for _ in getattr(self, "policy_ids", [])]
+
+    def _get_run_dir(self) -> str:
+        """获取日志目录（优先 run_dir，其次 log_dir，否则当前目录）。"""
+        rd = getattr(self, "run_dir", None)
+        if rd is None:
+            rd = getattr(self, "log_dir", None)
+        if rd is None:
+            rd = "."
+        return str(rd)
+
+    def _dump_eval_episode_step_tables(self, eval_step: int, eval_ep: int, step_info: dict, eval_id: int = 0):
+        """
+        将评估阶段步骤轨迹添加到 progress_eval_num_players_traj.csv , progress_eval_individual_rewards.csv
+        """
+        run_dir = self._get_run_dir()
+
+        # ---------- t -> num_players ----------
+        num_players = np.asarray(step_info.get("num_players", []), dtype=np.float32).reshape(-1)
+        T = int(num_players.shape[0])
+        t_idx = np.arange(T, dtype=np.int32)
+
+        if T > 0:
+            df_np_long = pd.DataFrame({
+                "eval_id": int(eval_id),
+                "step": int(eval_step),
+                "eval_ep": int(eval_ep),
+                "t": t_idx,
+                "num_players": num_players.astype(np.int32),
+            })
+            _append_df_csv(os.path.join(run_dir, "progress_eval_num_players_traj.csv"), df_np_long)
+
+        # ---------- t -> individual_rewards (WIDE FORMAT) ----------
+        ir_list = step_info.get("individual_rewards", None)
+        if ir_list is None:
+            return
+
+        rows_long = []
+        max_slots_seen = 0
+
+        for t in range(len(ir_list)):
+            arr = np.asarray(ir_list[t])
+            # expected: (max_player_num, 1) or (max_player_num,)
+            if arr.ndim == 2 and arr.shape[1] == 1:
+                arr = arr[:, 0]
+            arr = arr.reshape(-1)  # (num_slots,)
+
+            num_slots = int(arr.shape[0])
+            if num_slots > max_slots_seen:
+                max_slots_seen = num_slots
+
+            row = {
+                "eval_id": int(eval_id),
+                "step": int(eval_step),
+                "eval_ep": int(eval_ep),
+                "t": int(t),
+            }
+            # 把每个 slot 的 reward 依次摊平为列："0","1","2",...
+            for s in range(num_slots):
+                row[str(s)] = float(arr[s])
+
+            rows_long.append(row)
+
+        if len(rows_long) > 0:
+            df_ir_wide = pd.DataFrame(rows_long)
+
+            # 确保列顺序固定：eval_id, step, eval_ep, t, 0,1,2,...,max_slots_seen-1
+            reward_cols = [str(i) for i in range(max_slots_seen)]
+            df_ir_wide = df_ir_wide.reindex(columns=["eval_id", "step", "eval_ep", "t"] + reward_cols)
+
+            _append_df_csv(os.path.join(run_dir, "progress_eval_individual_rewards.csv"), df_ir_wide)
+
+    def _dump_train_episode_step_tables(self, train_step: int, step_info: dict):
+        """
+        将训练阶段的逐步动态信息写入 CSV。
+        记录频率由 collect_rollout 里基于 log_interval 控制，避免每个 episode 都写导致文件过大。
+        """
+        run_dir = self._get_run_dir()
+
+        # ---------- t -> num_players ----------
+        num_players = np.asarray(step_info.get("num_players", []), dtype=np.float32).reshape(-1)
+        if num_players.size > 0:
+            df_np = pd.DataFrame({
+                "step": int(train_step),
+                "t": np.arange(num_players.size, dtype=np.int32),
+                "num_players": num_players.astype(np.int32),
+            })
+            _append_df_csv(os.path.join(run_dir, "progress_train_num_players_traj.csv"), df_np)
+
+        # ---------- t -> active masks ----------
+        active_masks = step_info.get("active_masks", [])
+        rows_active = []
+        for t_i, am in enumerate(active_masks):
+            arr = np.asarray(am, dtype=np.float32).reshape(-1)
+            row = {
+                "step": int(train_step),
+                "t": int(t_i),
+                "active_ratio": float(arr.mean()) if arr.size > 0 else 0.0,
+            }
+            for slot_i, v in enumerate(arr):
+                row[f"active_{slot_i}"] = float(v)
+            rows_active.append(row)
+
+        if len(rows_active) > 0:
+            _append_df_csv(
+                os.path.join(run_dir, "progress_train_active_masks_traj.csv"),
+                pd.DataFrame(rows_active)
+            )
+
+        # ---------- t -> individual rewards ----------
+        ir_list = step_info.get("individual_rewards", [])
+        rows_reward = []
+        max_slots_seen = 0
+
+        for t_i, ir in enumerate(ir_list):
+            arr = np.asarray(ir, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[1] == 1:
+                arr = arr[:, 0]
+            arr = arr.reshape(-1)
+
+            max_slots_seen = max(max_slots_seen, int(arr.shape[0]))
+
+            row = {
+                "step": int(train_step),
+                "t": int(t_i),
+            }
+            for slot_i, v in enumerate(arr):
+                row[str(slot_i)] = float(v)
+            rows_reward.append(row)
+
+        if len(rows_reward) > 0:
+            df_ir = pd.DataFrame(rows_reward)
+            reward_cols = [str(i) for i in range(max_slots_seen)]
+            df_ir = df_ir.reindex(columns=["step", "t"] + reward_cols)
+            _append_df_csv(os.path.join(run_dir, "progress_train_individual_rewards.csv"), df_ir)
+
+        # ---------- t -> adj metrics ----------
+        adj_metrics = step_info.get("adj_metrics", [])
+        rows_adj = []
+        for t_i, m in enumerate(adj_metrics):
+            if not isinstance(m, dict):
+                continue
+            row = {"step": int(train_step), "t": int(t_i)}
+            row.update({k: float(v) for k, v in m.items()})
+            rows_adj.append(row)
+
+        if len(rows_adj) > 0:
+            _append_df_csv(
+                os.path.join(run_dir, "progress_train_adj_metrics_traj.csv"),
+                pd.DataFrame(rows_adj)
+            )
+
+    def eval(self):
+        """评估若干回合并做日志。
+         改进：一次评估可能包含 num_eval_episodes 个 episode，本实现会对“每一个评估 episode”
+        都导出两张随时间步变化的表（num_players、individual_rewards），并且不会重复 dump。
+        """
+        self.trainer.prep_rollout()
+
+        # 评估发生时的训练步数（评估本身不推进 total_env_steps）
+        eval_step = int(getattr(self, "total_env_steps", 0))
+
+        # 评估调用编号：用于区分不同 eval 调用，避免覆盖 per-episode 文件
+        eval_id = int(getattr(self, "_eval_call_id", 0))
+        self._eval_call_id = eval_id + 1
+
+        eval_infos: Dict[str, list] = {
+            "win_rate": [],
+            "average_episode_rewards": [],
+            "num_players": [],
+            "num_players_mean": [],
+            "num_players_min": [],
+            "num_players_max": [],
+            "num_players_std": [],
+            "join_events": [],
+            "leave_events": [],
+            "roster_change_events": [],
+            "active_ratio_mean": [],
+            "active_ratio_min": [],
+            "active_ratio_max": [],
+            "episode_real_length": [],
+            "adj_valid_factor_ratio": [],
+            "adj_empty_factor_ratio": [],
+            "adj_order1_ratio": [],
+            "adj_order2_ratio": [],
+            "adj_order3_ratio": [],
+            "adj_invalid_factor_ratio": [],
+            "adj_mean_order": [],
+        }
+
+        for ep_i in range(self.args.num_eval_episodes):
+            env_info = self.collecter(explore=False, training_episode=False, warmup=False)  # 采样一个评估 episode
+
+            # 先 dump：每个 episode 只 dump 一次
+            step_info = getattr(self, "last_episode_step_info", None)
+            if isinstance(step_info, dict):
+                self._dump_eval_episode_step_tables(eval_step=eval_step, eval_ep=ep_i,
+                                                    step_info=step_info, eval_id=eval_id)
+            # 再累计 scalar 指标（用于 progress_eval.csv）
+            for k, v in env_info.items():
+                if k not in eval_infos:
+                    eval_infos[k] = []
+                eval_infos[k].append(v)
+
+        # ==================== 修改点：eval 后计算均值，用于 best checkpoint ====================
+        self.log_env(eval_infos, suffix="eval_")
+
+        eval_summary = {}
+        for k, v in eval_infos.items():
+            try:
+                eval_summary["eval_" + k] = float(np.mean(v))
+            except Exception:
+                pass
+
+        # 保存 best eval checkpoint
+        self.maybe_save_best_eval(eval_summary)
+
+        return eval_summary
+
+    @torch.no_grad()
+    def collect_rollout(self, explore=True, training_episode=True, warmup=False):
+        """
+        收集一个完整 episode 并入缓冲，所有智能体共享同一个策略。
+        新增 exist_mask 的获取与传递。
+        :param explore: (bool) 收集此回合时是否使用探索策略。
+        :param training_episode: (bool) 此回合用于评估还是训练。
+        :param warmup: (bool) 此回合是否在预热阶段收集。
+        :return env_info: (dict) 包含有关展开数据的信息（总奖励等）。
+        """
+        env_info: Dict[str, Any] = {}
+        p_id = "policy_0"
+        policy = self.policies[p_id]
+
+        env = self.env if training_episode or warmup else self.eval_env
+
+        obs, share_obs, avail_acts = env.reset()
+
+        # ====== 可视化/录制：实时弹窗 + 同步保存 mp4（强制打印调试信息）======
+        render_enabled = bool(getattr(self.args, "render", False))
+        save_video = bool(getattr(self.args, "save_video", False))
+        video_path = getattr(self.args, "video_path", None)
+        render_fps = float(getattr(self.args, "render_fps", getattr(self.args, "fps", 10)))
+
+        # 只要给了 video_path，就认为要保存视频
+        if video_path is not None and str(video_path).strip() != "":
+            save_video = True
+        if save_video and (video_path is None or str(video_path).strip() == ""):
+            video_path = os.path.join(str(getattr(self, "run_dir", ".")), "episode.mp4")
+
+        # 统一成绝对路径，避免你找不到输出文件
+        video_path = os.path.abspath(str(video_path))
+
+        # 仅支持 DummyVecEnv 的 env.envs[0] 渲染/抓帧
+        base_env = None
+        if hasattr(env, "envs") and isinstance(getattr(env, "envs"), list) and len(env.envs) > 0:
+            base_env = env.envs[0]
+
+        print(f"[play] render_enabled={render_enabled}, save_video={save_video}", flush=True)
+        print(f"[play] video_path={video_path}", flush=True)
+        print(f"[play] base_env={'OK' if base_env is not None else 'NONE'}", flush=True)
+
+        video_writer = None
+        video_size = None
+        frame_count = 0
+        warned_no_visualizer = False
+
+        def _render_and_grab_rgb():
+            nonlocal warned_no_visualizer, render_enabled
+
+            if base_env is None:
+                return None
+
+            # 先尝试正常 render（有显示设备时弹窗+抓屏）
+            try:
+                if render_enabled:
+                    base_env.render()
+            except Exception as e:
+                msg = str(e)
+                print(f"[render] base_env.render() failed: {repr(e)}", flush=True)
+                # 无显示设备：自动关闭窗口渲染，改用离屏渲染
+                if "No available video device" in msg:
+                    render_enabled = False
+                # 继续走离屏渲染
+            except BaseException as e:
+                print(f"[render] unexpected render error: {repr(e)}", flush=True)
+                render_enabled = False
+
+            if not save_video:
+                return None
+
+            # 1) 若可用 pygame screen，则直接抓屏（仅当 render_enabled=True 且 visualizer 存在）
+            if render_enabled:
+                try:
+                    import pygame
+                    if getattr(base_env, "visualizer", None) is None:
+                        if not warned_no_visualizer:
+                            print("[grab] base_env.visualizer is None", flush=True)
+                            warned_no_visualizer = True
+                    else:
+                        screen = getattr(base_env.visualizer, "screen", None)
+                        if screen is not None:
+                            arr = pygame.surfarray.array3d(screen)  # (W,H,3)
+                            frame = np.transpose(arr, (1, 0, 2)).copy()
+                            return frame
+                except Exception as e:
+                    print(f"[grab] pygame grab failed: {repr(e)}", flush=True)
+
+            # 2) 离屏渲染：不依赖显示设备。直接用 base_env.grid 画 RGB 帧（纯 numpy）
+            try:
+                g = getattr(base_env, "grid", None)
+                if g is None:
+                    return None
+
+                # 环境里的 grid 是 list-of-lists：0/1/2/3（见 wolfpack_penalty_open.py）
+                # 这里统一转成 ndarray
+                if isinstance(g, np.ndarray):
+                    grid_arr = g
+                else:
+                    grid_arr = np.asarray(g, dtype=np.int32)
+
+                if grid_arr.ndim != 2:
+                    return None
+
+                H, W = int(grid_arr.shape[0]), int(grid_arr.shape[1])
+                cell = int(getattr(self.args, "render_cell", 20))  # 每格像素，匹配 Visualizer 的 20 更直观
+
+                # 按 Visualizer 规则配色：默认蓝；1黑；2白；3红
+                rgb = np.zeros((H, W, 3), dtype=np.uint8)
+                rgb[:] = (0, 0, 255)  # BLUE
+                rgb[grid_arr == 1] = (0, 0, 0)  # BLACK
+                rgb[grid_arr == 2] = (255, 255, 255)  # WHITE
+                rgb[grid_arr == 3] = (255, 0, 0)  # RED
+
+                # 放大到可视尺寸
+                frame = np.repeat(np.repeat(rgb, cell, axis=0), cell, axis=1)
+                return frame
+
+            except Exception as e:
+                print(f"[offscreen] render failed: {repr(e)}", flush=True)
+                return None
+
+        def _ensure_writer(frame_rgb):
+            nonlocal video_writer, video_size
+            if frame_rgb is None:
+                return
+
+            h, w = frame_rgb.shape[:2]
+            if video_writer is None:
+                os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+                try:
+                    import imageio.v2 as imageio
+                except Exception as e:
+                    raise RuntimeError(f"[video] imageio 不可用，请安装：pip install imageio imageio-ffmpeg。原因：{e}")
+
+                # 优先 libx264，失败就用 mpeg4（更兼容）
+                try:
+                    video_writer = imageio.get_writer(video_path, fps=render_fps, codec="libx264")
+                except Exception:
+                    video_writer = imageio.get_writer(video_path, fps=render_fps, codec="mpeg4")
+
+                video_size = (w, h)
+                print(f"[video] writer created. fps={render_fps}, size={video_size}", flush=True)
+
+        def _write_frame(frame_rgb):
+            nonlocal frame_count
+            if frame_rgb is None:
+                return
+            _ensure_writer(frame_rgb)
+            if video_writer is None:
+                return
+            h, w = frame_rgb.shape[:2]
+            if video_size != (w, h):
+                return
+            video_writer.append_data(frame_rgb)
+            frame_count += 1
+            if frame_count % 30 == 0:
+                print(f"[video] frames_written={frame_count}", flush=True)
+
+        # reset 后先渲染/抓首帧
+        if render_enabled or save_video:
+            frame0 = _render_and_grab_rgb()
+            _write_frame(frame0)
+            if render_enabled and render_fps > 0:
+                time.sleep(1.0 / render_fps)
+
+        # ========== Wolfpack infos 逐步轨迹（用于评估导出）==========
+        # 注意：这里记录的是“每一个 episode”的逐步信息；无论 explore=True(训练) 还是 explore=False(评估)，都会记录。
+        num_players_traj: List[int] = []
+        individual_rewards_traj: List[np.ndarray] = []  # list of (N,1)
+        active_masks_traj: List[np.ndarray] = []  # list of (N,1)
+        valid_indices_traj: List[np.ndarray] = []  # list of (N,)
+        adj_metrics_traj: List[Dict[str, float]] = []  # list of per-step adj structure metrics
+
+        # 每次 rollout 开始先清空，避免 eval() 读到上一个 episode 的残留
+        self.last_episode_step_info = None
+        # 缓存本 episode 最近一次 infos（用于 episode 级统计，如 win_rate / episode_limit）
+        last_info_dict: Optional[Dict[str, Any]] = None
+
+        # for shared policy, we concatenate obs across envs and agents
+        last_acts_batch = np.zeros((self.num_envs * self.num_agents, self.act_dim), dtype=np.float32)
+        rnn_states_batch = np.zeros((self.num_envs * self.num_agents, self.hidden_size), dtype=np.float32)
+
+        # ------- episode 级缓存（shape 与 SMACRunner/PREYRunner 完全一致） -------
+        episode_obs = {
+            p_id: np.zeros((self.episode_length + 1, self.num_envs, self.num_agents, policy.obs_dim), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_share_obs = {
+            p_id: np.zeros((self.episode_length + 1, self.num_envs, self.num_agents, policy.central_obs_dim),
+                           dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_acts = {
+            p_id: np.zeros((self.episode_length, self.num_envs, self.num_agents, self.act_dim), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_rewards = {
+            p_id: np.zeros((self.episode_length, self.num_envs, self.num_agents, 1), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_dones = {
+            p_id: np.ones((self.episode_length, self.num_envs, self.num_agents, 1), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_dones_env = {
+            p_id: np.ones((self.episode_length, self.num_envs, 1), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_avail_acts = {
+            p_id: np.zeros((self.episode_length + 1, self.num_envs, self.num_agents, self.act_dim), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_adj = {
+            p_id: np.zeros((self.episode_length + 1, self.num_envs, self.num_agents, self.num_factor), dtype=np.int64)
+            for p_id in self.policy_ids
+        }
+        episode_prob_adj = {
+            p_id: np.zeros((self.episode_length + 1, self.num_envs, self.num_agents, self.num_factor), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_qtot = {
+            p_id: np.zeros((self.episode_length, self.num_envs, 1), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        # f_v/f_q 在 PREY/SMAC 里使用了 (num_factor   num_agents) 的槽位；保持一致便于 Trainer 复用
+        episode_f_v = {
+            p_id: np.zeros((self.episode_length, self.num_envs, self.num_factor + self.num_agents, 1), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_f_q = {
+            p_id: np.zeros((self.episode_length, self.num_envs, self.num_factor + self.num_agents, 1), dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+        episode_rnn_states = {
+            p_id: np.zeros((self.episode_length + 1, self.num_envs, self.num_agents, self.hidden_size),
+                           dtype=np.float32)
+            for p_id in self.policy_ids
+        }
+
+        active_masks = self._infer_active_masks_from_obs(obs)
+        dones = (active_masks == 0)  # bool：空槽位一开始就视为 done
+
+        # -------- 采集整回合 --------
+        t = 0
+        while t < self.episode_length:
+
+            obs_batch = np.concatenate(obs)
+            states_batch = np.concatenate(share_obs)
+            avail_acts_batch = np.concatenate(avail_acts)
+
+            # ------ 与 SMACRunner/PREYRunner 同：先更新 RNN hidden ------
+            if self.algorithm_name in self.adj_correlation:  # get actions for all agents to step the env
+
+                # _, rnn_states_batch, _ = policy.get_hidden_states(obs_batch, last_acts_batch, rnn_states_batch)
+                # ====== 核心修复 2A：在 rollout 时正确重置断线/新加入者的 RNN 状态 ======
+                _, rnn_states_batch, _ = policy.get_hidden_states( obs_batch, last_acts_batch, rnn_states_batch, dones=dones.reshape(-1, 1))
+                rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
+                # =====================================================================
+
+                if self.use_dyn_graph:
+                    prob_adj, adj, _ = self.adj_network.sample(
+                        obs_batch[None, :],
+                        rnn_states_batch.unsqueeze(0),
+                        self.use_adj_init,
+                        dones,
+                        explore,
+                        self.total_env_steps
+                    )
+
+                    # ===== 修改点：DDFG/SDDFG 通用 factor-level mask =====
+                    prob_adj, adj = self._mask_adj_by_dones(
+                        adj=adj,
+                        prob_adj=prob_adj,
+                        dones=dones,
+                        num_agents=self.num_agents,
+                        num_factor=self.num_factor
+                    )
+
+                    eye = self._build_alive_eye(self.num_agents, dones, adj.device)
+                    adj_all = torch.cat([adj.cpu().detach(), eye.cpu()], dim=2)
+
+                else:
+                    # ===== 修改点：静态图同样必须按动态存活 mask 过滤 =====
+                    adj = self.adj.to(self.device) if torch.is_tensor(self.adj) else torch.as_tensor(self.adj,
+                                                                                                     device=self.device)
+                    if adj.dim() == 2:
+                        adj = adj.unsqueeze(0)
+
+                    prob_adj = torch.zeros_like(adj, dtype=torch.float32, device=adj.device)
+
+                    prob_adj, adj = self._mask_adj_by_dones(
+                        adj=adj,
+                        prob_adj=prob_adj,
+                        dones=dones,
+                        num_agents=self.num_agents,
+                        num_factor=self.num_factor
+                    )
+
+                    eye = self._build_alive_eye(self.num_agents, dones, adj.device)
+                    adj_all = torch.cat([adj.cpu().detach(), eye.cpu()], dim=2)
+
+                # 动作选择
+                if warmup:
+                    acts_batch = policy.get_random_actions(obs_batch, avail_acts_batch)
+                else:
+                    if self.algorithm_name == 'casec':
+                        acts_batch, qtot, _, f_q = policy.get_actions(rnn_states_batch.unsqueeze(0),
+                                                                      torch.tensor(avail_acts_batch),
+                                                                      t_env=self.total_env_steps,
+                                                                      explore=explore)
+                    else:
+                        acts_batch, qtot, _, f_q = policy.get_actions(
+                            obs_batch[None, :],
+                            rnn_states_batch.unsqueeze(0),
+                            torch.tensor(avail_acts_batch).to(self.device),
+                            t_env=self.total_env_steps,
+                            explore=explore,
+                            adj_input=adj_all.to(self.device),
+                            no_sequence=False,
+                            dones=torch.tensor(dones).to(self.device))
+                    if self.use_vfunction:
+                        f_v = policy.get_v_values(rnn_states_batch.unsqueeze(0), states_batch[None, :],
+                                                  adj_all.to(self.device), no_sequence=False,
+                                                  dones=torch.tensor(dones).to(self.device)
+                                                  )
+            else:
+                # 非 DDFG 算法，保持与 MPERunner/SMACRunner 一致
+                if warmup:
+                    ## completely random actions in warmup phase
+                    #acts_batch = policy.get_random_actions(obs_batch, avail_acts_batch)
+                    # advance rnn state (so shapes/logic remain consistent)
+                    # _, rnn_states_batch, _ = policy.get_hidden_states(
+                    #     obs_batch, last_acts_batch, rnn_states_batch, dones=dones.reshape(-1, 1)
+                    # )
+
+                    # warmup 阶段只采随机动作填充 replay buffer。
+                    # RNN hidden 不需要前向推进；按照当前 active mask 清理即可。
+                    acts_batch = policy.get_random_actions(obs_batch, avail_acts_batch)
+                    rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
+
+                else:
+                    acts_batch, rnn_states_batch, _ = policy.get_actions(
+                        obs_batch,
+                        last_acts_batch,
+                        rnn_states_batch,
+                        avail_acts_batch,
+                        t_env=self.total_env_steps,
+                        explore=explore
+                    )
+                    rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
+
+                # 普通 baseline 不使用动态图。仍写入 dummy adj/prob_adj，以复用 RecReplayBuffer 字段。
+                prob_adj = torch.zeros((self.num_agents, self.num_factor), dtype=torch.float32)
+                adj = torch.zeros((self.num_agents, self.num_factor), dtype=torch.int64)
+
+            # numpy 化 & 缓存
+            acts_batch = acts_batch if isinstance(acts_batch, np.ndarray) else acts_batch.cpu().detach().numpy()
+            rnn_states_batch = rnn_states_batch if isinstance(rnn_states_batch,
+                                                              np.ndarray) else rnn_states_batch.cpu().detach().numpy()
+
+            # ===== 修改点：只有当前时刻存活的 slot 才有真实上一动作；新加入 slot 下一步 prev_action 应为 0 =====
+            active_masks_curr = (~dones.squeeze(-1)).astype(np.float32).reshape(-1, 1)
+            last_acts_batch = acts_batch * active_masks_curr
+
+            env_acts = np.split(acts_batch, self.num_envs)
+
+            # Env step
+            next_obs, next_share_obs, rewards, env_dones, infos, next_avail_acts = env.step(env_acts)
+
+            # 可视化/录制：每步渲染并抓帧写入 mp4
+            if (render_enabled or save_video) and base_env is not None:
+                frame_rgb = _render_and_grab_rgb()
+                _write_frame(frame_rgb)
+                if render_enabled and render_fps > 0:
+                    time.sleep(1.0 / render_fps)
+
+            active_masks_next = self._extract_active_masks_batch(infos, self.num_envs, self.num_agents,
+                                                                 fallback_obs=next_obs)
+            dones = np.logical_or(env_dones, active_masks_next == 0)
+
+            # ========== 解析 wolfpack env 返回的 infos，并记录逐步轨迹 ==========
+            info_dict = self._extract_first_info_dict(infos, env_i=0)
+
+            if info_dict:
+                last_info_dict = info_dict
+            else:
+                info_dict = last_info_dict if isinstance(last_info_dict, dict) else {}
+
+            if "num_players" in info_dict:
+                try:
+                    num_players_traj.append(int(info_dict["num_players"]))
+                except Exception:
+                    pass
+
+            am = info_dict.get("active_masks", None)
+
+            if am is not None:
+                try:
+                    am_arr = np.asarray(am, dtype=np.float32)
+                    if am_arr.ndim == 1:
+                        am_arr = am_arr.reshape(-1, 1)
+                    if am_arr.ndim == 2:
+                        am_arr = am_arr[:, :1]
+                    active_masks_traj.append(am_arr.copy())
+                except Exception:
+                    pass
+
+            ir = info_dict.get("individual_rewards", None)
+            if ir is not None:
+                try:
+                    ir_arr = np.asarray(ir, dtype=np.float32)
+                    if ir_arr.ndim == 1:
+                        ir_arr = ir_arr.reshape(-1, 1)
+                    if ir_arr.ndim == 2:
+                        ir_arr = ir_arr[:, :1]
+                    individual_rewards_traj.append(ir_arr.copy())
+                except Exception:
+                    pass
+
+            vi = info_dict.get("valid_indices", None)
+            if vi is not None:
+                try:
+                    vi_arr = np.asarray(vi, dtype=np.int32).reshape(-1)
+                    valid_indices_traj.append(vi_arr.copy())
+                except Exception:
+                    pass
+
+            if training_episode or warmup:
+                self.total_env_steps += self.num_envs
+
+            dones_env = np.all(env_dones, axis=1)
+
+            terminate_episodes = np.any(dones_env) or t == self.episode_length - 1
+
+            '''for k in range(self.num_envs):
+                 reward_norm = self.reward_scaling(rewards[k,0])
+                 rewards[k] = reward_norm'''
+
+            # --------- 写入 episode 缓存（与 SMAC/PREY 完全一致） ---------
+            episode_obs[p_id][t] = obs
+            episode_share_obs[p_id][t] = share_obs
+            episode_acts[p_id][t] = env_acts
+            episode_rewards[p_id][t] = rewards
+            episode_rnn_states[p_id][t] = rnn_states_batch
+
+            # here dones store agent done flag of the next step
+            if self.algorithm_name in self.adj_correlation:
+                env_adj = (
+                    adj.cpu().detach().numpy()[0]
+                    if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"]
+                    else adj.cpu().detach().numpy()
+                )
+                env_prob_adj = (
+                    prob_adj.cpu().detach().numpy()[0]
+                    if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"]
+                    else prob_adj.cpu().detach().numpy()
+                )
+                episode_adj[p_id][t] = env_adj
+                episode_prob_adj[p_id][t] = env_prob_adj
+
+                # ===== 日志新增：记录每步邻接图结构质量，兼容 DDFG 与 SDDFG/GAT =====
+                try:
+                    adj_metrics_traj.append(
+                        self._calc_adj_metrics(adj, dones, self.num_agents)
+                    )
+                except Exception:
+                    pass
+
+                if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"] and not warmup:
+                    episode_qtot[p_id][t] = qtot.cpu().detach().numpy()
+                    episode_f_q[p_id][t] = f_q.cpu().detach().numpy()
+                    if self.use_vfunction:
+                        episode_f_v[p_id][t] = f_v.cpu().detach().numpy()
+
+            episode_dones[p_id][t] = dones
+            episode_dones_env[p_id][t] = dones_env
+            episode_avail_acts[p_id][t] = avail_acts
+
+            # 时间推进
+            t += 1
+            obs = next_obs
+            share_obs = next_share_obs
+            avail_acts = next_avail_acts
+
+            # This codebase assumes a single env thread in recurrent runners.
+            assert self.num_envs == 1, "Only one env is supported here."
+
+            if terminate_episodes:
+                # robustly parse infos: could be dict (per env), or array/list of per-agent dicts
+                for i in range(self.num_envs):
+                    info0 = None
+                    try:
+                        info0 = infos[i][0]
+                    except Exception:
+                        try:
+                            info0 = infos[i]
+                        except Exception:
+                            info0 = None
+                    if isinstance(info0, dict) and ('won' in info0):
+                        env_info['win_rate'] = 1 if info0['won'] else 0
+                break
+
+        # 末帧写入（与 SMAC/PREY 一致）
+        episode_obs[p_id][t] = obs
+        episode_share_obs[p_id][t] = share_obs
+        episode_avail_acts[p_id][t] = avail_acts
+
+        if self.algorithm_name in self.adj_correlation:
+            obs_batch = np.concatenate(obs)
+
+            #_, rnn_states_batch, _ = policy.get_hidden_states(obs_batch, last_acts_batch, rnn_states_batch)
+            # ====== 核心修复 2B：回合结束时同步重置 ======
+            _, rnn_states_batch, _ = policy.get_hidden_states(
+                obs_batch, last_acts_batch, rnn_states_batch, dones=dones.reshape(-1, 1)
+            )
+            rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
+            # ============================================
+
+            if self.use_dyn_graph:
+                prob_adj, adj, _ = self.adj_network.sample(
+                    obs_batch[None, :],
+                    rnn_states_batch.unsqueeze(0),
+                    self.use_adj_init,
+                    dones,
+                    explore,
+                    self.total_env_steps
+                )
+
+                prob_adj, adj = self._mask_adj_by_dones(
+                    adj=adj,
+                    prob_adj=prob_adj,
+                    dones=dones,
+                    num_agents=self.num_agents,
+                    num_factor=self.num_factor
+                )
+            else:
+                adj = self.adj.to(self.device) if torch.is_tensor(self.adj) else torch.as_tensor(self.adj,
+                                                                                                 device=self.device)
+                if adj.dim() == 2:
+                    adj = adj.unsqueeze(0)
+
+                prob_adj = torch.zeros_like(adj, dtype=torch.float32, device=adj.device)
+
+                prob_adj, adj = self._mask_adj_by_dones(
+                    adj=adj,
+                    prob_adj=prob_adj,
+                    dones=dones,
+                    num_agents=self.num_agents,
+                    num_factor=self.num_factor
+                )
+
+            rnn_states_batch = rnn_states_batch if isinstance(rnn_states_batch,
+                                                              np.ndarray) else rnn_states_batch.cpu().detach().numpy()
+            env_adj = (
+                adj.cpu().detach().numpy()[0] if self.algorithm_name in ["sddfg","ddfg",
+                                                                         "ddfg_low", "sddfg"] else adj.cpu().detach().numpy()
+            )
+            env_prob_adj = (
+                prob_adj.cpu().detach().numpy()[0]
+                if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"]
+                else prob_adj.cpu().detach().numpy()
+            )
+            episode_adj[p_id][t] = env_adj
+            episode_prob_adj[p_id][t] = env_prob_adj
+            episode_rnn_states[p_id][t] = rnn_states_batch
+
+        # 入缓冲区 & 统计
+        if explore:
+            self.num_episodes_collected += self.num_envs
+
+            ind = self.buffer.insert(self.num_envs,  # push all episodes collected in this rollout step to the buffer
+                                     episode_obs,
+                                     episode_share_obs,
+                                     episode_acts,
+                                     episode_rewards,
+                                     episode_dones,
+                                     episode_dones_env,
+                                     episode_avail_acts,
+                                     episode_adj,
+                                     episode_prob_adj,
+                                     )
+
+            if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"] and self.total_env_steps >= self.adj_begin_step and (
+            not warmup):
+                self.num_adj_episodes_collected += self.num_envs
+                rewards_normed = self.buffer.norm_reward(ind)
+
+                idx = self.adj_buffer.insert(self.num_envs,
+                                             episode_obs,
+                                             episode_share_obs,
+                                             episode_acts,
+                                             rewards_normed,
+                                             episode_dones,
+                                             episode_dones_env,
+                                             episode_avail_acts,
+                                             episode_adj,
+                                             episode_prob_adj,
+                                             episode_qtot,
+                                             episode_f_v,
+                                             episode_f_q,
+                                             episode_rnn_states)
+                self.adj_buffer.compute_advantage(idx)
+
+        # ========== 将逐步 infos 轨迹缓存起来（供 eval() 导出）==========
+        self.last_episode_step_info = {
+            "num_players": num_players_traj,
+            "individual_rewards": individual_rewards_traj,
+            "active_masks": active_masks_traj,
+            "valid_indices": valid_indices_traj,
+            "adj_metrics": adj_metrics_traj,
+        }
+
+        # episode 级标量（用于 progress/progress_eval）
+        if len(num_players_traj) > 0:
+            np_players = np.asarray(num_players_traj, dtype=np.float32)
+            env_info["num_players"] = int(np_players[-1])
+            env_info["num_players_mean"] = float(np_players.mean())
+            env_info["num_players_min"] = float(np_players.min())
+            env_info["num_players_max"] = float(np_players.max())
+            env_info["num_players_std"] = float(np_players.std())
+
+            if np_players.shape[0] > 1:
+                diff = np.diff(np_players)
+                env_info["join_events"] = float(np.maximum(diff, 0).sum())
+                env_info["leave_events"] = float(np.maximum(-diff, 0).sum())
+                env_info["roster_change_events"] = float(np.count_nonzero(diff))
+            else:
+                env_info["join_events"] = 0.0
+                env_info["leave_events"] = 0.0
+                env_info["roster_change_events"] = 0.0
+
+        if len(active_masks_traj) > 0:
+            try:
+                am_stack = np.stack([
+                    np.asarray(x, dtype=np.float32).reshape(self.num_agents, 1)
+                    for x in active_masks_traj
+                ], axis=0)
+                active_ratio_by_t = am_stack.mean(axis=(1, 2))
+                env_info["active_ratio_mean"] = float(active_ratio_by_t.mean())
+                env_info["active_ratio_min"] = float(active_ratio_by_t.min())
+                env_info["active_ratio_max"] = float(active_ratio_by_t.max())
+            except Exception:
+                pass
+
+        if len(adj_metrics_traj) > 0:
+            try:
+                metric_keys = sorted(set().union(*[m.keys() for m in adj_metrics_traj if isinstance(m, dict)]))
+                for k in metric_keys:
+                    vals = [float(m.get(k, 0.0)) for m in adj_metrics_traj if isinstance(m, dict)]
+                    if len(vals) > 0:
+                        env_info[k] = float(np.mean(vals))
+            except Exception:
+                pass
+
+        env_info["episode_real_length"] = int(t)
+
+        if isinstance(last_info_dict, dict):
+            if "won" in last_info_dict:
+                try:
+                    env_info["win_rate"] = 1 if bool(last_info_dict["won"]) else 0
+                except Exception:
+                    pass
+
+        env_info.setdefault("win_rate", 0)
+        env_info.setdefault("num_players", 0)
+        env_info.setdefault("num_players_mean", float(env_info["num_players"]))
+        env_info.setdefault("num_players_min", float(env_info["num_players"]))
+        env_info.setdefault("num_players_max", float(env_info["num_players"]))
+        env_info.setdefault("num_players_std", 0.0)
+        env_info.setdefault("join_events", 0.0)
+        env_info.setdefault("leave_events", 0.0)
+        env_info.setdefault("roster_change_events", 0.0)
+        env_info.setdefault("active_ratio_mean", 0.0)
+        env_info.setdefault("active_ratio_min", 0.0)
+        env_info.setdefault("active_ratio_max", 0.0)
+        env_info.setdefault("episode_real_length", int(t))
+
+        env_info['average_episode_rewards'] = np.sum(episode_rewards[p_id][:, 0, 0, 0])
+        # ===== 日志新增：训练阶段也低频导出逐步轨迹 CSV =====
+        # eval 阶段已经由 eval() 调用 _dump_eval_episode_step_tables；
+        # 这里仅对训练 episode 按 log_interval 导出，避免文件过大。
+        if training_episode and (not warmup):
+            try:
+                should_dump_train_traj = (
+                    self.total_env_steps > 0 and
+                    ((self.total_env_steps - getattr(self, "last_log_T", 0)) / max(float(self.log_interval), 1.0)) >= 1
+                )
+                if should_dump_train_traj and isinstance(self.last_episode_step_info, dict):
+                    self._dump_train_episode_step_tables(
+                        train_step=int(self.total_env_steps),
+                        step_info=self.last_episode_step_info
+                    )
+            except Exception as e:
+                print(f"[log] dump train step tables failed: {repr(e)}", flush=True)
+
+        # 关闭视频写入器（确保 mp4 文件落盘）
+        try:
+            if video_writer is not None:
+                video_writer.close()
+                print(f"[video] done. total_frames={frame_count}", flush=True)
+                print(f"[video] saved: {video_path}", flush=True)
+            else:
+                print("[video] writer was never created (0 frames captured).", flush=True)
+                print(f"[video] expected path: {video_path}", flush=True)
+        except Exception as e:
+            print(f"[video] close failed: {repr(e)}", flush=True)
+
+        return env_info
+
+
+
+    def log(self):
+        """See parent class."""
+        end = time.time()
+        print(
+            "\n Env {} Algo {} Exp {} runs total num timesteps {}/{}, FPS {}. \n".format(
+                self.env_name,
+                self.algorithm_name,
+                self.args.experiment_name,
+                self.total_env_steps,
+                self.num_env_steps,
+                int(self.total_env_steps / (end - self.start)),
+            )
+        )
+
+        # 防御：若在训练尚未产生 train_infos 前触发 log，则用空 dict 占位
+        train_infos = getattr(self, "train_infos", None)
+        if (not isinstance(train_infos, (list, tuple))) or (len(train_infos) != len(self.policy_ids)):
+            train_infos = [dict() for _ in self.policy_ids]
+            self.train_infos = train_infos
+
+        for p_id, train_info in zip(self.policy_ids, self.train_infos):
+            self.log_train(p_id, train_info)
+
+        # ===== 日志新增：记录动作探索 epsilon 与邻接探索 adj_epsilon =====
+        schedule_info = {}
+        try:
+            p0 = self.policies[self.policy_ids[0]]
+            if hasattr(p0, "exploration"):
+                schedule_info["epsilon"] = float(p0.exploration.eval(self.total_env_steps))
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.adj_network, "exploration"):
+                schedule_info["adj_epsilon"] = float(self.adj_network.exploration.eval(self.total_env_steps))
+        except Exception:
+            pass
+
+        for k, v in schedule_info.items():
+            tag = "schedule/" + k
+            if self.use_wandb:
+                # 不在 wolfpack_runner.py 里直接 import wandb；
+                # 通过 log_env 写入 env_infos 更稳。这里仅写入 TensorBoard 时可用。
+                pass
+            else:
+                self.writter.add_scalar(tag, v, self.total_env_steps)
+
+        # 同时放进 env_infos，让 progress.csv 也能记录 epsilon/adj_epsilon
+        for k, v in schedule_info.items():
+            if k not in self.env_infos:
+                self.env_infos[k] = []
+            self.env_infos[k].append(v)
+
+        self.log_env(self.env_infos)
+        self.log_clear()
+
+    def log_clear(self):
+        """See parent class."""
+        self.env_infos = {
+            "win_rate": [],
+            "average_episode_rewards": [],
+
+            # episode 末尾人数
+            "num_players": [],
+
+            # episode 内动态人数统计
+            "num_players_mean": [],
+            "num_players_min": [],
+            "num_players_max": [],
+            "num_players_std": [],
+            "join_events": [],
+            "leave_events": [],
+            "roster_change_events": [],
+
+            # active mask 覆盖率
+            "active_ratio_mean": [],
+            "active_ratio_min": [],
+            "active_ratio_max": [],
+
+            # episode 长度
+            "episode_real_length": [],
+
+            # 邻接图结构质量
+            "adj_valid_factor_ratio": [],
+            "adj_empty_factor_ratio": [],
+            "adj_order1_ratio": [],
+            "adj_order2_ratio": [],
+            "adj_order3_ratio": [],
+            "adj_invalid_factor_ratio": [],
+            "adj_mean_order": [],
+
+            # 探索强度
+            "epsilon": [],
+            "adj_epsilon": [],
+        }
