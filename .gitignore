@@ -1,11 +1,11 @@
 # 训练输出数据，不上传
-scripts/results/
+#scripts/results/
 *.csv
 *.pth
 *.pt
 *.log
-scripts/*/models/
-scripts/*/logs/
+#scripts/*/models/
+#scripts/*/logs/
 
 # Python 缓存文件
 __pycache__/
@@ -22,3 +22,5 @@ __pycache__/
 # 系统隐藏文件
 .DS_Store
 Thumbs.db
+
+**/events.out.tfevents*
