@@ -1103,7 +1103,7 @@ class WolfpackPenaltyOpen(gym.Env):
 
         def_orientation = 0
         alive_food_positions = [pos for i, pos in enumerate(self.food_positions) if self.food_alive_statuses[i]]
-        available_pos = list(set(self.possibleCoordinates) - set(self.player_positions) - set(alive_food_positions))
+        available_pos = sorted(set(self.possibleCoordinates) - set(self.player_positions) - set(alive_food_positions))
         if not available_pos:
             return
 

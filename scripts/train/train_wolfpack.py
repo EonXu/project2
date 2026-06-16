@@ -1,4 +1,6 @@
 import os, sys
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("PYTHONHASHSEED", "0")
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -251,9 +253,23 @@ def main(args):
         os.makedirs(str(run_dir))
 
     # 随机种子
+    import random
     torch.manual_seed(all_args.seed)
-    torch.cuda.manual_seed_all(all_args.seed)
+    random.seed(all_args.seed)
     np.random.seed(all_args.seed)
+    torch.manual_seed(all_args.seed)
+    torch.cuda.manual_seed(all_args.seed)
+    torch.cuda.manual_seed_all(all_args.seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    except Exception:
+        pass
 
     # init wandb
     if all_args.use_wandb:
