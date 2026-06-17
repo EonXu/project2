@@ -3,12 +3,14 @@ from .util import get_dim_from_space
 from .segment_tree import SumSegmentTree, MinSegmentTree
 import torch
 
+
 def _cast(x):
     return x.transpose(2, 0, 1, 3)
 
 
 class AdjBuffer(object):
-    def __init__(self, policy_info, policy_agents, num_factor, buffer_size, episode_length, use_same_share_obs, use_avail_acts,use_reward_normalization=False,gamma=0.97,gae_lambda=0.95,hidden_size=64, seed=0):
+    def __init__(self, policy_info, policy_agents, num_factor, buffer_size, episode_length, use_same_share_obs,
+                 use_avail_acts, use_reward_normalization=False, gamma=0.97, gae_lambda=0.95, hidden_size=64, seed=0):
         """
         Replay buffer class for training RNN policies. Stores entire episodes rather than single transitions.
 
@@ -44,8 +46,9 @@ class AdjBuffer(object):
 
     def __len__(self):
         return self.policy_buffers['policy_0'].filled_i
-      
-    def insert(self, num_insert_episodes, obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj=None,prob_adj=None,q_tot=None,f_v=None,f_q=None,rnn_states=None):
+
+    def insert(self, num_insert_episodes, obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj=None,
+               prob_adj=None, q_tot=None, f_v=None, f_q=None, rnn_states=None):
         """
         Insert a set of episodes into buffer. If the buffer size overflows, old episodes are dropped.
 
@@ -66,8 +69,10 @@ class AdjBuffer(object):
                                                          np.array(share_obs[p_id]), np.array(acts[p_id]),
                                                          np.array(rewards[p_id]), np.array(dones[p_id]),
                                                          np.array(dones_env[p_id]), np.array(avail_acts[p_id]),
-                                                         np.array(adj[p_id]),np.array(prob_adj[p_id]),np.array(q_tot[p_id]),
-                                                         np.array(f_v[p_id]), np.array(f_q[p_id]), np.array(rnn_states[p_id]))
+                                                         np.array(adj[p_id]), np.array(prob_adj[p_id]),
+                                                         np.array(q_tot[p_id]),
+                                                         np.array(f_v[p_id]), np.array(f_q[p_id]),
+                                                         np.array(rnn_states[p_id]))
         return idx_range
 
     '''def sample(self, batch_size,data_chunk_length,num_mini_batch):
@@ -84,23 +89,26 @@ class AdjBuffer(object):
         :return: valid_transition: (dict) maps policy_id to whether each sampled transition is valid or not (invalid if corresponding agent is dead)
         :return: avail_acts: (dict) maps policy_id to available actions corresponding to that policy
         """
-        inds = np.random.choice(self.__len__(), batch_size)
+        replace = self.__len__() < batch_size
+        inds = self.rng.choice(self.__len__(), batch_size, replace=replace)
         #import pdb;pdb.set_trace()
         obs_batch, share_obs_batch, dones_batch, dones_env_batch, adj_batch, prob_adj_batch, advantages_batch, f_advts_batch, rnn_obs_batch = {}, {}, {}, {}, {}, {}, {}, {}, {}
         for p_id in self.policy_info.keys():
             obs_batch[p_id], share_obs_batch[p_id], dones_batch[p_id], dones_env_batch[p_id], adj_batch[p_id], prob_adj_batch[p_id], advantages_batch[p_id], f_advts_batch[p_id], rnn_obs_batch[p_id] = self.policy_buffers[p_id].sample_inds(inds,data_chunk_length,num_mini_batch)
 
         return obs_batch, share_obs_batch, dones_batch, dones_env_batch, adj_batch, prob_adj_batch, advantages_batch, f_advts_batch, rnn_obs_batch'''
-        
+
     def compute_advantage(self, idx, value_normalizer=None):
 
         for p_id in self.policy_info.keys():
             self.policy_buffers[p_id].compute_advantage(idx)
         return idx
 
+
 class AdjPolicyBuffer(object):
     def __init__(self, buffer_size, episode_length, num_agents, num_factor, obs_space, share_obs_space, act_space,
-                 use_same_share_obs, use_avail_acts, use_reward_normalization=False,gamma=0.97,gae_lambda=0.95,hidden_size=64, seed=0):
+                 use_same_share_obs, use_avail_acts, use_reward_normalization=False, gamma=0.97, gae_lambda=0.95,
+                 hidden_size=64, seed=0):
         """
         Buffer class containing buffer data corresponding to a single policy.
 
@@ -160,45 +168,50 @@ class AdjPolicyBuffer(object):
         # default to done being True
         self.dones = np.ones_like(self.rewards, dtype=np.float32)
         self.dones_env = np.ones((self.episode_length, self.buffer_size, 1), dtype=np.float32)
-        self.adj = np.zeros((self.episode_length+1,self.buffer_size, self.num_agents, self.num_factor), dtype=np.int64)
-        self.prob_adj = np.zeros((self.episode_length+1,self.buffer_size, self.num_agents, self.num_factor), dtype=np.float32)
+        self.adj = np.zeros((self.episode_length + 1, self.buffer_size, self.num_agents, self.num_factor),
+                            dtype=np.int64)
+        self.prob_adj = np.zeros((self.episode_length + 1, self.buffer_size, self.num_agents, self.num_factor),
+                                 dtype=np.float32)
         self.qtot = np.zeros((self.episode_length, self.buffer_size, 1), dtype=np.float32)
         self.margin_q = np.zeros((self.episode_length, self.buffer_size, self.num_agents, 1), dtype=np.float32)
-        self.f_q = np.zeros((self.episode_length, self.buffer_size, self.num_factor+self.num_agents, 1), dtype=np.float32)
+        self.f_q = np.zeros((self.episode_length, self.buffer_size, self.num_factor + self.num_agents, 1),
+                            dtype=np.float32)
         self.advantage = np.zeros((self.episode_length, self.buffer_size, 1), dtype=np.float32)
-        self.f_v = np.zeros((self.episode_length, self.buffer_size, self.num_factor+self.num_agents, 1), dtype=np.float32)
+        self.f_v = np.zeros((self.episode_length, self.buffer_size, self.num_factor + self.num_agents, 1),
+                            dtype=np.float32)
         self.f_advt = np.zeros((self.episode_length, self.buffer_size, self.num_factor, 1), dtype=np.float32)
-        self.rnn_obs = np.zeros((self.episode_length + 1, self.buffer_size,self.num_agents, self.hidden_size), dtype=np.float32)
-
+        self.rnn_obs = np.zeros((self.episode_length + 1, self.buffer_size, self.num_agents, self.hidden_size),
+                                dtype=np.float32)
 
     def __len__(self):
-        return self.filled_i      
+        return self.filled_i
+
     def compute_advantage(self, idx, value_normalizer=None):
-        
+
         gae = 0
-        m_gae = np.zeros((len(idx),self.num_agents, 1), dtype=np.float32)
-        f_gae = np.zeros((len(idx),self.num_factor, 1), dtype=np.float32)
+        m_gae = np.zeros((len(idx), self.num_agents, 1), dtype=np.float32)
+        f_gae = np.zeros((len(idx), self.num_factor, 1), dtype=np.float32)
         '''delta = 1/self.gamma * (self.rewards[step-1,idx,0] + self.gamma * value_normalizer.denormalize(self.qtot[step,idx]).cpu().numpy() * (1-self.dones_env[step-1,idx]) -  value_normalizer.denormalize(self.qtot[step-1,idx]).cpu().numpy())
             gae = delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * gae
             self.advantage[step,idx] = gae    
             f_delta = 1/self.gamma * (self.rewards[step,idx,0] + self.gamma *  value_normalizer.denormalize(self.f_q[step,idx]).cpu().numpy() * (1-self.dones_env[step-1,idx]) -  value_normalizer.denormalize(self.f_q[step-1,idx]).cpu().numpy())
             f_gae = f_delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * f_gae
             self.f_advt[step,idx] = f_gae
-            
+
             f_delta = 1/self.gamma * (self.rewards[step,idx,0] + self.gamma *  self.f_q[step,idx] * (1-self.dones_env[step-1,idx]) -  self.f_q[step-1,idx])
             f_gae = f_delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * f_gae'''
-        #self.f_advt = self.f_q
-        #import pdb;pdb.set_trace()
-        for step in reversed(range(0,self.rewards.shape[0])):
-            #value_normalizer.denormalize(self.qtot[step,idx]
-            f_delta = self.f_q[step,idx,:self.num_factor] -  self.f_v[step,idx,:self.num_factor]
-            f_gae = f_delta + self.gamma * self.gae_lambda * (1-self.dones_env[step,idx]) * f_gae
-            self.f_advt[step,idx] = f_gae
-            #self.f_advt[step,idx] = self.f_v[step,idx,:self.num_factor]
+        # self.f_advt = self.f_q
+        # import pdb;pdb.set_trace()
+        for step in reversed(range(0, self.rewards.shape[0])):
+            # value_normalizer.denormalize(self.qtot[step,idx]
+            f_delta = self.f_q[step, idx, :self.num_factor] - self.f_v[step, idx, :self.num_factor]
+            f_gae = f_delta + self.gamma * self.gae_lambda * (1 - self.dones_env[step, idx]) * f_gae
+            self.f_advt[step, idx] = f_gae
+            # self.f_advt[step,idx] = self.f_v[step,idx,:self.num_factor]
             '''delta = self.qtot[step,idx] -  self.f_v[step,idx].sum()
             gae = delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * gae
             self.advantage[step,idx] = gae'''
-            
+
             '''if step == self.rewards.shape[0]-1:
                 delta = self.rewards[step,idx,0] - self.f_v[step,idx].sum()
             else:
@@ -206,17 +219,17 @@ class AdjPolicyBuffer(object):
                 (1-self.dones_env[step,idx]) -  self.f_v[step,idx].sum()
             gae = delta + self.gamma * self.gae_lambda * (1-self.dones_env[step,idx]) * gae
             self.advantage[step,idx] = gae'''
-            
+
         '''back_reward = 0 
         for step in reversed(range(0,self.episode_length)):
             discount_reward = self.rewards[step,idx,0] + self.gamma * back_reward
             self.advantage[step,idx] = discount_reward
             back_reward = discount_reward'''
-           
+
         return idx
-    
-    
-    def insert(self, num_insert_episodes, obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj=None, prob_adj=None,qtot=None,f_v=None,f_q=None,rnn_obs=None):
+
+    def insert(self, num_insert_episodes, obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj=None,
+               prob_adj=None, qtot=None, f_v=None, f_q=None, rnn_obs=None):
         """
         Insert a set of episodes corresponding to this policy into buffer. If the buffer size overflows, old transitions are dropped.
 
@@ -247,21 +260,19 @@ class AdjPolicyBuffer(object):
         if self.use_same_share_obs:
             # remove agent dimension since all agents share centralized observation
             share_obs = share_obs[:, :, 0]
-        
+
         self.obs[:, idx_range] = obs.copy()
         self.share_obs[:, idx_range] = share_obs.copy()
         self.acts[:, idx_range] = acts.copy()
         self.rewards[:, idx_range] = rewards.copy()
         self.dones[:, idx_range] = dones.copy()
         self.dones_env[:, idx_range] = dones_env.copy()
-        self.adj[:,idx_range] =adj.copy()
-        self.prob_adj[:,idx_range] =prob_adj.copy()
-        self.qtot[:,idx_range] =qtot.copy()
-        self.f_v[:,idx_range] = f_v.copy()
-        self.f_q[:,idx_range] = f_q.copy()
-        self.rnn_obs[:,idx_range] =rnn_obs.copy()
-        
-        
+        self.adj[:, idx_range] = adj.copy()
+        self.prob_adj[:, idx_range] = prob_adj.copy()
+        self.qtot[:, idx_range] = qtot.copy()
+        self.f_v[:, idx_range] = f_v.copy()
+        self.f_q[:, idx_range] = f_q.copy()
+        self.rnn_obs[:, idx_range] = rnn_obs.copy()
 
         if self.use_avail_acts:
             self.avail_acts[:, idx_range] = avail_acts.copy()
@@ -479,7 +490,3 @@ class AdjPolicyBuffer(object):
                 np.stack(f_advts_batch, axis=0),
                 np.stack(rnn_obs_batch, axis=0),
             )
- 
-
-
-

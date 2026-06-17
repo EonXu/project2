@@ -619,9 +619,9 @@ class R_SDDFGPolicy(MLPPolicy):
                 greedy_action = actions[i]
                 if explore:
                     eps = self.exploration.eval(t_env)
-                    rand_number = np.random.rand(self.n_agents)
+                    rand_number = self.rng.rand(self.n_agents)
                     # random actions sample uniformly from action space
-                    random_action = Categorical(logits=torch.ones(self.n_agents, self.act_dim[i])).sample().numpy()
+                    random_action = self.rng.randint(0, self.act_dim[i], size=self.n_agents)
                     take_random = (rand_number < eps).astype(int)
                     action = (1 - take_random) * to_numpy(greedy_action) + take_random * random_action
                     onehot_action = make_onehot(action, self.act_dim[i])
