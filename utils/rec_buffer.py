@@ -9,7 +9,7 @@ def _cast(x):
 
 class RecReplayBuffer(object):
     def __init__(self, policy_info, policy_agents, num_factor, buffer_size, episode_length, use_same_share_obs, use_avail_acts,
-                 use_reward_normalization=False):
+                 use_reward_normalization=False, seed=0):
         """
         Replay buffer class for training RNN policies. Stores entire episodes rather than single transitions.
 
@@ -21,6 +21,7 @@ class RecReplayBuffer(object):
         :param use_reward_normalization: (bool) whether to use reward normalization.
         """
         self.policy_info = policy_info
+        self.rng = np.random.RandomState(int(seed))
 
         self.policy_buffers = {p_id: RecPolicyBuffer(buffer_size,
                                                      episode_length,
@@ -75,7 +76,8 @@ class RecReplayBuffer(object):
         :return: valid_transition: (dict) maps policy_id to whether each sampled transition is valid or not (invalid if corresponding agent is dead)
         :return: avail_acts: (dict) maps policy_id to available actions corresponding to that policy
         """
-        inds = np.random.choice(self.__len__(), batch_size)
+        replace = self.__len__() < batch_size
+        inds = self.rng.choice(self.__len__(), batch_size, replace=replace)
         obs, share_obs, acts, rewards, dones, dones_env, avail_acts,adj,prob_adj = {}, {}, {}, {}, {}, {}, {}, {}, {}
         #import pdb;pdb.set_trace()
         for p_id in self.policy_info.keys():
@@ -281,7 +283,7 @@ class RecPolicyBuffer(object):
       
 class PrioritizedRecReplayBuffer(RecReplayBuffer):
     def __init__(self, alpha, policy_info, policy_agents, buffer_size, episode_length, use_same_share_obs,
-                 use_avail_acts, use_reward_normalization=False):
+                 use_avail_acts, use_reward_normalization=False, seed=0):
         """Prioritized replay buffer class for training RNN policies. See parent class."""
         super(PrioritizedRecReplayBuffer, self).__init__(policy_info, policy_agents, buffer_size,
                                                          episode_length, use_same_share_obs, use_avail_acts,
@@ -310,7 +312,7 @@ class PrioritizedRecReplayBuffer(RecReplayBuffer):
 
     def _sample_proportional(self, batch_size, p_id=None):
         total = self._it_sums[p_id].sum(0, len(self) - 1)
-        mass = np.random.random(size=batch_size) * total
+        mass = self.rng.random_sample(size=batch_size) * total
         idx = self._it_sums[p_id].find_prefixsum_idx(mass)
         return idx
 

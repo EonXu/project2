@@ -15,29 +15,49 @@ class Agent(object):
         return self.obs_type
 
 class DQNAgent(Agent):
-    def __init__(self, agent_id, args=None, obs_type="partial_obs", obs_height=9, obs_width=17, mode="test"):
+    def __init__(self, agent_id, args=None, obs_type="partial_obs",
+                 obs_height=9, obs_width=17, mode="test"):
         super(DQNAgent, self).__init__(agent_id, obs_type)
+
+        self.agent_id = agent_id
         self.obs_type = obs_type
-        self.args = args
+        self.args = {} if args is None else args
         self.color = (255, 0, 0)
-        self.experience_replay = ReplayMemoryLite(state_h=obs_height, state_w=obs_width,
-                                                  with_gpu=self.args['with_gpu'])
-        self.dqn_net = DQN(17,9,32,self.args['max_seq_length'],7, mode="partial")
-
-        # if self.args['with_gpu']:
-        #     self.dqn_net.cuda()
-        #     self.dqn_net.device = "cuda:0"
-        #     self.target_dqn_net.cuda()
-        #     self.target_dqn_net.device = "cuda:0"
-
         self.mode = mode
+
+        # 私有 RNG，不再使用 random.random / np.random 全局状态
+        base_seed = int(self.args.get("seed", 0))
+        self.seed = base_seed + int(agent_id) * 1009
+        self.rng = np.random.RandomState(self.seed)
+
+        self.experience_replay = ReplayMemoryLite(
+            state_h=obs_height,
+            state_w=obs_width,
+            with_gpu=self.args.get("with_gpu", False),
+            seed=self.seed + 17,
+        )
+
+        self.dqn_net = DQN(
+            17, 9, 32,
+            self.args["max_seq_length"],
+            7,
+            mode="partial"
+        )
+
         if not self.mode == "test":
-            self.optimizer = optim.Adam(self.dqn_net.parameters(), lr=self.args['lr'])
-            self.target_dqn_net = DQN(17, 9, 32, self.args['max_seq_length'], 7, mode="partial")
+            self.optimizer = optim.Adam(self.dqn_net.parameters(), lr=self.args["lr"])
+            self.target_dqn_net = DQN(
+                17, 9, 32,
+                self.args["max_seq_length"],
+                7,
+                mode="partial"
+            )
             hard_copy(self.target_dqn_net, self.dqn_net)
 
-        self.recent_obs_storage = np.zeros([self.args['max_seq_length'], obs_height, obs_width, 3])
-
+        self.recent_obs_storage = np.zeros(
+            [self.args["max_seq_length"], obs_height, obs_width, 3],
+            dtype=np.float32
+        )
 
     def load_parameters(self, filename):
         self.dqn_net.load_state_dict(torch.load(filename, map_location=lambda storage, loc: storage))
@@ -46,16 +66,27 @@ class DQNAgent(Agent):
     def save_parameters(self, filename):
         torch.save(self.dqn_net.state_dict(), filename)
 
-    def act(self, obs,added_features=None, mode="train", epsilon=0.01):
+    def act(self, obs, added_features=None, mode="train", epsilon=0.01):
         self.recent_obs_storage = np.roll(self.recent_obs_storage, axis=0, shift=-1)
         self.recent_obs_storage[-1] = obs
-        net_inp = torch.Tensor([self.recent_obs_storage.transpose([0, 3, 1, 2])])
-        _, indices = torch.max(self.dqn_net(net_inp), dim=-1)
-        # Implement resets
-        if not self.mode=="test":
-            if random.random() < epsilon:
-                indices = random.randint(0,6)
-        return indices
+
+        net_inp = torch.as_tensor(
+            self.recent_obs_storage.transpose([0, 3, 1, 2])[None],
+            dtype=torch.float32
+        )
+
+        with torch.no_grad():
+            _, indices = torch.max(self.dqn_net(net_inp), dim=-1)
+
+        action = int(indices.item())
+
+        # 当前 wolfpack 里 DQNAgent 默认 mode="test"，通常不会进入此分支；
+        # 保留确定性私有 RNG，防止后续把 prey 改成 train/eval-random 时失控。
+        if self.mode != "test":
+            if self.rng.rand() < float(epsilon):
+                action = int(self.rng.randint(0, 7))
+
+        return action
 
     def store_exp(self, exp):
         self.experience_replay.insert(exp)

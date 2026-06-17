@@ -319,7 +319,9 @@ class RecRunner(object):
                                                      self.episode_length,
                                                      self.use_same_share_obs,
                                                      self.use_avail_acts,
-                                                     self.use_reward_normalization)
+                                                     self.use_reward_normalization,
+                                                     seed=int(self.args.seed) + 410000,
+                                                     )
         else:
             # RecReplayBuffer 用于存储 recurrent（序列）数据，支持按 policy 存储
             self.buffer = RecReplayBuffer(self.policy_info,
@@ -329,7 +331,9 @@ class RecRunner(object):
                                           self.episode_length,
                                           self.use_same_share_obs,
                                           self.use_avail_acts,
-                                          self.use_reward_normalization)
+                                          self.use_reward_normalization,
+                                          seed=int(self.args.seed) + 410000,
+                                          )
 
         # 邻接缓冲区，用于存储用于训练动态邻接网络的数据（含 gae/gamma/hidden 等）
         self.adj_buffer = AdjBuffer(self.policy_info,
@@ -342,7 +346,9 @@ class RecRunner(object):
                                     self.use_reward_normalization,
                                     self.gamma,
                                     self.gae_lambda,
-                                    self.hidden_size)
+                                    self.hidden_size,
+                                    seed=int(self.args.seed) + 420000,
+                                    )
 
     def run(self):
         """Collect a training episode and perform appropriate training, saving, logging, and evaluation steps."""

@@ -8,7 +8,7 @@ def _cast(x):
 
 
 class AdjBuffer(object):
-    def __init__(self, policy_info, policy_agents, num_factor, buffer_size, episode_length, use_same_share_obs, use_avail_acts,use_reward_normalization=False,gamma=0.97,gae_lambda=0.95,hidden_size=64):
+    def __init__(self, policy_info, policy_agents, num_factor, buffer_size, episode_length, use_same_share_obs, use_avail_acts,use_reward_normalization=False,gamma=0.97,gae_lambda=0.95,hidden_size=64, seed=0):
         """
         Replay buffer class for training RNN policies. Stores entire episodes rather than single transitions.
 
@@ -20,21 +20,27 @@ class AdjBuffer(object):
         :param use_reward_normalization: (bool) whether to use reward normalization.
         """
         self.policy_info = policy_info
+        self.rng = np.random.RandomState(int(seed))
 
-        self.policy_buffers = {p_id: AdjPolicyBuffer(buffer_size,
-                                                     episode_length,
-                                                     len(policy_agents[p_id]),
-                                                     num_factor,
-                                                     self.policy_info[p_id]['obs_space'],
-                                                     self.policy_info[p_id]['share_obs_space'],
-                                                     self.policy_info[p_id]['act_space'],
-                                                     use_same_share_obs,
-                                                     use_avail_acts,
-                                                     use_reward_normalization,
-                                                     gamma,
-                                                     gae_lambda,
-                                                     hidden_size)
-                               for p_id in self.policy_info.keys()}
+        self.policy_buffers = {
+            p_id: AdjPolicyBuffer(
+                buffer_size,
+                episode_length,
+                len(policy_agents[p_id]),
+                num_factor,
+                self.policy_info[p_id]['obs_space'],
+                self.policy_info[p_id]['share_obs_space'],
+                self.policy_info[p_id]['act_space'],
+                use_same_share_obs,
+                use_avail_acts,
+                use_reward_normalization,
+                gamma,
+                gae_lambda,
+                hidden_size,
+                seed=int(seed) + 1000 + i,
+            )
+            for i, p_id in enumerate(self.policy_info.keys())
+        }
 
     def __len__(self):
         return self.policy_buffers['policy_0'].filled_i
@@ -94,7 +100,7 @@ class AdjBuffer(object):
 
 class AdjPolicyBuffer(object):
     def __init__(self, buffer_size, episode_length, num_agents, num_factor, obs_space, share_obs_space, act_space,
-                 use_same_share_obs, use_avail_acts, use_reward_normalization=False,gamma=0.97,gae_lambda=0.95,hidden_size=64):
+                 use_same_share_obs, use_avail_acts, use_reward_normalization=False,gamma=0.97,gae_lambda=0.95,hidden_size=64, seed=0):
         """
         Buffer class containing buffer data corresponding to a single policy.
 
@@ -120,6 +126,8 @@ class AdjPolicyBuffer(object):
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.hidden_size = hidden_size
+
+        self.rng = np.random.RandomState(int(seed))
         # obs
         if obs_space.__class__.__name__ == 'Box':
             obs_shape = obs_space.shape
@@ -384,7 +392,7 @@ class AdjPolicyBuffer(object):
         num_mini_batch = max(1, min(int(num_mini_batch), data_chunks))
         mini_batch_size = max(1, data_chunks // num_mini_batch)
 
-        rand = torch.randperm(data_chunks).numpy()
+        rand = self.rng.permutation(data_chunks)
         sampler = [
             rand[i * mini_batch_size:(i + 1) * mini_batch_size]
             for i in range(num_mini_batch)

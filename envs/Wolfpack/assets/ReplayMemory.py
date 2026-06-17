@@ -4,7 +4,7 @@ import torch
 
 class ReplayMemoryLite(object):
     def __init__(self, max_capacity=1000, state_h=25, state_w=25, len_seq=5, with_added=False, added_dim=0,
-                 with_gpu=False):
+                 with_gpu=False, seed=0):
         self.max_capacity = max_capacity
         self.state_h = state_h
         self.state_w = state_w
@@ -17,7 +17,7 @@ class ReplayMemoryLite(object):
         self.device = 'cpu'
         # if with_gpu:
         #     self.device = 'cuda:0'
-
+        self.rng = np.random.RandomState(int(seed))
         self.with_added = with_added
         if self.with_added:
             self.added_dim = added_dim
@@ -66,7 +66,7 @@ class ReplayMemoryLite(object):
 
     def sample(self,batch_size, idxes=None):
         if batch_size < self.size:
-            sampled_idx = sample(range(self.size), batch_size)
+            sampled_idx = self.rng.choice(self.size, batch_size, replace=False).tolist()
             if idxes != None:
                 sampled_idx = idxes
             shifted_idxes = [[a + self.len_seq - 1 - x for a in sampled_idx] for x in reversed(range(self.len_seq))]

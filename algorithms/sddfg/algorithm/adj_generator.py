@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from itertools import combinations
 from utils.util import DecayThenFlatSchedule, to_torch
+import numpy as np
 
 
 class _GATLayer(nn.Module):
@@ -71,6 +72,8 @@ class Adj_Generator(nn.Module):
         self.num_factor = args.num_factor
         self.highest_orders = args.highest_orders
         self._triplet_cache = {}
+
+        self.rng = np.random.RandomState(int(getattr(args, "seed", 0)) + 520000)
 
         gat_heads = args.gat_heads
         gat_slope = args.gat_negative_slope
@@ -305,7 +308,12 @@ class Adj_Generator(nn.Module):
         if explore:
             eps = float(self.exploration.eval(t_env if t_env is not None else 0))
             if eps > 0:
-                noise = torch.rand_like(pair_score) * eps
+                noise_np = self.rng.random_sample(tuple(pair_score.shape)).astype(np.float32)
+                noise = torch.from_numpy(noise_np).to(
+                    device=pair_score.device,
+                    dtype=pair_score.dtype
+                ) * eps
+
                 pair_score = (pair_score + noise) * pair_mask.to(pair_score.dtype)
                 pair_score = pair_score / pair_score.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                 pair_score = pair_score * pair_mask.to(pair_score.dtype)

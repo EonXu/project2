@@ -75,6 +75,7 @@ COMMON_ARGS=(
   --num_factor 3
   --use_dyn_graph
   --use_vfunction
+  --adj_begin_step 30000
 
   --num_agents 4
   --max_player_num 5

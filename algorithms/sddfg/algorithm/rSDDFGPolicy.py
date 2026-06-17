@@ -65,6 +65,7 @@ class R_SDDFGPolicy(MLPPolicy):
         self.hidden_size = self.args.hidden_size
         self.lamda = self.args.lamda
         self.num_rank = self.args.num_rank
+        self.rng = np.random.RandomState(int(getattr(self.args, "seed", 0)) + 310000)
         if self.args.prev_act_inp:
             # this is only local information so the agent can act decentralized
             self.rnn_network_input_dim = self.obs_dim + self.act_dim
@@ -104,6 +105,29 @@ class R_SDDFGPolicy(MLPPolicy):
         if train:
             self.exploration = DecayThenFlatSchedule(self.args.epsilon_start, self.args.epsilon_finish,
                                                      self.args.epsilon_anneal_time, decay="linear")
+
+    def _sample_action_indices_np(self, available_actions, batch_size, act_dim):
+        if available_actions is None:
+            return self.rng.randint(0, int(act_dim), size=int(batch_size)).astype(np.int64)
+
+        if torch.is_tensor(available_actions):
+            aa = available_actions.detach().cpu().numpy()
+        else:
+            aa = np.asarray(available_actions)
+
+        aa = aa.reshape(int(batch_size), int(act_dim))
+
+        out = np.zeros(int(batch_size), dtype=np.int64)
+        for b in range(int(batch_size)):
+            valid = np.flatnonzero(aa[b] > 0.5)
+            if valid.size == 0:
+                valid = np.arange(int(act_dim), dtype=np.int64)
+            out[b] = int(self.rng.choice(valid))
+        return out
+
+    def _sample_onehot_np(self, available_actions, batch_size, act_dim):
+        action_idx = self._sample_action_indices_np(available_actions, batch_size, act_dim)
+        return make_onehot(action_idx, act_dim)
 
     def get_hidden_states(self, obs, prev_actions, rnn_states, dones=None):
         if self.args.prev_act_inp:
@@ -612,16 +636,18 @@ class R_SDDFGPolicy(MLPPolicy):
         else:
             if explore:
                 eps = self.exploration.eval(t_env)
-                rand_numbers = np.random.rand(self.n_agents)
+                rand_numbers = self.rng.rand(self.n_agents)
+                random_actions = self._sample_action_indices_np(
+                    available_actions,
+                    self.n_agents,
+                    self.act_dim
+                )
 
-                aa_device = available_actions.device if torch.is_tensor(available_actions) else self.device
-                logits = torch.ones(self.n_agents, self.act_dim, device=aa_device)
-                logits = avail_choose(logits, available_actions)
+                take_random = (rand_numbers < eps).astype(np.int64)
 
-                random_actions = Categorical(logits=logits).sample().detach().cpu().numpy()
-                take_random = (rand_numbers < eps).astype(int)
+                greedy_actions = to_numpy(actions) if torch.is_tensor(actions) else np.asarray(actions)
+                greedy_actions = greedy_actions.reshape(self.n_agents).astype(np.int64)
 
-                greedy_actions = to_numpy(actions) if torch.is_tensor(actions) else actions
                 actions = (1 - take_random) * greedy_actions + take_random * random_actions
                 onehot_actions = make_onehot(actions, self.act_dim)
             else:
@@ -638,20 +664,19 @@ class R_SDDFGPolicy(MLPPolicy):
         if self.multidiscrete:
             random_actions = []
             for i in range(len(self.act_dim)):
-                logits = torch.ones(batch_size, self.act_dim[i], device=self.device)
-                random_actions.append(
-                    OneHotCategorical(logits=logits).sample().detach().cpu().numpy()
+                random_idx = self._sample_action_indices_np(
+                    None,
+                    batch_size,
+                    self.act_dim[i]
                 )
+                random_actions.append(make_onehot(random_idx, self.act_dim[i]))
             random_actions = np.concatenate(random_actions, axis=-1)
         else:
-            if available_actions is not None:
-                aa_device = available_actions.device if torch.is_tensor(available_actions) else self.device
-                logits = torch.ones(batch_size, self.act_dim, device=aa_device)
-                logits = avail_choose(logits, available_actions)
-                random_actions = OneHotCategorical(logits=logits).sample().detach().cpu().numpy()
-            else:
-                logits = torch.ones(batch_size, self.act_dim, device=self.device)
-                random_actions = OneHotCategorical(logits=logits).sample().detach().cpu().numpy()
+            random_actions = self._sample_onehot_np(
+                available_actions,
+                batch_size,
+                self.act_dim
+            )
 
         return random_actions
 

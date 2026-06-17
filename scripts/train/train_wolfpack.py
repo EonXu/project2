@@ -1,6 +1,8 @@
 import os, sys
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("PYTHONHASHSEED", "0")
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -22,6 +24,56 @@ from runner.wolfpack_runner import WolfpackRunner as Runner
 
 import envs.Wolfpack
 from envs.env_wrappers import ShareDummyVecEnv, ShareSubprocVecEnv
+
+def set_global_seeds(seed: int, cuda_deterministic: bool = True):
+    import random
+    import numpy as np
+    import torch
+
+    seed = int(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    if cuda_deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+        # 兼容新旧 PyTorch
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception as e:
+                print(f"[WARN] use_deterministic_algorithms failed: {e}")
+        elif hasattr(torch, "set_deterministic"):
+            try:
+                torch.set_deterministic(True)
+            except Exception as e:
+                print(f"[WARN] set_deterministic failed: {e}")
+        else:
+            print("[WARN] Current torch has no strict deterministic API; "
+                  "only cudnn.deterministic=True is used.")
+
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        except Exception:
+            pass
 
 # ===== 修改点 5：train_wolfpack.py 中新增 run 前缀工具函数 =====
 def get_run_csv_path(run_dir, filename):
@@ -253,23 +305,7 @@ def main(args):
         os.makedirs(str(run_dir))
 
     # 随机种子
-    import random
-    torch.manual_seed(all_args.seed)
-    random.seed(all_args.seed)
-    np.random.seed(all_args.seed)
-    torch.manual_seed(all_args.seed)
-    torch.cuda.manual_seed(all_args.seed)
-    torch.cuda.manual_seed_all(all_args.seed)
-
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
-
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-    except Exception:
-        pass
+    set_global_seeds(all_args.seed, all_args.cuda_deterministic)
 
     # init wandb
     if all_args.use_wandb:

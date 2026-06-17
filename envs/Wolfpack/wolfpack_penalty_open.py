@@ -183,6 +183,26 @@ class Generator(object):
 class WolfpackPenaltyOpen(gym.Env):
     metadata = {'render.modes': ['human']}
 
+    def _make_food_agent(self, idx):
+        agent = DQNAgent(
+            agent_id=idx,
+            args={
+                "with_gpu": self.prey_with_gpu,
+                "max_seq_length": 5,
+                "seed": int(self.seed) + 100000 + int(idx),
+            },
+            obs_type="partial_obs",
+            mode="test",
+        )
+
+        dirname = os.path.dirname(__file__)
+        filename = os.path.join(
+            dirname,
+            "assets/dqn_prey_parameters/exp0.0001param_10_agent_" + str(idx)
+        )
+        agent.load_parameters(filename)
+        return agent
+
     def __init__(self, grid_height=20, grid_width=20, num_agents=3, max_food_num=2,
                  sight_sideways=8, sight_radius=8, max_time_steps=200,
                  coop_radius=1, groupMultiplier=2, food_freeze_rate=0,
@@ -302,9 +322,7 @@ class WolfpackPenaltyOpen(gym.Env):
 
         # ====== 食物（猎物）智能体加载（预训练 DQN） ======
         self.remaining_timesteps = max_time_steps
-        self.food_list = [DQNAgent(agent_id=a, args={"with_gpu": self.prey_with_gpu, "max_seq_length": 5},
-                                   obs_type="partial_obs")
-                          for a in range(self.max_food_num)]
+        self.food_list = [self._make_food_agent(idx) for idx in range(self.max_food_num)]
 
         dirname = os.path.dirname(__file__)
         for idx, agent in enumerate(self.food_list):
@@ -427,9 +445,7 @@ class WolfpackPenaltyOpen(gym.Env):
         self.food_obses = food_obses
 
         # 重新实例化并加载食物策略参数（避免并行进程下的引用问题）
-        self.food_list = [DQNAgent(agent_id=a, args={"with_gpu": self.prey_with_gpu, "max_seq_length": 5},
-                                   obs_type="partial_obs")
-                          for a in range(self.max_food_num)]
+        self.food_list = [self._make_food_agent(idx) for idx in range(self.max_food_num)]
         dirname = os.path.dirname(__file__)
         for idx, agent in enumerate(self.food_list):
             filename = os.path.join(dirname,
