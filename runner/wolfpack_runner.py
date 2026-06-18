@@ -339,6 +339,135 @@ class WolfpackRunner(RecRunner):
             rd = "."
         return str(rd)
 
+    def _debug_dump_rollout_step(
+        self,
+        tag,
+        t,
+        obs=None,
+        share_obs=None,
+        actions=None,
+        env_acts=None,
+        rewards=None,
+        dones=None,
+        infos=None,
+        avail_acts=None,
+        adj=None,
+        prob_adj=None,
+        rnn_states=None,
+        base_env=None,
+        policy=None,
+        adj_network=None,
+    ):
+        """
+        只在指定 total_env_steps 附近记录 rollout 关键状态，用于定位同 seed 分叉。
+        默认记录 step=9000~10000，避免日志过大。
+        """
+        debug_start = int(getattr(self.args, "debug_step_start", 0))
+        debug_end = int(getattr(self.args, "debug_step_end", 10000))
+        cur_step = int(getattr(self, "total_env_steps", 0))
+
+        if cur_step < debug_start or cur_step > debug_end:
+            return
+
+        run_dir = self._get_run_dir()
+        path = os.path.join(run_dir, "debug_rollout_step.csv")
+        path = _get_run_csv_path(path)
+
+        def _flat(x, max_items=80):
+            if x is None:
+                return ""
+            try:
+                if torch.is_tensor(x):
+                    x = x.detach().cpu().numpy()
+                arr = np.asarray(x)
+                return arr.reshape(-1)[:max_items].tolist()
+            except Exception as e:
+                return f"ERR:{repr(e)}"
+
+        import hashlib
+
+        def _hash_array(x):
+            if x is None:
+                return ""
+            try:
+                if torch.is_tensor(x):
+                    x = x.detach().cpu().numpy()
+                arr = np.asarray(x)
+                return hashlib.md5(arr.tobytes()).hexdigest()
+            except Exception as e:
+                return f"ERR:{repr(e)}"
+
+        def _rng_head(obj):
+            try:
+                if obj is None or not hasattr(obj, "rng"):
+                    return ""
+                st = obj.rng.get_state()
+                return str(st[1][:10].tolist())
+            except Exception as e:
+                return f"ERR:{repr(e)}"
+
+        def _param_sig(module, max_params=3):
+            """
+            轻量参数签名，不追求加密 hash，只用于判断两次 run 的网络参数是否已经分叉。
+            """
+            if module is None:
+                return ""
+            try:
+                vals = []
+                cnt = 0
+                for p in module.parameters():
+                    x = p.detach().float().cpu()
+                    vals.append(float(x.sum().item()))
+                    cnt += 1
+                    if cnt >= max_params:
+                        break
+                return str(vals)
+            except Exception as e:
+                return f"ERR:{repr(e)}"
+
+        info_dict = {}
+        try:
+            info_dict = self._extract_first_info_dict(infos, env_i=0) if infos is not None else {}
+        except Exception:
+            info_dict = {}
+
+        row = {
+            "total_env_steps": cur_step,
+            "tag": str(tag),
+            "t": int(t),
+            "actions": _flat(actions),
+            "env_acts": _flat(env_acts),
+            "rewards": _flat(rewards),
+            "dones": _flat(dones),
+            "avail_acts": _flat(avail_acts),
+            "adj": _flat(adj),
+            "prob_adj": _flat(prob_adj),
+            "rnn_states_head": _flat(rnn_states, max_items=20),
+            "info_num_players": info_dict.get("num_players", ""),
+            "info_valid_indices": _flat(info_dict.get("valid_indices", None)),
+            "info_active_masks": _flat(info_dict.get("active_masks", None)),
+            "info_individual_rewards": _flat(info_dict.get("individual_rewards", None)),
+            "obs_hash": _hash_array(obs),
+            "share_obs_hash": _hash_array(share_obs),
+            "actions_hash": _hash_array(actions),
+            "env_acts_hash": _hash_array(env_acts),
+            "rewards_hash": _hash_array(rewards),
+            "dones_hash": _hash_array(dones),
+            "avail_acts_hash": _hash_array(avail_acts),
+            "adj_hash": _hash_array(adj),
+            "prob_adj_hash": _hash_array(prob_adj),
+            "rnn_states_hash": _hash_array(rnn_states),
+
+            "policy_rng_head": _rng_head(policy),
+            "policy_param_sig": _param_sig(policy),
+            "adj_param_sig": _param_sig(adj_network),
+        }
+
+        df = pd.DataFrame([row])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_header = not os.path.exists(path)
+        df.to_csv(path, mode="a", header=write_header, index=False)
+
     def _dump_eval_episode_step_tables(self, eval_step: int, eval_ep: int, step_info: dict, eval_id: int = 0):
         """
         将评估阶段步骤轨迹添加到 progress_eval_num_players_traj.csv , progress_eval_individual_rewards.csv
@@ -585,9 +714,9 @@ class WolfpackRunner(RecRunner):
         if hasattr(env, "envs") and isinstance(getattr(env, "envs"), list) and len(env.envs) > 0:
             base_env = env.envs[0]
 
-        print(f"[play] render_enabled={render_enabled}, save_video={save_video}", flush=True)
-        print(f"[play] video_path={video_path}", flush=True)
-        print(f"[play] base_env={'OK' if base_env is not None else 'NONE'}", flush=True)
+        #print(f"[play] render_enabled={render_enabled}, save_video={save_video}", flush=True)
+        #print(f"[play] video_path={video_path}", flush=True)
+        #print(f"[play] base_env={'OK' if base_env is not None else 'NONE'}", flush=True)
 
         video_writer = None
         video_size = None
@@ -849,6 +978,26 @@ class WolfpackRunner(RecRunner):
                     eye = self._build_alive_eye(self.num_agents, dones, adj.device)
                     adj_all = torch.cat([adj.cpu().detach(), eye.cpu()], dim=2)
 
+                # ===== DEBUG: policy action 前，记录 obs / rnn / adj / rng / 参数状态 =====
+                self._debug_dump_rollout_step(
+                    tag="before_policy_action",
+                    t=t,
+                    obs=obs_batch,
+                    share_obs=states_batch,
+                    actions=None,
+                    env_acts=None,
+                    rewards=None,
+                    dones=dones,
+                    infos=None,
+                    avail_acts=avail_acts_batch,
+                    adj=adj if "adj" in locals() else None,
+                    prob_adj=prob_adj if "prob_adj" in locals() else None,
+                    rnn_states=rnn_states_batch,
+                    base_env=base_env,
+                    policy=policy,
+                    adj_network=self.adj_network if hasattr(self, "adj_network") else None,
+                )
+
                 # 动作选择
                 if warmup:
                     acts_batch = policy.get_random_actions(obs_batch, avail_acts_batch)
@@ -914,8 +1063,46 @@ class WolfpackRunner(RecRunner):
 
             env_acts = np.split(acts_batch, self.num_envs)
 
+            # ===== DEBUG: step 前记录 policy 输出动作 =====
+            self._debug_dump_rollout_step(
+                tag="before_env_step",
+                t=t,
+                obs=obs,
+                actions=acts_batch,
+                env_acts=env_acts,
+                rewards=None,
+                dones=dones,
+                infos=None,
+                avail_acts=avail_acts,
+                adj=adj if "adj" in locals() else None,
+                prob_adj=prob_adj if "prob_adj" in locals() else None,
+                rnn_states=rnn_states_batch,
+                share_obs=states_batch,
+                policy=policy,
+                adj_network=self.adj_network if hasattr(self, "adj_network") else None,
+            )
+
             # Env step
             next_obs, next_share_obs, rewards, env_dones, infos, next_avail_acts = env.step(env_acts)
+
+            # ===== DEBUG: step 后记录 env 返回 =====
+            self._debug_dump_rollout_step(
+                tag="after_env_step",
+                t=t,
+                obs=next_obs,
+                actions=acts_batch,
+                env_acts=env_acts,
+                rewards=rewards,
+                dones=env_dones,
+                infos=infos,
+                avail_acts=next_avail_acts,
+                adj=adj if "adj" in locals() else None,
+                prob_adj=prob_adj if "prob_adj" in locals() else None,
+                rnn_states=rnn_states_batch,
+                share_obs=states_batch,
+                policy=policy,
+                adj_network=self.adj_network if hasattr(self, "adj_network") else None,
+            )
 
             # 可视化/录制：每步渲染并抓帧写入 mp4
             if (render_enabled or save_video) and base_env is not None:
@@ -1247,11 +1434,11 @@ class WolfpackRunner(RecRunner):
         try:
             if video_writer is not None:
                 video_writer.close()
-                print(f"[video] done. total_frames={frame_count}", flush=True)
-                print(f"[video] saved: {video_path}", flush=True)
+                #print(f"[video] done. total_frames={frame_count}", flush=True)
+                #print(f"[video] saved: {video_path}", flush=True)
             else:
                 print("[video] writer was never created (0 frames captured).", flush=True)
-                print(f"[video] expected path: {video_path}", flush=True)
+                #print(f"[video] expected path: {video_path}", flush=True)
         except Exception as e:
             print(f"[video] close failed: {repr(e)}", flush=True)
 

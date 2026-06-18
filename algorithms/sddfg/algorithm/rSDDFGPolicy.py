@@ -1,36 +1,70 @@
 import numpy as np
 import torch
 #import torch_scatter  # 用于图神经网络中的散射操作
+# def scatter_add(src, index, dim=0, out=None, dim_size=None):
+#     """
+#     使用 torch 原生函数模拟 torch_scatter.scatter_add，支持自动广播 index
+#     """
+#     if dim_size is None:
+#         dim_size = index.max().item() + 1
+#
+#     # 构造输出 tensor 的形状
+#     out_size = list(src.size())
+#     out_size[dim] = dim_size
+#
+#     if out is None:
+#         out = torch.zeros(out_size, dtype=src.dtype, device=src.device)
+#
+#     # [关键修复] 如果 index 维度少于 src，则自动扩展 index 以匹配 src 的形状
+#     if index.dim() != src.dim():
+#         # 假设 index 是一维的，我们需要将其 unsqueeze 并 expand 到与 src 相同的形状
+#         # 例如：src [E, D], index [E] -> index [E, 1] -> index [E, D]
+#
+#         # 1. 构建 view_shape: 在 dim 之后的所有维度补 1
+#         # 例如 src.dim()=2, dim=0 => view_shape=[E, 1]
+#         # 例如 src.dim()=4, dim=0 => view_shape=[E, 1, 1, 1]
+#         view_shape = list(index.shape)
+#         for _ in range(src.dim() - index.dim()):
+#             view_shape.append(1)
+#
+#         # 2. 调整形状并扩展
+#         index = index.view(view_shape).expand_as(src)
+#
+#     return out.scatter_add_(dim, index, src)
 def scatter_add(src, index, dim=0, out=None, dim_size=None):
     """
-    使用 torch 原生函数模拟 torch_scatter.scatter_add，支持自动广播 index
-    """
-    if dim_size is None:
-        dim_size = index.max().item() + 1
+    Deterministic debug version for SDDFG.
 
-    # 构造输出 tensor 的形状
-    out_size = list(src.size())
-    out_size[dim] = dim_size
+    目的：
+    避免 CUDA scatter_add_ 在重复 index 下的非确定性累加顺序。
+    当前 rSDDFGPolicy.py 内部只需要 dim=0 的 scatter_add。
+    这个版本速度较慢，但用于 10k determinism 验证足够。
+    """
+    if dim != 0:
+        raise NotImplementedError("deterministic scatter_add only supports dim=0 in this debug patch")
+
+    if index.dim() != 1:
+        index_flat = index.reshape(-1)
+    else:
+        index_flat = index
+
+    if dim_size is None:
+        dim_size = int(index_flat.max().item()) + 1
 
     if out is None:
-        out = torch.zeros(out_size, dtype=src.dtype, device=src.device)
+        out_shape = list(src.shape)
+        out_shape[0] = int(dim_size)
+        out = torch.zeros(out_shape, dtype=src.dtype, device=src.device)
+    else:
+        out.zero_()
 
-    # [关键修复] 如果 index 维度少于 src，则自动扩展 index 以匹配 src 的形状
-    if index.dim() != src.dim():
-        # 假设 index 是一维的，我们需要将其 unsqueeze 并 expand 到与 src 相同的形状
-        # 例如：src [E, D], index [E] -> index [E, 1] -> index [E, D]
+    # 固定 Python 顺序累加，避免 CUDA atomic add 的顺序漂移
+    for i in range(index_flat.shape[0]):
+        dst = int(index_flat[i].item())
+        out[dst] = out[dst] + src[i]
 
-        # 1. 构建 view_shape: 在 dim 之后的所有维度补 1
-        # 例如 src.dim()=2, dim=0 => view_shape=[E, 1]
-        # 例如 src.dim()=4, dim=0 => view_shape=[E, 1, 1, 1]
-        view_shape = list(index.shape)
-        for _ in range(src.dim() - index.dim()):
-            view_shape.append(1)
+    return out
 
-        # 2. 调整形状并扩展
-        index = index.view(view_shape).expand_as(src)
-
-    return out.scatter_add_(dim, index, src)
 from algorithms.sddfg.algorithm.agent_q_function import AgentQFunction
 from algorithms.sddfg.algorithm.agent_v_function import AgentVFunction
 # from algorithms.sddfg.algorithm.adj_generator import Adj_Generator

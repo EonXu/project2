@@ -287,13 +287,40 @@ def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
 
+    # 随机种子
+    set_global_seeds(all_args.seed, all_args.cuda_deterministic)
+
+    # 设备选择（与其他 train 一致）
     # 设备选择（与其他 train 一致）
     if all_args.cuda and torch.cuda.is_available():
         device = torch.device("cuda:0")
         torch.set_num_threads(all_args.n_training_threads)
+
         if all_args.cuda_deterministic:
+            # 关键：禁用 cuDNN，避免 GRU/RNN backward 走 cuDNN 非确定实现
+            torch.backends.cudnn.enabled = False
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
+
+            # 防止 Ampere/新卡上 TF32 引入额外数值差异；旧 torch 没这些属性也不报错
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = False
+            except Exception:
+                pass
+
+            try:
+                torch.backends.cudnn.allow_tf32 = False
+            except Exception:
+                pass
+
+            # 旧 torch 可能没有 use_deterministic_algorithms，所以加保护
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception as e:
+                print(f"[WARN] torch.use_deterministic_algorithms unavailable or failed: {repr(e)}", flush=True)
+
+            print("[DETERMINISM] CUDA deterministic mode enabled; cuDNN disabled.", flush=True)
+
     else:
         device = torch.device("cpu")
         torch.set_num_threads(all_args.n_training_threads)
@@ -304,8 +331,6 @@ def main(args):
     if not run_dir.exists():
         os.makedirs(str(run_dir))
 
-    # 随机种子
-    set_global_seeds(all_args.seed, all_args.cuda_deterministic)
 
     # init wandb
     if all_args.use_wandb:
