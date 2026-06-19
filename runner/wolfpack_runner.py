@@ -596,6 +596,12 @@ class WolfpackRunner(RecRunner):
 
         eval_summary = {}
         for k, v in eval_infos.items():
+            # Baseline algorithms do not emit SDDFG-only adjacency metrics.  Do
+            # not call np.mean([]): besides producing a meaningless NaN, it
+            # raises a RuntimeWarning and makes a healthy baseline run look as
+            # if its training values became non-finite.
+            if len(v) == 0:
+                continue
             try:
                 eval_summary["eval_" + k] = float(np.mean(v))
             except Exception:

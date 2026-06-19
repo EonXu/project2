@@ -808,11 +808,12 @@ class RecRunner(object):
                 index=False
             )
 
+            clamp_text = f"{clamp_ratio:.6f}" if np.isfinite(clamp_ratio) else "N/A"
             print(
                 f"[BEST] Save best_win checkpoint at step={step}, "
                 f"eval_win_rate={eval_win:.6f}, "
                 f"eval_reward={eval_reward:.6f}, "
-                f"clamp_ratio={clamp_ratio}"
+                f"clamp_ratio={clamp_text}"
             )
 
     """（QMix/VDN等）从 model_dir 恢复：各policy的Q网络 & mixer。"""

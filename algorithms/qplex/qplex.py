@@ -224,6 +224,12 @@ class QPlex(Trainer):
             train_info['grad_norm'] = grad_norm.detach().cpu().item()
         else:
             train_info['grad_norm'] = float(grad_norm)
+        # PyTorch reports the pre-clip norm.  Record the effective bound and a
+        # clipping indicator for stable long-run monitoring without changing
+        # the optimizer update or the existing grad_norm metric semantics.
+        grad_norm_value = float(train_info['grad_norm'])
+        train_info['grad_was_clipped'] = float(grad_norm_value > self.args.max_grad_norm)
+        train_info['grad_norm_after_clip_bound'] = min(grad_norm_value, float(self.args.max_grad_norm))
         train_info['Q_tot'] = (q_evals_batch * (1 - bad_transitions_mask)).mean().cpu().item()
 
         return train_info, None, None

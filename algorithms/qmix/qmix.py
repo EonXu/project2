@@ -219,7 +219,13 @@ class QMix(Trainer):
         self.optimizer.step()
         train_info = {}
         train_info['loss'] = loss
+        # clip_grad_norm_ returns the norm *before* clipping.  Keep the legacy
+        # field for comparable curves, and expose whether clipping was active
+        # so large QMIX pre-clip values are not mistaken for applied gradients.
         train_info['grad_norm'] = grad_norm
+        grad_norm_value = float(torch.as_tensor(grad_norm).detach().cpu().item())
+        train_info['grad_was_clipped'] = float(grad_norm_value > self.args.max_grad_norm)
+        train_info['grad_norm_after_clip_bound'] = min(grad_norm_value, float(self.args.max_grad_norm))
         train_info['Q_tot'] = (Q_tot_seq * (1 - bad_transitions_mask)).mean()
 
         return train_info, new_priorities, idxes
