@@ -69,11 +69,7 @@ class QPlex(Trainer):
         for policy in self.policies.values():
             self.parameters += policy.parameters()
         self.parameters += self.mixer.parameters()
-        #self.optimizer = torch.optim.Adam(params=self.parameters, lr=self.lr, eps=self.opti_eps)
         self.optimizer = torch.optim.RMSprop(params=self.parameters, lr=args.lr, alpha=0.99, eps=0.00001)
-
-        if self.args.use_double_q:
-            print("double Q learning will be used")
 
     def train_policy_on_batch(self, batch, update_policy_id=None):
         """See parent class."""
@@ -197,7 +193,6 @@ class QPlex(Trainer):
             
             # don't need the first Q values for next step
         # combine agent q value sequences to feed into mixer networks
-        #import pdb;pdb.set_trace()
         q_evals_batch = torch.cat(q_evals_all, dim=-1)
         q_targets_batch = torch.cat(q_targets_all, dim=-1)
         
@@ -205,21 +200,22 @@ class QPlex(Trainer):
         rewards = to_torch(rew_batch[self.policy_ids[0]][0]).to(**self.tpdv)
         # form bad transition mask
         bad_transitions_mask = torch.cat((torch.zeros(1, batch_size, 1).to(**self.tpdv), dones_env_batch[:self.episode_length - 1, :, :]))
-        #import pdb;pdb.set_trace()
         # L_td
         y_dqn = rewards + (1 - dones_env_batch) * self.args.gamma * q_targets_batch
         error = (q_evals_batch - y_dqn.detach()) * (1 - bad_transitions_mask)
-        #import pdb;pdb.set_trace()
         if self.qatten:
             q_attend_regs_batch = q_attend_regs_all[0]
             loss = mse_loss(error).sum() / (1 - bad_transitions_mask).sum() + q_attend_regs_batch
         else:
             loss = mse_loss(error).sum() / (1 - bad_transitions_mask).sum()
-        #import pdb;pdb.set_trace()
         # backward pass and gradient step
         self.optimizer.zero_grad()
+        if not torch.isfinite(loss):
+            raise FloatingPointError("non-finite qplex loss")
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters, self.args.max_grad_norm)
+        if not torch.isfinite(torch.as_tensor(grad_norm)):
+            raise FloatingPointError("non-finite qplex gradient norm")
         self.optimizer.step()
         # log
         train_info = {}
@@ -235,7 +231,6 @@ class QPlex(Trainer):
 
     def hard_target_updates(self):
         """Hard update the target networks."""
-        print("hard update targets")
         for policy_id in self.policy_ids:
             self.target_policies[policy_id].load_state(self.policies[policy_id])
         if self.mixer is not None:

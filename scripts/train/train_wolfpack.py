@@ -504,6 +504,19 @@ def main(args):
         """QPLEX mixer 需要可整除的 state unit；其他算法不使用该约束。"""
         if all_args.algorithm_name != "qplex":
             return local_obs_dim
+        if all_args.env_name == "wolfpack":
+            # Wolfpack state starts with seven features per player slot:
+            # (x, y, orientation one-hot, active flag). Food and remaining-time
+            # features are a global suffix and must not be split into QPLEX's
+            # per-agent attention keys.
+            wolfpack_agent_state_dim = 7
+            required_agent_prefix = wolfpack_agent_state_dim * all_args.max_player_num
+            if cent_obs_dim < required_agent_prefix:
+                raise ValueError(
+                    "Wolfpack QPLEX state is shorter than its agent-state prefix: "
+                    f"cent_obs_dim={cent_obs_dim}, required={required_agent_prefix}"
+                )
+            return wolfpack_agent_state_dim
         if cent_obs_dim % all_args.max_player_num != 0:
             raise ValueError(
                 "QPLEX requires cent_obs_dim divisible by max_player_num, "

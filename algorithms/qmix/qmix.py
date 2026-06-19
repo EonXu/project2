@@ -71,8 +71,6 @@ class QMix(Trainer):
         self.optimizer = torch.optim.Adam(
             params=self.parameters, lr=self.lr, eps=self.opti_eps)
 
-        if self.args.use_double_q:
-            print("double Q learning will be used")
 
     def train_policy_on_batch(self, batch, update_policy_id=None):
         """See parent class."""
@@ -211,18 +209,14 @@ class QMix(Trainer):
 
         # backward pass and gradient step
         self.optimizer.zero_grad()
-        loss.backward()
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"non-finite {self.args.algorithm_name} loss")
 
-        #for param in self.parameters:
-            #if param.grad is not None:
-                #print("param=",param.shape)
-                #print("grad=",param.grad)
-                #print("grad_sum=",param.grad.data.norm(2))
+        loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters, self.args.max_grad_norm)
+        if not torch.isfinite(torch.as_tensor(grad_norm)):
+            raise FloatingPointError(f"non-finite {self.args.algorithm_name} gradient norm")
         self.optimizer.step()
-        # log
-        #rint((Q_tot_seq * (1 - bad_transitions_mask)).mean())
-        #rint(grad_norm)\
         train_info = {}
         train_info['loss'] = loss
         train_info['grad_norm'] = grad_norm
@@ -233,7 +227,6 @@ class QMix(Trainer):
 
     def hard_target_updates(self):
         """Hard update the target networks."""
-        print("hard update targets")
         for policy_id in self.policy_ids:
             self.target_policies[policy_id].load_state(self.policies[policy_id])
         if self.mixer is not None:

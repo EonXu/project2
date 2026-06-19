@@ -48,8 +48,28 @@ class RecRunner(object):
         progress_filename = os.path.join(self.run_dir, filename)
 
         df = pd.DataFrame([row_dict])
-        write_header = not os.path.exists(progress_filename)
-        df.to_csv(progress_filename, mode='a', header=write_header, index=False)
+        if not os.path.exists(progress_filename):
+            df.to_csv(progress_filename, index=False)
+            return
+
+        # Scalar dictionaries can gain fields after warmup (for example,
+        # policy losses do not exist before the first optimizer update). Keep
+        # the CSV schema aligned instead of appending wider rows under an old
+        # header. Rewriting happens only when a new column first appears.
+        existing_columns = list(pd.read_csv(progress_filename, nrows=0).columns)
+        new_columns = [column for column in df.columns if column not in existing_columns]
+        all_columns = existing_columns + new_columns
+
+        if new_columns:
+            existing_df = pd.read_csv(progress_filename)
+            existing_df.reindex(columns=all_columns).to_csv(progress_filename, index=False)
+
+        df.reindex(columns=all_columns).to_csv(
+            progress_filename,
+            mode='a',
+            header=False,
+            index=False,
+        )
 
     # 检查sddfg参数
     def _validate_dynamic_graph_args(self):
@@ -647,9 +667,22 @@ class RecRunner(object):
 
     def _latest_train_metric(self, key, default=np.nan):
         """
-        从最近一次 train_infos 中读取辅助指标。
-        例如 clamp_ratio 通常来自 train_adj_info，不在 eval_summary 中。
+        Read a scalar from the latest adjacency or policy training result.
+
+        Adjacency metrics such as clamp_ratio are stored as lists in
+        train_adj_infos, whereas policy losses are stored as dictionaries in
+        train_infos. Prefer the adjacency source because it is the authoritative
+        source for graph-policy tie-break metrics.
         """
+        adj_info = getattr(self, "train_adj_infos", None)
+        if isinstance(adj_info, dict) and key in adj_info:
+            try:
+                values = np.asarray(adj_info[key], dtype=np.float64).reshape(-1)
+                if values.size > 0 and np.all(np.isfinite(values)):
+                    return float(values.mean())
+            except Exception:
+                pass
+
         infos = getattr(self, "train_infos", None)
         if isinstance(infos, (list, tuple)):
             for info in infos:

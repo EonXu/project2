@@ -59,7 +59,6 @@ class QPlexPolicy(RecurrentPolicy):
             input_batch = obs_batch
 
         q_batch, new_rnn_states = self.q_network.get_rnn(input_batch, rnn_states)
-        #import pdb;pdb.set_trace()
         if action_batch is not None:
             action_batch = to_torch(action_batch).to(self.device)
             q_values = self.q_values_from_actions(q_batch, action_batch)
@@ -86,7 +85,6 @@ class QPlexPolicy(RecurrentPolicy):
             input_batch = obs_batch
 
         q_batch, new_rnn_states = self.q_network(input_batch, rnn_states)
-        #import pdb;pdb.set_trace()
         if action_batch is not None:
             action_batch = to_torch(action_batch).to(self.device)
             q_values = self.q_values_from_actions(q_batch, action_batch)
@@ -115,7 +113,6 @@ class QPlexPolicy(RecurrentPolicy):
         else:
             # convert one-hot action batch to index tensors to gather the q values corresponding to the actions taken
             action_batch = action_batch.max(dim=-1)[1]
-            # import pdb; pdb.set_trace()
             q_values = torch.gather(q_batch, len(action_batch.shape), action_batch.unsqueeze(dim=-1))
             # q_values is a column vector containing q values for the actions specified by action_batch
         return q_values
@@ -123,7 +120,6 @@ class QPlexPolicy(RecurrentPolicy):
     def get_actions(self, obs, prev_actions, rnn_states, available_actions=None, t_env=None, explore=False):
         """See parent class."""
         q_values_out, new_rnn_states = self.get_q_values(obs, prev_actions, rnn_states)
-        #import pdb;pdb.set_trace()
         if t_env == None and explore == True:
             explore = False
         onehot_actions, greedy_Qs = self.actions_from_q(q_values_out, available_actions=available_actions, explore=explore, t_env=t_env)
