@@ -44,7 +44,29 @@ experiment_name="sddfg_intra_ep_4to6_r${shock_remove_num}_j${shock_join_num}_rec
 result_root="${script_dir}/results/${env_name}/${algorithm}/${experiment_name}"
 mkdir -p "${result_root}/console_logs"
 console_log="${result_root}/console_logs/train_$(date +%Y%m%d_%H%M%S).log"
-echo "Console log: ${console_log}"
+repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+
+# Persist source provenance in the same console log as the training output.
+# Full SDDFG/baseline comparisons are invalid if their server-side code
+# revisions cannot be reconciled afterwards.
+git_commit="unavailable"
+git_tree_state="unavailable"
+if command -v git >/dev/null 2>&1 && git -C "${repo_root}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git_commit="$(git -C "${repo_root}" rev-parse HEAD)"
+  if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=no)" ]]; then
+    git_tree_state="dirty"
+  else
+    git_tree_state="clean"
+  fi
+fi
+
+{
+  echo "Algorithm: ${algorithm}"
+  echo "Seed: ${seed}; GPU: ${gpu}; num_env_steps: ${num_env_steps}"
+  echo "Experiment: ${experiment_name}"
+  echo "Git commit: ${git_commit}; tracked tree: ${git_tree_state}"
+  echo "Console log: ${console_log}"
+} | tee "${console_log}"
 
 CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --env_name "${env_name}" \
@@ -121,7 +143,7 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --save_interval 50000 \
   --num_eval_episodes 10 \
   --use_wandb \
-  2>&1 | tee "${console_log}"
+  2>&1 | tee -a "${console_log}"
 
 # In this repository --use_wandb is a store_false flag, so passing it disables
 # W&B and writes local TensorBoard/results under:
