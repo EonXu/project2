@@ -38,6 +38,14 @@ dynamic_min_agents=2
 
 experiment_name="sddfg_intra_ep_4to6_r${shock_remove_num}_j${shock_join_num}_rec${shock_recover_delay}_seed${seed}"
 
+# Keep stdout/stderr even when the server terminal disconnects. The Python
+# runner still creates its normal runN directory; this console log is stored at
+# the experiment root and can be matched by its timestamp.
+result_root="${script_dir}/results/${env_name}/${algorithm}/${experiment_name}"
+mkdir -p "${result_root}/console_logs"
+console_log="${result_root}/console_logs/train_$(date +%Y%m%d_%H%M%S).log"
+echo "Console log: ${console_log}"
+
 CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --env_name "${env_name}" \
   --wolfpack_id "${wolfpack_id}" \
@@ -112,7 +120,8 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --eval_interval 20000 \
   --save_interval 50000 \
   --num_eval_episodes 10 \
-  --use_wandb
+  --use_wandb \
+  2>&1 | tee "${console_log}"
 
 # In this repository --use_wandb is a store_false flag, so passing it disables
 # W&B and writes local TensorBoard/results under:

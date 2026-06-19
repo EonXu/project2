@@ -343,6 +343,9 @@ class R_SDDFG:
                 loss = mse_loss(error).sum() / valid_denom
             new_priorities = None
 
+        if not torch.isfinite(loss):
+            raise FloatingPointError("non-finite SDDFG policy loss")
+
         if self.use_vfunction:
             curr_v_tot = torch.cat(vtot, dim=-1).unsqueeze(-1)
             next_step_v_tot = torch.cat(target_vtot, dim=-1).unsqueeze(-1)
@@ -353,20 +356,34 @@ class R_SDDFG:
             f_v_tot = torch.cat(fv, dim=-1).unsqueeze(-1)
             error_fv = (f_v_tot - curr_v_tot.detach()) * (1 - bad_transitions_mask)
             loss_fv = mse_loss(error_fv).sum() / valid_denom
+            if not torch.isfinite(loss_v):
+                raise FloatingPointError("non-finite SDDFG total-value loss")
+            if not torch.isfinite(loss_fv):
+                raise FloatingPointError("non-finite SDDFG factor-value loss")
 
         self.policy_optimizer.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.policy_parameters, self.args.max_grad_norm)
+        if not torch.isfinite(torch.as_tensor(grad_norm)):
+            raise FloatingPointError("non-finite SDDFG policy gradient norm")
         self.policy_optimizer.step()
         if self.use_vfunction:
             self.critic_vtot_optimizer.zero_grad()
             loss_v.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic_vtot_parameters, self.args.max_grad_norm)
+            vtot_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.critic_vtot_parameters, self.args.max_grad_norm
+            )
+            if not torch.isfinite(torch.as_tensor(vtot_grad_norm)):
+                raise FloatingPointError("non-finite SDDFG total-value gradient norm")
             self.critic_vtot_optimizer.step()
 
             self.critic_fv_optimizer.zero_grad()
             loss_fv.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic_fv_parameters, self.args.max_grad_norm)
+            fv_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.critic_fv_parameters, self.args.max_grad_norm
+            )
+            if not torch.isfinite(torch.as_tensor(fv_grad_norm)):
+                raise FloatingPointError("non-finite SDDFG factor-value gradient norm")
             self.critic_fv_optimizer.step()
 
         train_info = {}
@@ -374,6 +391,8 @@ class R_SDDFG:
         train_info['loss_v'] = _to_float(loss_v) if self.use_vfunction else 0.0
         train_info['loss_fv'] = _to_float(loss_fv) if self.use_vfunction else 0.0
         train_info['policy_grad_norm'] = _to_float(grad_norm)
+        train_info['vtot_grad_norm'] = _to_float(vtot_grad_norm) if self.use_vfunction else 0.0
+        train_info['fv_grad_norm'] = _to_float(fv_grad_norm) if self.use_vfunction else 0.0
         return train_info, new_priorities, idxes
 
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):

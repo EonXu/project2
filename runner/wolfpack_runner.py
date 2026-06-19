@@ -563,6 +563,7 @@ class WolfpackRunner(RecRunner):
             "roster_change_events": [],
             "pending_recovery_final": [],
             "recovery_completion_rate": [],
+            "activation_state_resets": [],
             "active_ratio_mean": [],
             "active_ratio_min": [],
             "active_ratio_max": [],
@@ -760,6 +761,9 @@ class WolfpackRunner(RecRunner):
         recover_event_count = 0
         topology_change_steps = 0
         pending_recovery_final = 0
+        # Number of 0->1 slot activations whose recurrent state and previous
+        # action were reset. This covers both new joins and recoveries.
+        activation_state_reset_count = 0
 
         # 每次 rollout 开始先清空，避免 eval() 读到上一个 episode 的残留
         self.last_episode_step_info = None
@@ -989,6 +993,23 @@ class WolfpackRunner(RecRunner):
                 1.0 - joined_masks.reshape(-1, 1).astype(np.float32)
             )
 
+            # A newly activated slot must never inherit state from the former
+            # occupant. Fail immediately instead of silently contaminating the
+            # replay buffer and only discovering it after a long experiment.
+            joined_flat = joined_masks.reshape(-1).astype(bool)
+            if np.any(joined_flat):
+                # Episode statistics below refer to env_i=0, matching the
+                # runner's existing Wolfpack info extraction convention.
+                activation_state_reset_count += int(joined_masks[0].sum())
+                if not np.allclose(rnn_states_batch[joined_flat], 0.0, atol=1e-7):
+                    raise RuntimeError(
+                        "RNN state reset failed for a joined/recovered Wolfpack slot"
+                    )
+                if not np.allclose(last_acts_batch[joined_flat], 0.0, atol=1e-7):
+                    raise RuntimeError(
+                        "Previous-action reset failed for a joined/recovered Wolfpack slot"
+                    )
+
             active_masks = active_masks_next
             dones = next_dones
 
@@ -1047,6 +1068,15 @@ class WolfpackRunner(RecRunner):
                 left_count = int(info_dict.get("left_count", 0))
                 joined_count = int(info_dict.get("joined_count", 0))
                 recovered_count = int(info_dict.get("recovered_count", 0))
+
+                activated_count = int(joined_masks[0].sum())
+                expected_activated_count = joined_count + recovered_count
+                if activated_count != expected_activated_count:
+                    raise RuntimeError(
+                        "Wolfpack active-mask transition disagrees with topology events: "
+                        f"mask activated {activated_count} slot(s), but info reports "
+                        f"{joined_count} join(s) and {recovered_count} recovery(s)"
+                    )
 
                 left_event_count += left_count
                 join_event_count += joined_count
@@ -1341,6 +1371,7 @@ class WolfpackRunner(RecRunner):
         env_info.setdefault("roster_change_events", 0.0)
         env_info.setdefault("pending_recovery_final", 0.0)
         env_info.setdefault("recovery_completion_rate", 0.0)
+        env_info["activation_state_resets"] = float(activation_state_reset_count)
         env_info.setdefault("active_ratio_mean", 0.0)
         env_info.setdefault("active_ratio_min", 0.0)
         env_info.setdefault("active_ratio_max", 0.0)
@@ -1389,13 +1420,38 @@ class WolfpackRunner(RecRunner):
             )
         )
 
-        # 防御：若在训练尚未产生 train_infos 前触发 log，则用空 dict 占位
-        train_infos = getattr(self, "train_infos", None)
-        if (not isinstance(train_infos, (list, tuple))) or (len(train_infos) != len(self.policy_ids)):
-            train_infos = [dict() for _ in self.policy_ids]
-            self.train_infos = train_infos
+        # Aggregate all mini-updates produced by the latest training trigger.
+        raw_train_infos = getattr(self, "train_infos", None)
+        if not isinstance(raw_train_infos, (list, tuple)):
+            raw_train_infos = []
 
-        for p_id, train_info in zip(self.policy_ids, self.train_infos):
+        # DDFG/SDDFG performs train_interval_episode updates per trigger, so
+        # train_infos contains K * num_policies dictionaries. Aggregate by
+        # policy instead of discarding the metrics when K > 1.
+        aggregated_train_infos = []
+        num_policies = len(self.policy_ids)
+        for policy_index in range(num_policies):
+            policy_updates = [
+                info for info in raw_train_infos[policy_index::num_policies]
+                if isinstance(info, dict) and info
+            ]
+            keys = sorted(set().union(*(info.keys() for info in policy_updates))) \
+                if policy_updates else []
+            aggregated = {}
+            for key in keys:
+                values = [float(info[key]) for info in policy_updates if key in info]
+                if values:
+                    if not np.all(np.isfinite(values)):
+                        raise FloatingPointError(
+                            f"non-finite policy training metric {key}: {values}"
+                        )
+                    aggregated[key] = float(np.mean(values))
+            aggregated["updates_aggregated"] = float(len(policy_updates))
+            aggregated["total_train_steps"] = float(self.total_train_steps)
+            aggregated_train_infos.append(aggregated)
+
+        self.train_infos = aggregated_train_infos
+        for p_id, train_info in zip(self.policy_ids, aggregated_train_infos):
             self.log_train(p_id, train_info)
 
         # ===== 日志新增：记录动作探索 epsilon 与邻接探索 adj_epsilon =====
@@ -1451,6 +1507,7 @@ class WolfpackRunner(RecRunner):
             "roster_change_events": [],
             "pending_recovery_final": [],
             "recovery_completion_rate": [],
+            "activation_state_resets": [],
 
             # active mask 覆盖率
             "active_ratio_mean": [],
