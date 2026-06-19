@@ -1,12 +1,10 @@
 import copy
-import random
 import pickle as pkl
 import numpy as np
-import threading
 import gym
 from gym import spaces
 import time
-import sys, os
+import os
 from .assets.Agent import DQNAgent
 from numpy.random import RandomState
 
@@ -208,7 +206,10 @@ class WolfpackPenaltyOpen(gym.Env):
                  coop_radius=1, groupMultiplier=2, food_freeze_rate=0,
                  add_rate=0.05, del_rate=0.05, seed=None,
                  max_player_num=5, obs_type="vector", with_random_grid=False, random_grid_dir=None,
-                 prey_with_gpu=False, close_penalty=0.1):
+                 prey_with_gpu=False, close_penalty=0.1,
+                 intra_episode_dynamic=False, shock_steps="", shock_remove_num=0,
+                 shock_join_delay=10, shock_join_num=0, shock_recover_delay=30,
+                 dynamic_min_agents=2, continue_after_success=False):
 
         # ====== 基本网格/观测与动作配置 ======
         self.grid_height = grid_height
@@ -222,6 +223,33 @@ class WolfpackPenaltyOpen(gym.Env):
         self.ma_obs_type = obs_type
         self.N_DISCRETE_ACTIONS = 7
         self.n_actions = self.N_DISCRETE_ACTIONS
+
+        self.intra_episode_dynamic = bool(intra_episode_dynamic)
+        self.shock_steps = shock_steps
+        self.shock_remove_num = int(shock_remove_num)
+        self.shock_join_delay = int(shock_join_delay)
+        self.shock_join_num = int(shock_join_num)
+        self.shock_recover_delay = int(shock_recover_delay)
+        self.dynamic_min_agents = int(dynamic_min_agents)
+        self.continue_after_success = bool(continue_after_success)
+
+        # ====== 回合内动态事件参数校验 ======
+        # 所有张量仍使用 max_player_num 作为固定容量；这里只改变槽位是否有效。
+        if self.num_players > self.max_player_num:
+            raise ValueError("num_agents cannot exceed max_player_num")
+        if self.intra_episode_dynamic:
+            if not 1 <= self.dynamic_min_agents <= self.num_players:
+                raise ValueError("dynamic_min_agents must be in [1, num_agents]")
+            if self.shock_recover_delay <= 0:
+                raise ValueError("shock_recover_delay must be > 0")
+            if self.shock_remove_num <= 0:
+                raise ValueError("shock_remove_num must be > 0")
+            if self.shock_join_delay < 0 or self.shock_join_num < 0:
+                raise ValueError("shock join parameters must be >= 0")
+            if self.obs_type != "vector":
+                raise ValueError(
+                    "intra_episode_dynamic currently requires obs_type='vector'"
+                )
 
         self.action_space = [spaces.Discrete(self.n_actions) for _ in range(self.max_player_num)]
         # DDFG 一般会用 get_env_info()/get_avail_actions()，此处 action_space 仅作描述用途
@@ -246,7 +274,6 @@ class WolfpackPenaltyOpen(gym.Env):
         if seed is None:
             seed = int(time.time())
         self.seed = seed
-        self.randomizer = random
         self.prng = RandomState(self.seed)
         # OpenScheduler：回合内增减玩家的“到达-离开”过程
         self.scheduler = OpenScheduler(self.num_players, self.add_rate, self.del_rate, self.max_player_num, 2,
@@ -320,15 +347,9 @@ class WolfpackPenaltyOpen(gym.Env):
         self.food_obses = None
         self.prey_with_gpu = prey_with_gpu
 
-        # ====== 食物（猎物）智能体加载（预训练 DQN） ======
+        # _make_food_agent 内部已经完成参数加载。
         self.remaining_timesteps = max_time_steps
         self.food_list = [self._make_food_agent(idx) for idx in range(self.max_food_num)]
-
-        dirname = os.path.dirname(__file__)
-        for idx, agent in enumerate(self.food_list):
-            filename = os.path.join(dirname,
-                                    ("assets/dqn_prey_parameters/exp0.0001param_10_agent_" + str(idx)))
-            agent.load_parameters(filename)
 
         self.sight_sideways = sight_sideways
         self.sight_radius = sight_radius
@@ -342,7 +363,7 @@ class WolfpackPenaltyOpen(gym.Env):
 
     def load_map(self, filename):
         with open(filename, 'rb') as f:
-            self.levelMap = pkl.load(f)
+            return pkl.load(f)
 
     """方法作用：重置一轮游戏并返回所有潜在槽位的观测（长度=max_player_num）。
            步骤：
@@ -364,8 +385,36 @@ class WolfpackPenaltyOpen(gym.Env):
             self.valid_indices[idx] = idx
         self.prev_valid_indices = None
 
-        self.scheduler = OpenScheduler(self.num_players, self.add_rate, self.del_rate, self.max_player_num, 2,
-                                       seed=self.seed)
+        # ====== 初始化同一回合的动态成员状态 ======
+        self.episode_step = 0
+        self.episode_success = False
+        self.pending_recovery = []
+
+        # UID 仅用于统计身份，不输入策略网络
+        self.slot_uids = [-1] * self.max_player_num
+        for slot in range(self.init_num_players):
+            self.slot_uids[slot] = slot
+        self.next_agent_uid = self.init_num_players
+
+        if self.intra_episode_dynamic:
+            self.event_scheduler = IntraEpisodeEventScheduler(
+                shock_steps=self.shock_steps,
+                remove_num=self.shock_remove_num,
+                join_delay=self.shock_join_delay,
+                join_num=self.shock_join_num,
+            )
+            self.scheduler = None
+        else:
+            # 原随机回合内调度器完全保留
+            self.event_scheduler = None
+            self.scheduler = OpenScheduler(
+                self.num_players,
+                self.add_rate,
+                self.del_rate,
+                self.max_player_num,
+                2,
+                seed=self.seed,
+            )
 
         # 重置网格、RGB
         self.RGB_padded_grid = [[[0, 0, 255] for _ in range(2 * self.pads + self.grid_width)]
@@ -389,7 +438,6 @@ class WolfpackPenaltyOpen(gym.Env):
         player_loc_idx = self.prng.choice(
             range(len(self.possibleCoordinates)), self.num_players, replace=False
         ).tolist()
-        # player_loc_idx = random.sample(range(len(self.possibleCoordinates)), self.num_players)
         self.player_positions = [self.possibleCoordinates[a] for a in player_loc_idx]
 
         # Reset initial player orientation and points
@@ -444,14 +492,8 @@ class WolfpackPenaltyOpen(gym.Env):
                       enumerate(self.food_obs_type)]
         self.food_obses = food_obses
 
-        # 重新实例化并加载食物策略参数（避免并行进程下的引用问题）
+        # 每回合重新实例化 prey，避免其序列状态跨 episode 泄漏；参数在工厂方法内加载。
         self.food_list = [self._make_food_agent(idx) for idx in range(self.max_food_num)]
-        dirname = os.path.dirname(__file__)
-        for idx, agent in enumerate(self.food_list):
-            filename = os.path.join(dirname,
-                                    ("assets/dqn_prey_parameters/exp0.0001param_10_agent_" + str(idx)))
-            agent.load_parameters(filename)
-        # return player_obses
         obs = np.asarray(player_obses, dtype=np.float32)
         share_obs = np.tile(self.get_state().astype(np.float32), (self.max_player_num, 1))
         avail_actions = self.get_avail_actions().astype(np.float32)
@@ -818,6 +860,9 @@ class WolfpackPenaltyOpen(gym.Env):
 
 
     def step(self, action):
+        # s_t 的成员集合。本步动作和奖励必须与事件发生前的成员对齐。
+        active_masks_before = self._active_mask()
+
         # 1) 解码动作：slot -> 离散 id
         if isinstance(action, (list, tuple)):
             action_arr = np.asarray(action)
@@ -849,13 +894,35 @@ class WolfpackPenaltyOpen(gym.Env):
         # 4) 推进世界（内部会更新 self.player_points 等）
         self.update_state(restructured_action, food_collective_action)
 
-        # 5) 保存本步 reward（slot 对齐），然后执行 open_process（可能删/加 agent）
+        # 5) 保存 s_t,a_t 产生的 reward，然后改变下一状态的成员集合。
         reward_slot = np.asarray(self.player_points, dtype=np.float32).reshape(self.max_player_num, 1)
+        individual_rewards = reward_slot * active_masks_before
 
-        deleted, new_types = self.scheduler.open_process()
+        self.episode_step += 1
         self.prev_valid_indices = self.valid_indices.copy()
-        self.del_agent(deleted)
-        self.add_agent(new_types)
+
+        if self.intra_episode_dynamic:
+            # 脚本化事件：同一 episode 内突发退出、新成员加入、原成员恢复。
+            event_info = self._apply_scripted_events()
+        else:
+            # 向下兼容：保留原随机 OpenScheduler 路径。
+            before_event_mask = self._active_mask()
+            deleted, new_types = self.scheduler.open_process()
+            self.del_agent(deleted)
+            self.add_agent(new_types)
+            after_event_mask = self._active_mask()
+
+            event_info = {
+                "left_slots": np.where(
+                    (before_event_mask[:, 0] == 1)
+                    & (after_event_mask[:, 0] == 0)
+                )[0].astype(np.int64).tolist(),
+                "joined_slots": np.where(
+                    (before_event_mask[:, 0] == 0)
+                    & (after_event_mask[:, 0] == 1)
+                )[0].astype(np.int64).tolist(),
+                "recovered_slots": [],
+            }
 
         # open 后重置距离塑形基线（避免槽位变化导致 prev_dist 错位）
         self.prev_dist_to_food = [None] * self.max_player_num
@@ -878,48 +945,59 @@ class WolfpackPenaltyOpen(gym.Env):
 
         # 7) done / masks / avail / share_obs
         success = (not any(self.food_alive_statuses))  # 所有 prey 当前都被捕获/冻结
+        self.episode_success = self.episode_success or success
         time_limit = (self.remaining_timesteps <= 0)
-        episode_done = success or time_limit
+        # 动态恢复实验不能在 prey 暂时全部冻结时提前截断，否则后续恢复事件不会发生。
+        episode_done = time_limit or (success and not self.continue_after_success)
         done = np.full((self.max_player_num, 1), episode_done, dtype=bool)
 
-        active_masks = np.zeros((self.max_player_num, 1), dtype=np.float32)
-        for slot in range(self.max_player_num):
-            active_masks[slot, 0] = 1.0 if self.valid_indices[slot] >= 0 else 0.0
+        active_masks = self._active_mask()
 
         avail_actions = self.get_avail_actions().astype(np.float32)
         share_obs = np.tile(self.get_state().astype(np.float32), (self.max_player_num, 1))
 
-        # 空槽位 reward=0（避免训练噪声）
-        reward_slot = reward_slot * active_masks
-
         # ========== team reward：把所有智能体 reward 加起来 ==========
-        # individual_rewards: (N,1)
-        individual_rewards = reward_slot.copy()
         team_reward_scalar = float(np.sum(individual_rewards))  # 标量：全队本步总回报
 
-        # 返回给算法侧的 reward 变为 team reward（对有效槽位广播；空槽位仍为 0）
-        team_reward = np.full_like(individual_rewards, team_reward_scalar) * active_masks
+        # 团队奖励是 transition-level 标量，必须广播到所有固定槽位。
+        # Trainer 当前读取 slot 0 的共享奖励；若按 next active mask 屏蔽，slot 0
+        # 恰好退出时会错误地把整个团队奖励变为 0。
+        team_reward = np.full(
+            (self.max_player_num, 1),
+            team_reward_scalar,
+            dtype=np.float32,
+        )
 
         # --------- make infos consistent with SMAC/MPE/Prey style ---------
         # 评估/日志常用：是否成功围捕（所有 prey 均被捕获）
-        won = bool(np.sum(np.asarray(self.food_alive_statuses, dtype=np.int32)) == 0)
+        won = bool(self.episode_success)
 
-        # Build per-agent info list (length = max_player_num)
-        infos = []
-        for slot in range(self.max_player_num):
-            infos.append({
-                # runner 常用
-                "won": won,
+        topology_changed = bool(
+            event_info["left_slots"]
+            or event_info["joined_slots"]
+            or event_info["recovered_slots"]
+        )
+        common_info = {
+            "won": won,
+            "valid_indices": self.valid_indices.copy(),
+            "slot_uids": self.slot_uids.copy(),
+            "num_players": int(self.num_players),
+            "active_masks": active_masks.copy(),
+            "individual_rewards": individual_rewards.copy(),
+            "team_reward": team_reward_scalar,
+            "topology_changed": topology_changed,
+            "left_slots": list(event_info["left_slots"]),
+            "joined_slots": list(event_info["joined_slots"]),
+            "recovered_slots": list(event_info["recovered_slots"]),
+            "left_count": len(event_info["left_slots"]),
+            "joined_count": len(event_info["joined_slots"]),
+            "recovered_count": len(event_info["recovered_slots"]),
+            "pending_recovery_count": len(self.pending_recovery),
+            "episode_step": int(self.episode_step),
+        }
+        infos = [dict(common_info) for _ in range(self.max_player_num)]
 
-                # wolfpack 特有但对齐后很有用（建议保留）
-                "valid_indices": self.valid_indices.copy(),
-                "num_players": int(self.num_players),
-                "active_masks": active_masks,
-                "individual_rewards": individual_rewards,  # (N,1)
-                "team_reward": team_reward_scalar,  # scalar
-            })
-
-
+        self._validate_dynamic_outputs(obs, share_obs, active_masks, avail_actions)
         return obs, share_obs, team_reward, done, infos, avail_actions
 
     def _onehot4(self, ori: int):
@@ -1095,60 +1173,231 @@ class WolfpackPenaltyOpen(gym.Env):
 
         self.visualizer.grid = self.grid
         self.visualizer.render()
-        self.visualizer.render()
+
+    def _active_mask(self):
+        """返回固定槽位掩码：1=当前在场，0=退出/尚未加入。"""
+        return np.asarray(
+            [[1.0 if rid >= 0 else 0.0] for rid in self.valid_indices],
+            dtype=np.float32,
+        )
+
+    def _remove_agents_for_shock(self, requested_num):
+        """在单个 episode 内一次性移除多个成员，并保存恢复快照。
+
+        快照保存原 slot、逻辑 UID、位置、朝向和观测类型。真实玩家 rid
+        会在删除后重新编号，因此不能把 rid 用作跨时间身份。
+        """
+        max_removable = max(0, self.num_players - self.dynamic_min_agents)
+        remove_num = min(int(requested_num), max_removable)
+        if remove_num <= 0:
+            return []
+
+        active_slots = [
+            slot for slot, rid in enumerate(self.valid_indices) if rid >= 0
+        ]
+        selected_slots = [
+            int(slot) for slot in self.prng.choice(
+                active_slots, remove_num, replace=False
+            ).tolist()
+        ]
+
+        recovery_records = []
+        real_ids = []
+        for slot in selected_slots:
+            rid = self.valid_indices[slot]
+            recovery_records.append({
+                "slot": int(slot),
+                "uid": int(self.slot_uids[slot]),
+                "position": tuple(self.player_positions[rid]),
+                "orientation": int(self.player_orientation[rid]),
+                "obs_type": self.player_obs_type[rid],
+                "due_step": int(self.episode_step + self.shock_recover_delay),
+            })
+            real_ids.append(rid)
+
+        self.pending_recovery.extend(recovery_records)
+        # 必须倒序删除，避免 list.pop() 改变后续 rid。
+        self.del_agent(sorted(real_ids, reverse=True))
+        return selected_slots
+
+    def _restore_one_member(self, record):
+        """恢复一个离线成员；优先恢复原位置，否则选择当前空地。"""
+        slot = int(record["slot"])
+        if slot < 0 or slot >= self.max_player_num:
+            return False
+        if self.valid_indices[slot] != -1:
+            # 恢复槽位被占用时不丢弃记录，下一个环境步继续重试。
+            return False
+
+        alive_food_positions = {
+            pos for i, pos in enumerate(self.food_positions)
+            if self.food_alive_statuses[i]
+        }
+        free_positions = sorted(
+            set(self.possibleCoordinates)
+            - set(self.player_positions)
+            - alive_food_positions
+        )
+        if not free_positions:
+            return False
+
+        preferred_position = tuple(record["position"])
+        if preferred_position in free_positions:
+            position = preferred_position
+        else:
+            position = free_positions[int(self.prng.choice(len(free_positions)))]
+
+        rid = len(self.player_positions)
+        self.player_positions.append(position)
+        self.player_orientation.append(int(record["orientation"]))
+        self.player_obs_type.append(record["obs_type"])
+        self.valid_indices[slot] = rid
+        self.slot_uids[slot] = int(record["uid"])
+        self.player_points[slot] = 0.0
+        self.num_players += 1
+
+        self.grid[position[0]][position[1]] = 2
+        if "full_rgb" in self.obs_type:
+            self.RGB_grid[position[0]][position[1]] = [255, 255, 255]
+        self.RGB_padded_grid[
+            position[0] + self.pads
+        ][position[1] + self.pads] = [255, 255, 255]
+        return True
+
+    def _restore_due_members(self):
+        """恢复到期成员；无法恢复的记录保留到下一步重试。"""
+        recovered_slots = []
+        still_pending = []
+
+        for record in self.pending_recovery:
+            if int(record["due_step"]) > self.episode_step:
+                still_pending.append(record)
+                continue
+
+            if self._restore_one_member(record):
+                recovered_slots.append(int(record["slot"]))
+            else:
+                still_pending.append(record)
+
+        self.pending_recovery = still_pending
+        return recovered_slots
+
+    def _apply_scripted_events(self):
+        """应用本步的退出、恢复、新加入事件。
+
+        恢复优先于新加入；尚未到期的恢复槽位会被预留，避免新成员抢占。
+        """
+        request = self.event_scheduler.events_at(self.episode_step)
+        left_slots = self._remove_agents_for_shock(request["remove_num"])
+        recovered_slots = self._restore_due_members()
+
+        reserved_slots = {
+            int(record["slot"]) for record in self.pending_recovery
+        }
+        allowed_join_slots = [
+            slot for slot, rid in enumerate(self.valid_indices)
+            if rid == -1 and slot not in reserved_slots
+        ]
+        joined_slots = self.add_agent(
+            ["vector"] * int(request["join_num"]),
+            allowed_slots=allowed_join_slots,
+        )
+
+        return {
+            "left_slots": left_slots,
+            "joined_slots": joined_slots,
+            "recovered_slots": recovered_slots,
+        }
+
+    def _validate_dynamic_outputs(self, obs, share_obs, active_masks, avail_actions):
+        """动态模式下检查固定容量和空槽位编码，尽早暴露张量错位。"""
+        if not self.intra_episode_dynamic:
+            return
+
+        if obs.shape[0] != self.max_player_num:
+            raise RuntimeError(f"obs slot mismatch: {obs.shape}")
+        if share_obs.shape[0] != self.max_player_num:
+            raise RuntimeError(f"share_obs slot mismatch: {share_obs.shape}")
+        if active_masks.shape != (self.max_player_num, 1):
+            raise RuntimeError(f"active mask mismatch: {active_masks.shape}")
+        if avail_actions.shape[0] != self.max_player_num:
+            raise RuntimeError(f"avail_actions slot mismatch: {avail_actions.shape}")
+
+        inactive = active_masks[:, 0] == 0
+        if np.any(inactive):
+            if not np.all(obs[inactive] == -1.0):
+                raise RuntimeError("inactive slot observation must be all -1")
+            if not np.all(avail_actions[inactive, 4] == 1.0):
+                raise RuntimeError("inactive slot must allow stay action")
+            if not np.all(np.sum(avail_actions[inactive], axis=-1) == 1.0):
+                raise RuntimeError("inactive slot must only allow stay action")
 
     """方法作用：增加若干玩家（OpenScheduler 触发后调用）。
         步骤：
             1) 随机从空地挑选不冲突的坐标；
             2) 更新位置/朝向/网格显示；
             3) 在 valid_indices 里为新来的玩家分配空槽位（值=当前最大真实索引+1）。
+        新成员不能占用等待原成员恢复的槽位；恢复成员使用原 slot 和原 UID。
     """
+    def add_agent(self, new_types, allowed_slots=None):
+        if not new_types:
+            return []
 
-    def add_agent(self, new_types):
-        """增加若干玩家（OpenScheduler 触发后调用）。
+        empty_slots = [
+            slot for slot, rid in enumerate(self.valid_indices)
+            if rid == -1
+        ]
 
-        注意：冻结期（dead）的 prey 视为不存在，因此只排除 alive prey 的位置。
-        """
-        if new_types is None or len(new_types) == 0:
-            return
+        if allowed_slots is not None:
+            allowed = set(allowed_slots)
+            empty_slots = [slot for slot in empty_slots if slot in allowed]
 
-        # 可用空槽数量：严格限制最多只能加到 max_player_num
-        empty_slots = [idx_s for idx_s, v in enumerate(self.valid_indices) if v == -1]
-        if not empty_slots:
-            return
+        alive_food_positions = [
+            pos for i, pos in enumerate(self.food_positions)
+            if self.food_alive_statuses[i]
+        ]
+        available_pos = sorted(
+            set(self.possibleCoordinates)
+            - set(self.player_positions)
+            - set(alive_food_positions)
+        )
 
-        def_orientation = 0
-        alive_food_positions = [pos for i, pos in enumerate(self.food_positions) if self.food_alive_statuses[i]]
-        available_pos = sorted(set(self.possibleCoordinates) - set(self.player_positions) - set(alive_food_positions))
-        if not available_pos:
-            return
-
-        # 关键：add_num 同时受 “可用位置” 与 “空槽数” 与 “new_types长度” 约束
-        add_num = min(len(new_types), len(available_pos), len(empty_slots))
+        add_num = min(len(new_types), len(empty_slots), len(available_pos))
         if add_num <= 0:
-            return
+            return []
 
-        pos_idxes = self.prng.choice(len(available_pos), add_num, replace=False).tolist()
-        added_pos = [available_pos[a] for a in pos_idxes]
+        self.prng.shuffle(empty_slots)
+        pos_indices = self.prng.choice(
+            len(available_pos), add_num, replace=False
+        ).tolist()
 
-        # 扩展内部列表
-        self.player_orientation.extend([def_orientation for _ in range(len(added_pos))])
-        self.player_positions.extend(added_pos)
+        added_slots = []
 
-        for a in added_pos:
-            self.grid[a[0]][a[1]] = 2
-            if "full_rgb" in self.obs_type:
-                self.RGB_grid[a[0]][a[1]] = [255, 255, 255]
-            self.RGB_padded_grid[a[0] + self.pads][a[1] + self.pads] = [255, 255, 255]
+        for i in range(add_num):
+            slot = empty_slots[i]
+            pos = available_pos[pos_indices[i]]
+            rid = len(self.player_positions)
+
+            self.player_positions.append(pos)
+            self.player_orientation.append(0)
+            self.player_obs_type.append(new_types[i])
+            self.valid_indices[slot] = rid
             self.num_players += 1
 
-            # 为新增玩家占用一个空槽位（slot），并分配新的真实 id（index）
-            offset = max(self.valid_indices) + 1 if max(self.valid_indices) >= 0 else 0
-            empty_slots = [idx_s for idx_s, v in enumerate(self.valid_indices) if v == -1]
-            if not empty_slots:
-                break
-            slot_pick = self.prng.choice(len(empty_slots), 1).tolist()[0]
-            self.valid_indices[empty_slots[slot_pick]] = offset
+            self.slot_uids[slot] = self.next_agent_uid
+            self.next_agent_uid += 1
+            self.player_points[slot] = 0.0
+
+            self.grid[pos[0]][pos[1]] = 2
+            if "full_rgb" in self.obs_type:
+                self.RGB_grid[pos[0]][pos[1]] = [255, 255, 255]
+            self.RGB_padded_grid[
+                pos[0] + self.pads
+                ][pos[1] + self.pads] = [255, 255, 255]
+
+            added_slots.append(slot)
+
+        return added_slots
 
     def del_agent(self, agent_id):
         """删除若干玩家（OpenScheduler 触发后调用）。
@@ -1160,10 +1409,13 @@ class WolfpackPenaltyOpen(gym.Env):
         if isinstance(agent_id, int):
             agent_id = [agent_id]
 
+        deleted_slots = []
         for idx in sorted(agent_id, reverse=True):
             if idx < 0 or idx >= len(self.player_positions):
                 continue
 
+            # 删除前记录 rid 对应的固定 slot；rid 随 list.pop() 会重新编号。
+            slot = self.valid_indices.index(idx)
             a = self.player_positions[idx]
             self.grid[a[0]][a[1]] = 1
             if "full_rgb" in self.obs_type:
@@ -1172,7 +1424,11 @@ class WolfpackPenaltyOpen(gym.Env):
 
             self.player_positions.pop(idx)
             self.player_orientation.pop(idx)
+            if idx < len(self.player_obs_type):
+                self.player_obs_type.pop(idx)
+            self.slot_uids[slot] = -1
             self.num_players -= 1
+            deleted_slots.append(slot)
 
             # 更新槽位映射：>idx 的真实 id 需要 -1；=idx 的槽位置空
             for slot_i, v in enumerate(self.valid_indices):
@@ -1180,6 +1436,8 @@ class WolfpackPenaltyOpen(gym.Env):
                     self.valid_indices[slot_i] -= 1
                 elif v == idx:
                     self.valid_indices[slot_i] = -1
+
+        return deleted_slots
 
 """开放调度器：以几何分布随机决定“删除/添加”玩家的数量与时机。
     关键参数：
@@ -1232,15 +1490,12 @@ class OpenScheduler(object):
     def agent_removal_sampler(self):
         # 只有在线时间 > min_alive_time 的玩家才有资格被“抽走”
         eligible_idxs = [idx for idx, alive_dur in enumerate(self.alive_time) if alive_dur > self.min_alive_time]
-        # # 采一个“计划删除人数”的随机量（上限 2，以 0.7 的概率取1，以 0.3 的概率取 2）
-        # removed_amount = min(min(self.prng.choice(2, 1, p=[0.7, 0.3])[0] + 1, self.available_agents-1),
-        #                      len(eligible_idxs))
         max_removable = max(0, self.available_agents - self.min_available_agents)
-        removed_amount = min(1, max_removable, len(eligible_idxs)) #只删除1个
+        removed_amount = min(1, max_removable, len(eligible_idxs))
 
         removed_indices = []
-        if not removed_amount == 0:
-            #否则在 eligible_idxs 里无放回随机挑 removed_amount 个索引并返回
+        if removed_amount != 0:
+            # 在 eligible_idxs 里无放回随机挑 removed_amount 个索引并返回。
             removed_indices = self.prng.choice(len(eligible_idxs), removed_amount, replace=False).tolist()
             removed_indices = [eligible_idxs[k] for k in removed_indices]
         return removed_indices
@@ -1249,7 +1504,7 @@ class OpenScheduler(object):
         步骤：
           1) alive_time 全 +1；
           2) 以 remove_rate 决定是否删除；若删除 → agent_removal_sampler 采样并 del_agents；
-          3) 以 add_rate 决定是否添加；若添加 → 以 {1,2} 概率采样添加数量，受上限约束；
+          3) 以 add_rate 决定是否添加；若添加且未达到上限，则添加 1 名玩家；
           4) 返回 (deleted_idxs, new_obs_type_list)。
     """
     def open_process(self):
@@ -1275,12 +1530,51 @@ class OpenScheduler(object):
         new_obs_type = []
         space = max(0, self.max_available_agents - self.available_agents)
         if add and space > 0:
-            #agent_nums = min(self.prng.choice(2, 1, p=[0.7, 0.3])[0] + 1, space)
             agent_nums = min(1, space)
             if agent_nums > 0:
                 new_obs_type = self.add_agents(agent_nums)
 
         return deleted_idxs, new_obs_type
+
+"""保留原 OpenScheduler，新增可复现的多人突发事件。"""
+class IntraEpisodeEventScheduler:
+    """只生成事件请求，不直接修改环境内部玩家数组。"""
+
+    def __init__(
+        self,
+        shock_steps,
+        remove_num,
+        join_delay,
+        join_num,
+    ):
+        if isinstance(shock_steps, str):
+            shock_steps = [
+                int(x.strip())
+                for x in shock_steps.split(",")
+                if x.strip()
+            ]
+
+        self.shock_steps = sorted(set(shock_steps or []))
+        self.remove_num = int(remove_num)
+        self.join_delay = int(join_delay)
+        self.join_num = int(join_num)
+
+        self.join_events = {}
+        for step in self.shock_steps:
+            join_step = step + self.join_delay
+            self.join_events[join_step] = (
+                self.join_events.get(join_step, 0) + self.join_num
+            )
+
+    def events_at(self, episode_step):
+        return {
+            "remove_num": (
+                self.remove_num
+                if episode_step in self.shock_steps
+                else 0
+            ),
+            "join_num": self.join_events.get(episode_step, 0),
+        }
 
 """基于 pygame 的简易网格渲染器：蓝色背景、黑色空地、白色玩家、红色食物。"""
 class Visualizer(object):

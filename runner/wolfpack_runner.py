@@ -1,12 +1,11 @@
 import numpy as np
 import torch
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from runner.base_runner import RecRunner
 import os
 import pandas as pd
 
-# ===== 修改点 3：新增 run 前缀工具函数，供轨迹 CSV 使用 =====
 def _get_run_csv_path(path: str) -> str:
     """
     将写入 run 目录下的 CSV 路径改成带 run 前缀的文件名。
@@ -35,7 +34,6 @@ def _get_run_csv_path(path: str) -> str:
 
     return os.path.join(dir_name, prefix + file_name)
 
-# ===== 修改点 4：所有 wolfpack_runner 轨迹 CSV 自动带 run 前缀 =====
 def _append_df_csv(path: str, df: pd.DataFrame):
     """
     追加写入 CSV（如果文件不存在则写入表头；存在则不写表头，直接 append）。
@@ -51,6 +49,7 @@ def _append_df_csv(path: str, df: pd.DataFrame):
 
 
 class WolfpackRunner(RecRunner):
+    _BATCHED_FACTOR_GRAPH_ALGOS = {"sddfg", "ddfg", "ddfg_low"}
 
     @staticmethod
     def _extract_first_info_dict(infos, env_i=0):
@@ -339,135 +338,6 @@ class WolfpackRunner(RecRunner):
             rd = "."
         return str(rd)
 
-    def _debug_dump_rollout_step(
-        self,
-        tag,
-        t,
-        obs=None,
-        share_obs=None,
-        actions=None,
-        env_acts=None,
-        rewards=None,
-        dones=None,
-        infos=None,
-        avail_acts=None,
-        adj=None,
-        prob_adj=None,
-        rnn_states=None,
-        base_env=None,
-        policy=None,
-        adj_network=None,
-    ):
-        """
-        只在指定 total_env_steps 附近记录 rollout 关键状态，用于定位同 seed 分叉。
-        默认记录 step=9000~10000，避免日志过大。
-        """
-        debug_start = int(getattr(self.args, "debug_step_start", 0))
-        debug_end = int(getattr(self.args, "debug_step_end", 10000))
-        cur_step = int(getattr(self, "total_env_steps", 0))
-
-        if cur_step < debug_start or cur_step > debug_end:
-            return
-
-        run_dir = self._get_run_dir()
-        path = os.path.join(run_dir, "debug_rollout_step.csv")
-        path = _get_run_csv_path(path)
-
-        def _flat(x, max_items=80):
-            if x is None:
-                return ""
-            try:
-                if torch.is_tensor(x):
-                    x = x.detach().cpu().numpy()
-                arr = np.asarray(x)
-                return arr.reshape(-1)[:max_items].tolist()
-            except Exception as e:
-                return f"ERR:{repr(e)}"
-
-        import hashlib
-
-        def _hash_array(x):
-            if x is None:
-                return ""
-            try:
-                if torch.is_tensor(x):
-                    x = x.detach().cpu().numpy()
-                arr = np.asarray(x)
-                return hashlib.md5(arr.tobytes()).hexdigest()
-            except Exception as e:
-                return f"ERR:{repr(e)}"
-
-        def _rng_head(obj):
-            try:
-                if obj is None or not hasattr(obj, "rng"):
-                    return ""
-                st = obj.rng.get_state()
-                return str(st[1][:10].tolist())
-            except Exception as e:
-                return f"ERR:{repr(e)}"
-
-        def _param_sig(module, max_params=3):
-            """
-            轻量参数签名，不追求加密 hash，只用于判断两次 run 的网络参数是否已经分叉。
-            """
-            if module is None:
-                return ""
-            try:
-                vals = []
-                cnt = 0
-                for p in module.parameters():
-                    x = p.detach().float().cpu()
-                    vals.append(float(x.sum().item()))
-                    cnt += 1
-                    if cnt >= max_params:
-                        break
-                return str(vals)
-            except Exception as e:
-                return f"ERR:{repr(e)}"
-
-        info_dict = {}
-        try:
-            info_dict = self._extract_first_info_dict(infos, env_i=0) if infos is not None else {}
-        except Exception:
-            info_dict = {}
-
-        row = {
-            "total_env_steps": cur_step,
-            "tag": str(tag),
-            "t": int(t),
-            "actions": _flat(actions),
-            "env_acts": _flat(env_acts),
-            "rewards": _flat(rewards),
-            "dones": _flat(dones),
-            "avail_acts": _flat(avail_acts),
-            "adj": _flat(adj),
-            "prob_adj": _flat(prob_adj),
-            "rnn_states_head": _flat(rnn_states, max_items=20),
-            "info_num_players": info_dict.get("num_players", ""),
-            "info_valid_indices": _flat(info_dict.get("valid_indices", None)),
-            "info_active_masks": _flat(info_dict.get("active_masks", None)),
-            "info_individual_rewards": _flat(info_dict.get("individual_rewards", None)),
-            "obs_hash": _hash_array(obs),
-            "share_obs_hash": _hash_array(share_obs),
-            "actions_hash": _hash_array(actions),
-            "env_acts_hash": _hash_array(env_acts),
-            "rewards_hash": _hash_array(rewards),
-            "dones_hash": _hash_array(dones),
-            "avail_acts_hash": _hash_array(avail_acts),
-            "adj_hash": _hash_array(adj),
-            "prob_adj_hash": _hash_array(prob_adj),
-            "rnn_states_hash": _hash_array(rnn_states),
-
-            "policy_rng_head": _rng_head(policy),
-            "policy_param_sig": _param_sig(policy),
-            "adj_param_sig": _param_sig(adj_network),
-        }
-
-        df = pd.DataFrame([row])
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        write_header = not os.path.exists(path)
-        df.to_csv(path, mode="a", header=write_header, index=False)
-
     def _dump_eval_episode_step_tables(self, eval_step: int, eval_ep: int, step_info: dict, eval_id: int = 0):
         """
         将评估阶段步骤轨迹添加到 progress_eval_num_players_traj.csv , progress_eval_individual_rewards.csv
@@ -480,14 +350,44 @@ class WolfpackRunner(RecRunner):
         t_idx = np.arange(T, dtype=np.int32)
 
         if T > 0:
-            df_np_long = pd.DataFrame({
+            data = {
                 "eval_id": int(eval_id),
                 "step": int(eval_step),
                 "eval_ep": int(eval_ep),
                 "t": t_idx,
                 "num_players": num_players.astype(np.int32),
-            })
+            }
+            team_rewards = np.asarray(step_info.get("team_rewards", []), dtype=np.float32).reshape(-1)
+            if team_rewards.size == T:
+                data["team_reward"] = team_rewards
+            df_np_long = pd.DataFrame(data)
             _append_df_csv(os.path.join(run_dir, "progress_eval_num_players_traj.csv"), df_np_long)
+
+        # ---------- t -> 显式拓扑事件 ----------
+        # 不再只看 num_players 差分；同一步退出和加入时人数可能不变。
+        event_rows = []
+        for event in step_info.get("topology_events", []):
+            row = {
+                "eval_id": int(eval_id),
+                "step": int(eval_step),
+                "eval_ep": int(eval_ep),
+                "episode_step": int(event.get("episode_step", 0)),
+                "topology_changed": int(bool(event.get("topology_changed", False))),
+                "left_count": int(event.get("left_count", 0)),
+                "joined_count": int(event.get("joined_count", 0)),
+                "recovered_count": int(event.get("recovered_count", 0)),
+                "pending_recovery_count": int(event.get("pending_recovery_count", 0)),
+                "left_slots": ",".join(map(str, event.get("left_slots", []))),
+                "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
+                "recovered_slots": ",".join(map(str, event.get("recovered_slots", []))),
+                "slot_uids": ",".join(map(str, event.get("slot_uids", []))),
+            }
+            event_rows.append(row)
+        if event_rows:
+            _append_df_csv(
+                os.path.join(run_dir, "progress_eval_topology_events.csv"),
+                pd.DataFrame(event_rows),
+            )
 
         # ---------- t -> individual_rewards (WIDE FORMAT) ----------
         ir_list = step_info.get("individual_rewards", None)
@@ -539,12 +439,38 @@ class WolfpackRunner(RecRunner):
         # ---------- t -> num_players ----------
         num_players = np.asarray(step_info.get("num_players", []), dtype=np.float32).reshape(-1)
         if num_players.size > 0:
-            df_np = pd.DataFrame({
+            data = {
                 "step": int(train_step),
                 "t": np.arange(num_players.size, dtype=np.int32),
                 "num_players": num_players.astype(np.int32),
-            })
+            }
+            team_rewards = np.asarray(step_info.get("team_rewards", []), dtype=np.float32).reshape(-1)
+            if team_rewards.size == num_players.size:
+                data["team_reward"] = team_rewards
+            df_np = pd.DataFrame(data)
             _append_df_csv(os.path.join(run_dir, "progress_train_num_players_traj.csv"), df_np)
+
+        # ---------- t -> 显式拓扑事件 ----------
+        event_rows = []
+        for event in step_info.get("topology_events", []):
+            event_rows.append({
+                "step": int(train_step),
+                "episode_step": int(event.get("episode_step", 0)),
+                "topology_changed": int(bool(event.get("topology_changed", False))),
+                "left_count": int(event.get("left_count", 0)),
+                "joined_count": int(event.get("joined_count", 0)),
+                "recovered_count": int(event.get("recovered_count", 0)),
+                "pending_recovery_count": int(event.get("pending_recovery_count", 0)),
+                "left_slots": ",".join(map(str, event.get("left_slots", []))),
+                "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
+                "recovered_slots": ",".join(map(str, event.get("recovered_slots", []))),
+                "slot_uids": ",".join(map(str, event.get("slot_uids", []))),
+            })
+        if event_rows:
+            _append_df_csv(
+                os.path.join(run_dir, "progress_train_topology_events.csv"),
+                pd.DataFrame(event_rows),
+            )
 
         # ---------- t -> active masks ----------
         active_masks = step_info.get("active_masks", [])
@@ -633,7 +559,10 @@ class WolfpackRunner(RecRunner):
             "num_players_std": [],
             "join_events": [],
             "leave_events": [],
+            "recover_events": [],
             "roster_change_events": [],
+            "pending_recovery_final": [],
+            "recovery_completion_rate": [],
             "active_ratio_mean": [],
             "active_ratio_min": [],
             "active_ratio_max": [],
@@ -661,7 +590,7 @@ class WolfpackRunner(RecRunner):
                     eval_infos[k] = []
                 eval_infos[k].append(v)
 
-        # ==================== 修改点：eval 后计算均值，用于 best checkpoint ====================
+        # 计算评估均值，用于 best checkpoint。
         self.log_env(eval_infos, suffix="eval_")
 
         eval_summary = {}
@@ -694,75 +623,54 @@ class WolfpackRunner(RecRunner):
 
         obs, share_obs, avail_acts = env.reset()
 
-        # ====== 可视化/录制：实时弹窗 + 同步保存 mp4（强制打印调试信息）======
+        # 可视化/录制为可选功能；训练默认关闭。
         render_enabled = bool(getattr(self.args, "render", False))
         save_video = bool(getattr(self.args, "save_video", False))
         video_path = getattr(self.args, "video_path", None)
         render_fps = float(getattr(self.args, "render_fps", getattr(self.args, "fps", 10)))
 
-        # 只要给了 video_path，就认为要保存视频
         if video_path is not None and str(video_path).strip() != "":
             save_video = True
-        if save_video and (video_path is None or str(video_path).strip() == ""):
-            video_path = os.path.join(str(getattr(self, "run_dir", ".")), "episode.mp4")
-
-        # 统一成绝对路径，避免你找不到输出文件
-        video_path = os.path.abspath(str(video_path))
+        if save_video:
+            if video_path is None or str(video_path).strip() == "":
+                video_path = os.path.join(str(getattr(self, "run_dir", ".")), "episode.mp4")
+            video_path = os.path.abspath(str(video_path))
 
         # 仅支持 DummyVecEnv 的 env.envs[0] 渲染/抓帧
         base_env = None
         if hasattr(env, "envs") and isinstance(getattr(env, "envs"), list) and len(env.envs) > 0:
             base_env = env.envs[0]
 
-        #print(f"[play] render_enabled={render_enabled}, save_video={save_video}", flush=True)
-        #print(f"[play] video_path={video_path}", flush=True)
-        #print(f"[play] base_env={'OK' if base_env is not None else 'NONE'}", flush=True)
-
         video_writer = None
         video_size = None
-        frame_count = 0
-        warned_no_visualizer = False
 
         def _render_and_grab_rgb():
-            nonlocal warned_no_visualizer, render_enabled
+            nonlocal render_enabled
 
             if base_env is None:
                 return None
 
-            # 先尝试正常 render（有显示设备时弹窗+抓屏）
             try:
                 if render_enabled:
                     base_env.render()
-            except Exception as e:
-                msg = str(e)
-                print(f"[render] base_env.render() failed: {repr(e)}", flush=True)
-                # 无显示设备：自动关闭窗口渲染，改用离屏渲染
-                if "No available video device" in msg:
-                    render_enabled = False
-                # 继续走离屏渲染
-            except BaseException as e:
-                print(f"[render] unexpected render error: {repr(e)}", flush=True)
+            except Exception:
+                # 服务器无显示设备时关闭窗口渲染；如需视频则继续走离屏路径。
                 render_enabled = False
 
             if not save_video:
                 return None
 
-            # 1) 若可用 pygame screen，则直接抓屏（仅当 render_enabled=True 且 visualizer 存在）
             if render_enabled:
                 try:
                     import pygame
-                    if getattr(base_env, "visualizer", None) is None:
-                        if not warned_no_visualizer:
-                            print("[grab] base_env.visualizer is None", flush=True)
-                            warned_no_visualizer = True
-                    else:
+                    if getattr(base_env, "visualizer", None) is not None:
                         screen = getattr(base_env.visualizer, "screen", None)
                         if screen is not None:
-                            arr = pygame.surfarray.array3d(screen)  # (W,H,3)
+                            arr = pygame.surfarray.array3d(screen)
                             frame = np.transpose(arr, (1, 0, 2)).copy()
                             return frame
-                except Exception as e:
-                    print(f"[grab] pygame grab failed: {repr(e)}", flush=True)
+                except Exception:
+                    pass
 
             # 2) 离屏渲染：不依赖显示设备。直接用 base_env.grid 画 RGB 帧（纯 numpy）
             try:
@@ -794,8 +702,7 @@ class WolfpackRunner(RecRunner):
                 frame = np.repeat(np.repeat(rgb, cell, axis=0), cell, axis=1)
                 return frame
 
-            except Exception as e:
-                print(f"[offscreen] render failed: {repr(e)}", flush=True)
+            except Exception:
                 return None
 
         def _ensure_writer(frame_rgb):
@@ -818,10 +725,8 @@ class WolfpackRunner(RecRunner):
                     video_writer = imageio.get_writer(video_path, fps=render_fps, codec="mpeg4")
 
                 video_size = (w, h)
-                print(f"[video] writer created. fps={render_fps}, size={video_size}", flush=True)
 
         def _write_frame(frame_rgb):
-            nonlocal frame_count
             if frame_rgb is None:
                 return
             _ensure_writer(frame_rgb)
@@ -831,9 +736,6 @@ class WolfpackRunner(RecRunner):
             if video_size != (w, h):
                 return
             video_writer.append_data(frame_rgb)
-            frame_count += 1
-            if frame_count % 30 == 0:
-                print(f"[video] frames_written={frame_count}", flush=True)
 
         # reset 后先渲染/抓首帧
         if render_enabled or save_video:
@@ -847,8 +749,17 @@ class WolfpackRunner(RecRunner):
         num_players_traj: List[int] = []
         individual_rewards_traj: List[np.ndarray] = []  # list of (N,1)
         active_masks_traj: List[np.ndarray] = []  # list of (N,1)
-        valid_indices_traj: List[np.ndarray] = []  # list of (N,)
+        topology_events_traj: List[Dict[str, Any]] = []
+        team_rewards_traj: List[float] = []
         adj_metrics_traj: List[Dict[str, float]] = []  # list of per-step adj structure metrics
+
+        # 显式事件计数避免仅依赖 num_players 差分；同一步退出和加入可能相互抵消。
+        explicit_event_info_seen = False
+        left_event_count = 0
+        join_event_count = 0
+        recover_event_count = 0
+        topology_change_steps = 0
+        pending_recovery_final = 0
 
         # 每次 rollout 开始先清空，避免 eval() 读到上一个 episode 的残留
         self.last_episode_step_info = None
@@ -923,6 +834,10 @@ class WolfpackRunner(RecRunner):
         t = 0
         while t < self.episode_length:
 
+            # 当前图、动作和 Q 值都对应 s_t，必须保留该时刻的 mask。
+            dones_curr = dones.copy()
+            active_masks_curr = (~dones_curr).astype(np.float32)
+
             obs_batch = np.concatenate(obs)
             states_batch = np.concatenate(share_obs)
             avail_acts_batch = np.concatenate(avail_acts)
@@ -930,11 +845,13 @@ class WolfpackRunner(RecRunner):
             # ------ 与 SMACRunner/PREYRunner 同：先更新 RNN hidden ------
             if self.algorithm_name in self.adj_correlation:  # get actions for all agents to step the env
 
-                # _, rnn_states_batch, _ = policy.get_hidden_states(obs_batch, last_acts_batch, rnn_states_batch)
-                # ====== 核心修复 2A：在 rollout 时正确重置断线/新加入者的 RNN 状态 ======
-                _, rnn_states_batch, _ = policy.get_hidden_states( obs_batch, last_acts_batch, rnn_states_batch, dones=dones.reshape(-1, 1))
+                _, rnn_states_batch, _ = policy.get_hidden_states(
+                    obs_batch,
+                    last_acts_batch,
+                    rnn_states_batch,
+                    dones=dones.reshape(-1, 1),
+                )
                 rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
-                # =====================================================================
 
                 if self.use_dyn_graph:
                     prob_adj, adj, _ = self.adj_network.sample(
@@ -946,7 +863,6 @@ class WolfpackRunner(RecRunner):
                         self.total_env_steps
                     )
 
-                    # ===== 修改点：DDFG/SDDFG 通用 factor-level mask =====
                     prob_adj, adj = self._mask_adj_by_dones(
                         adj=adj,
                         prob_adj=prob_adj,
@@ -959,7 +875,7 @@ class WolfpackRunner(RecRunner):
                     adj_all = torch.cat([adj.cpu().detach(), eye.cpu()], dim=2)
 
                 else:
-                    # ===== 修改点：静态图同样必须按动态存活 mask 过滤 =====
+                    # 静态图同样按当前成员状态过滤失效 factor。
                     adj = self.adj.to(self.device) if torch.is_tensor(self.adj) else torch.as_tensor(self.adj,
                                                                                                      device=self.device)
                     if adj.dim() == 2:
@@ -977,26 +893,6 @@ class WolfpackRunner(RecRunner):
 
                     eye = self._build_alive_eye(self.num_agents, dones, adj.device)
                     adj_all = torch.cat([adj.cpu().detach(), eye.cpu()], dim=2)
-
-                # ===== DEBUG: policy action 前，记录 obs / rnn / adj / rng / 参数状态 =====
-                self._debug_dump_rollout_step(
-                    tag="before_policy_action",
-                    t=t,
-                    obs=obs_batch,
-                    share_obs=states_batch,
-                    actions=None,
-                    env_acts=None,
-                    rewards=None,
-                    dones=dones,
-                    infos=None,
-                    avail_acts=avail_acts_batch,
-                    adj=adj if "adj" in locals() else None,
-                    prob_adj=prob_adj if "prob_adj" in locals() else None,
-                    rnn_states=rnn_states_batch,
-                    base_env=base_env,
-                    policy=policy,
-                    adj_network=self.adj_network if hasattr(self, "adj_network") else None,
-                )
 
                 # 动作选择
                 if warmup:
@@ -1057,52 +953,18 @@ class WolfpackRunner(RecRunner):
             rnn_states_batch = rnn_states_batch if isinstance(rnn_states_batch,
                                                               np.ndarray) else rnn_states_batch.cpu().detach().numpy()
 
-            # ===== 修改点：只有当前时刻存活的 slot 才有真实上一动作；新加入 slot 下一步 prev_action 应为 0 =====
-            active_masks_curr = (~dones.squeeze(-1)).astype(np.float32).reshape(-1, 1)
-            last_acts_batch = acts_batch * active_masks_curr
+            # replay 中 t 时刻的 hidden 必须与当前 adj/action 对应。环境事件发生后
+            # 会重置 live hidden，因此先保存事件前快照，避免时间对齐被破坏。
+            rnn_states_for_transition = np.array(rnn_states_batch, copy=True)
+
+            # 只有 s_t 存活的 slot 才保存动作；空槽位的 previous action 必须为 0。
+            active_masks_curr_flat = active_masks_curr.reshape(-1, 1)
+            last_acts_batch = acts_batch * active_masks_curr_flat
 
             env_acts = np.split(acts_batch, self.num_envs)
 
-            # ===== DEBUG: step 前记录 policy 输出动作 =====
-            self._debug_dump_rollout_step(
-                tag="before_env_step",
-                t=t,
-                obs=obs,
-                actions=acts_batch,
-                env_acts=env_acts,
-                rewards=None,
-                dones=dones,
-                infos=None,
-                avail_acts=avail_acts,
-                adj=adj if "adj" in locals() else None,
-                prob_adj=prob_adj if "prob_adj" in locals() else None,
-                rnn_states=rnn_states_batch,
-                share_obs=states_batch,
-                policy=policy,
-                adj_network=self.adj_network if hasattr(self, "adj_network") else None,
-            )
-
             # Env step
             next_obs, next_share_obs, rewards, env_dones, infos, next_avail_acts = env.step(env_acts)
-
-            # ===== DEBUG: step 后记录 env 返回 =====
-            self._debug_dump_rollout_step(
-                tag="after_env_step",
-                t=t,
-                obs=next_obs,
-                actions=acts_batch,
-                env_acts=env_acts,
-                rewards=rewards,
-                dones=env_dones,
-                infos=infos,
-                avail_acts=next_avail_acts,
-                adj=adj if "adj" in locals() else None,
-                prob_adj=prob_adj if "prob_adj" in locals() else None,
-                rnn_states=rnn_states_batch,
-                share_obs=states_batch,
-                policy=policy,
-                adj_network=self.adj_network if hasattr(self, "adj_network") else None,
-            )
 
             # 可视化/录制：每步渲染并抓帧写入 mp4
             if (render_enabled or save_video) and base_env is not None:
@@ -1113,12 +975,28 @@ class WolfpackRunner(RecRunner):
 
             active_masks_next = self._extract_active_masks_batch(infos, self.num_envs, self.num_agents,
                                                                  fallback_obs=next_obs)
-            dones = np.logical_or(env_dones, active_masks_next == 0)
+
+            # 区分“图中不存在”和“RNN 需要重置”。新加入/恢复成员应立即参与
+            # s_{t+1} 的图，但不能继承该槽位以前的 hidden/previous action。
+            joined_masks = np.logical_and(active_masks_curr == 0, active_masks_next == 1)
+            next_dones = np.logical_or(env_dones, active_masks_next == 0)
+            rnn_reset_masks = np.logical_or(next_dones, joined_masks)
+
+            rnn_states_batch = self._mask_rnn_states_by_dones(
+                rnn_states_batch, rnn_reset_masks
+            )
+            last_acts_batch = last_acts_batch * (
+                1.0 - joined_masks.reshape(-1, 1).astype(np.float32)
+            )
+
+            active_masks = active_masks_next
+            dones = next_dones
 
             # ========== 解析 wolfpack env 返回的 infos，并记录逐步轨迹 ==========
             info_dict = self._extract_first_info_dict(infos, env_i=0)
+            has_fresh_info = isinstance(info_dict, dict) and bool(info_dict)
 
-            if info_dict:
+            if has_fresh_info:
                 last_info_dict = info_dict
             else:
                 info_dict = last_info_dict if isinstance(last_info_dict, dict) else {}
@@ -1154,13 +1032,46 @@ class WolfpackRunner(RecRunner):
                 except Exception:
                     pass
 
-            vi = info_dict.get("valid_indices", None)
-            if vi is not None:
+            if "team_reward" in info_dict:
                 try:
-                    vi_arr = np.asarray(vi, dtype=np.int32).reshape(-1)
-                    valid_indices_traj.append(vi_arr.copy())
+                    team_rewards_traj.append(float(info_dict["team_reward"]))
                 except Exception:
-                    pass
+                    team_rewards_traj.append(0.0)
+
+            event_keys = {
+                "left_count", "joined_count", "recovered_count",
+                "topology_changed", "pending_recovery_count"
+            }
+            if has_fresh_info and any(key in info_dict for key in event_keys):
+                explicit_event_info_seen = True
+                left_count = int(info_dict.get("left_count", 0))
+                joined_count = int(info_dict.get("joined_count", 0))
+                recovered_count = int(info_dict.get("recovered_count", 0))
+
+                left_event_count += left_count
+                join_event_count += joined_count
+                recover_event_count += recovered_count
+                pending_recovery_final = int(info_dict.get("pending_recovery_count", 0))
+
+                topology_changed = bool(info_dict.get(
+                    "topology_changed",
+                    left_count or joined_count or recovered_count,
+                ))
+                if topology_changed:
+                    topology_change_steps += 1
+
+                topology_events_traj.append({
+                    "episode_step": int(info_dict.get("episode_step", t + 1)),
+                    "topology_changed": topology_changed,
+                    "left_count": left_count,
+                    "joined_count": joined_count,
+                    "recovered_count": recovered_count,
+                    "pending_recovery_count": pending_recovery_final,
+                    "left_slots": list(info_dict.get("left_slots", [])),
+                    "joined_slots": list(info_dict.get("joined_slots", [])),
+                    "recovered_slots": list(info_dict.get("recovered_slots", [])),
+                    "slot_uids": list(info_dict.get("slot_uids", [])),
+                })
 
             if training_episode or warmup:
                 self.total_env_steps += self.num_envs
@@ -1178,18 +1089,18 @@ class WolfpackRunner(RecRunner):
             episode_share_obs[p_id][t] = share_obs
             episode_acts[p_id][t] = env_acts
             episode_rewards[p_id][t] = rewards
-            episode_rnn_states[p_id][t] = rnn_states_batch
+            episode_rnn_states[p_id][t] = rnn_states_for_transition
 
             # here dones store agent done flag of the next step
             if self.algorithm_name in self.adj_correlation:
                 env_adj = (
                     adj.cpu().detach().numpy()[0]
-                    if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"]
+                    if self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS
                     else adj.cpu().detach().numpy()
                 )
                 env_prob_adj = (
                     prob_adj.cpu().detach().numpy()[0]
-                    if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"]
+                    if self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS
                     else prob_adj.cpu().detach().numpy()
                 )
                 episode_adj[p_id][t] = env_adj
@@ -1198,12 +1109,13 @@ class WolfpackRunner(RecRunner):
                 # ===== 日志新增：记录每步邻接图结构质量，兼容 DDFG 与 SDDFG/GAT =====
                 try:
                     adj_metrics_traj.append(
-                        self._calc_adj_metrics(adj, dones, self.num_agents)
+                        # adj 是 s_t 的图，必须使用事件发生前的 dones_curr。
+                        self._calc_adj_metrics(adj, dones_curr, self.num_agents)
                     )
                 except Exception:
                     pass
 
-                if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"] and not warmup:
+                if self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS and not warmup:
                     episode_qtot[p_id][t] = qtot.cpu().detach().numpy()
                     episode_f_q[p_id][t] = f_q.cpu().detach().numpy()
                     if self.use_vfunction:
@@ -1245,13 +1157,10 @@ class WolfpackRunner(RecRunner):
         if self.algorithm_name in self.adj_correlation:
             obs_batch = np.concatenate(obs)
 
-            #_, rnn_states_batch, _ = policy.get_hidden_states(obs_batch, last_acts_batch, rnn_states_batch)
-            # ====== 核心修复 2B：回合结束时同步重置 ======
             _, rnn_states_batch, _ = policy.get_hidden_states(
                 obs_batch, last_acts_batch, rnn_states_batch, dones=dones.reshape(-1, 1)
             )
             rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
-            # ============================================
 
             if self.use_dyn_graph:
                 prob_adj, adj, _ = self.adj_network.sample(
@@ -1289,12 +1198,13 @@ class WolfpackRunner(RecRunner):
             rnn_states_batch = rnn_states_batch if isinstance(rnn_states_batch,
                                                               np.ndarray) else rnn_states_batch.cpu().detach().numpy()
             env_adj = (
-                adj.cpu().detach().numpy()[0] if self.algorithm_name in ["sddfg","ddfg",
-                                                                         "ddfg_low", "sddfg"] else adj.cpu().detach().numpy()
+                adj.cpu().detach().numpy()[0]
+                if self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS
+                else adj.cpu().detach().numpy()
             )
             env_prob_adj = (
                 prob_adj.cpu().detach().numpy()[0]
-                if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"]
+                if self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS
                 else prob_adj.cpu().detach().numpy()
             )
             episode_adj[p_id][t] = env_adj
@@ -1317,8 +1227,11 @@ class WolfpackRunner(RecRunner):
                                      episode_prob_adj,
                                      )
 
-            if self.algorithm_name in ["sddfg","ddfg", "ddfg_low", "sddfg"] and self.total_env_steps >= self.adj_begin_step and (
-            not warmup):
+            if (
+                self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS
+                and self.total_env_steps >= self.adj_begin_step
+                and not warmup
+            ):
                 self.num_adj_episodes_collected += self.num_envs
                 rewards_normed = self.buffer.norm_reward(ind)
 
@@ -1342,8 +1255,9 @@ class WolfpackRunner(RecRunner):
         self.last_episode_step_info = {
             "num_players": num_players_traj,
             "individual_rewards": individual_rewards_traj,
+            "team_rewards": team_rewards_traj,
             "active_masks": active_masks_traj,
-            "valid_indices": valid_indices_traj,
+            "topology_events": topology_events_traj,
             "adj_metrics": adj_metrics_traj,
         }
 
@@ -1356,15 +1270,32 @@ class WolfpackRunner(RecRunner):
             env_info["num_players_max"] = float(np_players.max())
             env_info["num_players_std"] = float(np_players.std())
 
-            if np_players.shape[0] > 1:
+            if explicit_event_info_seen:
+                # 环境显式事件可区分新成员与原成员恢复，也不会被同一步增减抵消。
+                env_info["join_events"] = float(join_event_count)
+                env_info["leave_events"] = float(left_event_count)
+                env_info["recover_events"] = float(recover_event_count)
+                env_info["roster_change_events"] = float(topology_change_steps)
+                env_info["pending_recovery_final"] = float(pending_recovery_final)
+                env_info["recovery_completion_rate"] = (
+                    float(recover_event_count) / max(float(left_event_count), 1.0)
+                )
+            elif np_players.shape[0] > 1:
+                # 兼容没有显式事件字段的旧环境。
                 diff = np.diff(np_players)
                 env_info["join_events"] = float(np.maximum(diff, 0).sum())
                 env_info["leave_events"] = float(np.maximum(-diff, 0).sum())
                 env_info["roster_change_events"] = float(np.count_nonzero(diff))
+                env_info["recover_events"] = 0.0
+                env_info["pending_recovery_final"] = 0.0
+                env_info["recovery_completion_rate"] = 0.0
             else:
                 env_info["join_events"] = 0.0
                 env_info["leave_events"] = 0.0
+                env_info["recover_events"] = 0.0
                 env_info["roster_change_events"] = 0.0
+                env_info["pending_recovery_final"] = 0.0
+                env_info["recovery_completion_rate"] = 0.0
 
         if len(active_masks_traj) > 0:
             try:
@@ -1406,7 +1337,10 @@ class WolfpackRunner(RecRunner):
         env_info.setdefault("num_players_std", 0.0)
         env_info.setdefault("join_events", 0.0)
         env_info.setdefault("leave_events", 0.0)
+        env_info.setdefault("recover_events", 0.0)
         env_info.setdefault("roster_change_events", 0.0)
+        env_info.setdefault("pending_recovery_final", 0.0)
+        env_info.setdefault("recovery_completion_rate", 0.0)
         env_info.setdefault("active_ratio_mean", 0.0)
         env_info.setdefault("active_ratio_min", 0.0)
         env_info.setdefault("active_ratio_max", 0.0)
@@ -1430,17 +1364,12 @@ class WolfpackRunner(RecRunner):
             except Exception as e:
                 print(f"[log] dump train step tables failed: {repr(e)}", flush=True)
 
-        # 关闭视频写入器（确保 mp4 文件落盘）
-        try:
-            if video_writer is not None:
+        # 关闭视频写入器，确保 mp4 文件落盘。
+        if video_writer is not None:
+            try:
                 video_writer.close()
-                #print(f"[video] done. total_frames={frame_count}", flush=True)
-                #print(f"[video] saved: {video_path}", flush=True)
-            else:
-                print("[video] writer was never created (0 frames captured).", flush=True)
-                #print(f"[video] expected path: {video_path}", flush=True)
-        except Exception as e:
-            print(f"[video] close failed: {repr(e)}", flush=True)
+            except Exception:
+                pass
 
         return env_info
 
@@ -1518,7 +1447,10 @@ class WolfpackRunner(RecRunner):
             "num_players_std": [],
             "join_events": [],
             "leave_events": [],
+            "recover_events": [],
             "roster_change_events": [],
+            "pending_recovery_final": [],
+            "recovery_completion_rate": [],
 
             # active mask 覆盖率
             "active_ratio_mean": [],

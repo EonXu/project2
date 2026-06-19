@@ -84,7 +84,6 @@ class Adj_Generator(nn.Module):
             negative_slope=gat_slope
         )
 
-        # ===== 修改点：三阶超边 scorer =====
         # 输入为三条 pair score: [s_ij, s_ik, s_jk]
         # 输出为 gate，最终 hyperedge_score = mean(pair_scores) * sigmoid(gate)
         hyperedge_hidden = int(getattr(args, "gat_hyperedge_hidden", getattr(args, "adj_hidden_dim", 32)))
@@ -105,18 +104,35 @@ class Adj_Generator(nn.Module):
 
     def _prepare_inputs(self, rnn_obs, dones):
         rnn_obs = to_torch(rnn_obs).to(self.device)
-        if len(rnn_obs.shape) == 2:
+
+        if rnn_obs.dim() == 2:
             rnn_obs = rnn_obs.unsqueeze(0)
 
         B, N, _ = rnn_obs.shape
+        if N != self.num_variable:
+            raise RuntimeError(
+                f"fixed-capacity mismatch: graph N={N}, "
+                f"max_player_num={self.num_variable}"
+            )
 
-        if dones is not None:
+        # 兼容没有 torch.nan_to_num 的旧 PyTorch。
+        rnn_obs = torch.where(
+            torch.isfinite(rnn_obs),
+            rnn_obs,
+            torch.zeros_like(rnn_obs),
+        )
+
+        if dones is None:
+            exist_mask = torch.ones(
+                B, N, device=self.device, dtype=torch.float32
+            )
+        else:
             dones_t = to_torch(dones).to(self.device)
             dones_t = dones_t.reshape(B, N, -1)[..., 0]
             exist_mask = (1.0 - dones_t.float()).clamp(0.0, 1.0)
-        else:
-            exist_mask = torch.ones(B, N, device=self.device, dtype=torch.float32)
 
+        # 即使 Runner 漏掉一次 hidden 清理，失效节点也不会进入 GAT
+        rnn_obs = rnn_obs * exist_mask.unsqueeze(-1)
         return rnn_obs, exist_mask
 
     def _pair_score(self, A, exist_mask):
@@ -217,7 +233,7 @@ class Adj_Generator(nn.Module):
         entropy = entropy_scalar * exist_mask
         return entropy
 
-    def _select_candidates(self, pair_score, exist_mask, explore=False, t_env=None):
+    def _select_candidates(self, pair_score):
         """
         从二阶 pair 与三阶 hyperedge 候选中统一 TopK。
         return:
@@ -320,9 +336,6 @@ class Adj_Generator(nn.Module):
 
         prob_adj, cond_adj = self._select_candidates(
             pair_score=pair_score,
-            exist_mask=exist_mask,
-            explore=explore,
-            t_env=t_env
         )
 
         entropy = self._candidate_entropy(pair_score, exist_mask)

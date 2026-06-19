@@ -8,9 +8,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import math
-import sys
+import random
 import gym
-import os
 from pathlib import Path
 import wandb
 import socket
@@ -26,10 +25,6 @@ import envs.Wolfpack
 from envs.env_wrappers import ShareDummyVecEnv, ShareSubprocVecEnv
 
 def set_global_seeds(seed: int, cuda_deterministic: bool = True):
-    import random
-    import numpy as np
-    import torch
-
     seed = int(seed)
 
     random.seed(seed)
@@ -75,7 +70,6 @@ def set_global_seeds(seed: int, cuda_deterministic: bool = True):
         except Exception:
             pass
 
-# ===== 修改点 5：train_wolfpack.py 中新增 run 前缀工具函数 =====
 def get_run_csv_path(run_dir, filename):
     """
     生成带 run 前缀的 CSV 路径。
@@ -131,15 +125,21 @@ def make_train_env(all_args):
                 random_grid_dir=all_args.random_grid_dir,
                 prey_with_gpu=all_args.prey_with_gpu,
                 close_penalty=all_args.close_penalty,
+                intra_episode_dynamic=all_args.intra_episode_dynamic,
+                shock_steps=all_args.shock_steps,
+                shock_remove_num=all_args.shock_remove_num,
+                shock_join_delay=all_args.shock_join_delay,
+                shock_join_num=all_args.shock_join_num,
+                shock_recover_delay=all_args.shock_recover_delay,
+                dynamic_min_agents=all_args.dynamic_min_agents,
+                continue_after_success=all_args.continue_after_success,
             )
 
-            #env = gym.make("wolfpack-v0", **wolf_kwargs)
             env = gym.make(all_args.wolfpack_id, **wolf_kwargs)
             return env
 
         return init_env
 
-    #return ShareDummyVecEnv([get_env_fn()])
     if all_args.n_training_threads == 1:
         return ShareDummyVecEnv([get_env_fn(0)])
     return ShareSubprocVecEnv([get_env_fn(i) for i in range(all_args.n_training_threads)])
@@ -181,14 +181,20 @@ def make_eval_env(all_args):
                 random_grid_dir=all_args.random_grid_dir,
                 prey_with_gpu=all_args.prey_with_gpu,
                 close_penalty=all_args.close_penalty,
+                intra_episode_dynamic=all_args.intra_episode_dynamic,
+                shock_steps=all_args.shock_steps,
+                shock_remove_num=all_args.shock_remove_num,
+                shock_join_delay=all_args.shock_join_delay,
+                shock_join_num=all_args.shock_join_num,
+                shock_recover_delay=all_args.shock_recover_delay,
+                dynamic_min_agents=all_args.dynamic_min_agents,
+                continue_after_success=all_args.continue_after_success,
             )
 
-            # env = gym.make("wolfpack-v0", **wolf_kwargs)
             env = gym.make(all_args.wolfpack_id, **wolf_kwargs)
             return env
         return init_env
 
-    #return ShareDummyVecEnv([get_env_fn()])
     if all_args.n_eval_rollout_threads == 1:
         return ShareDummyVecEnv([get_env_fn(0)])
     return ShareSubprocVecEnv([get_env_fn(i) for i in range(all_args.n_eval_rollout_threads)])
@@ -238,6 +244,55 @@ def parse_args(args, parser):
     parser.add_argument("--del_rate", type=float, default=0.1,
                         help="每步删除玩家的概率")
 
+    parser.add_argument(
+        "--intra_episode_dynamic",
+        action="store_true",
+        default=False,
+        help="启用单回合内脚本化退出、加入和恢复"
+    )
+    parser.add_argument(
+        "--shock_steps",
+        type=str,
+        default="",
+        help="突发退出时间步，逗号分隔，例如 50,120"
+    )
+    parser.add_argument(
+        "--shock_remove_num",
+        type=int,
+        default=0,
+        help="每次突发退出的智能体数量"
+    )
+    parser.add_argument(
+        "--shock_join_delay",
+        type=int,
+        default=10,
+        help="突发退出后多少步加入新成员"
+    )
+    parser.add_argument(
+        "--shock_join_num",
+        type=int,
+        default=0,
+        help="每次突发事件后加入的新成员数量"
+    )
+    parser.add_argument(
+        "--shock_recover_delay",
+        type=int,
+        default=30,
+        help="退出成员恢复所需步数，必须大于 0"
+    )
+    parser.add_argument(
+        "--dynamic_min_agents",
+        type=int,
+        default=2,
+        help="回合内至少保留的在线智能体数量"
+    )
+    parser.add_argument(
+        "--continue_after_success",
+        action="store_true",
+        default=False,
+        help="全部 prey 暂时被冻结后不提前结束，继续到 episode_length"
+    )
+
     # 观测类型
     parser.add_argument("--obs_type", type=str, default="vector",
                         help="观测类型：vector/partial_obs/full_rgb")
@@ -252,6 +307,58 @@ def parse_args(args, parser):
     parser.add_argument('--highest_orders', type=int, default=3, help="number of agents")
 
     all_args = parser.parse_known_args(args)[0]
+
+    if all_args.intra_episode_dynamic:
+        try:
+            shock_step_values = sorted({
+                int(value.strip())
+                for value in all_args.shock_steps.split(",")
+                if value.strip()
+            })
+        except ValueError as exc:
+            raise ValueError("--shock_steps must be comma-separated integers") from exc
+
+        if not shock_step_values:
+            raise ValueError("--shock_steps cannot be empty in intra-episode dynamic mode")
+        if all_args.shock_recover_delay <= 0:
+            raise ValueError("--shock_recover_delay must be > 0")
+        if all_args.num_agents > all_args.max_player_num:
+            raise ValueError("num_agents cannot exceed max_player_num")
+        if not 1 <= all_args.dynamic_min_agents <= all_args.num_agents:
+            raise ValueError("dynamic_min_agents must be in [1, num_agents]")
+        if all_args.shock_remove_num <= 0:
+            raise ValueError("shock_remove_num must be > 0")
+        if all_args.shock_remove_num > all_args.num_agents - all_args.dynamic_min_agents:
+            raise ValueError("shock_remove_num would violate dynamic_min_agents at the first shock")
+        if all_args.shock_join_num < 0 or all_args.shock_join_delay < 0:
+            raise ValueError("shock_join_num and shock_join_delay must be >= 0")
+        if any(step <= 0 or step >= all_args.episode_length for step in shock_step_values):
+            raise ValueError("every shock step must be in (0, episode_length)")
+
+        last_required_step = max(
+            shock_step_values[-1] + all_args.shock_recover_delay,
+            shock_step_values[-1] + all_args.shock_join_delay,
+        )
+        if last_required_step > all_args.episode_length:
+            raise ValueError("the final join/recovery event exceeds episode_length")
+
+        peak_agents = all_args.num_agents + len(shock_step_values) * all_args.shock_join_num
+        if peak_agents > all_args.max_player_num:
+            raise ValueError(
+                "max_player_num is too small to hold all joined and recovered members: "
+                f"required={peak_agents}, configured={all_args.max_player_num}"
+            )
+
+        # 脚本化事件与随机调度器互斥，保证事件可复现。
+        if all_args.add_rate != 0.0 or all_args.del_rate != 0.0:
+            raise ValueError(
+                "scripted intra-episode dynamics require --add_rate 0 --del_rate 0"
+            )
+
+        if all_args.algorithm_name == "sddfg" and not all_args.use_dyn_graph:
+            raise ValueError(
+                "SDDFG intra-episode dynamics require --use_dyn_graph"
+            )
 
     return all_args
 
@@ -377,8 +484,6 @@ def main(args):
                                                                                                        "sddfg"]:
         all_args.num_factor = N * (N - 1) // 2 + N # 两两配对 + N
     else:#动态图
-        # num_factor = int(math.factorial(num_agents) // (math.factorial(all_args.highest_orders) * math.factorial(
-        #     num_agents - all_args.highest_orders)) * all_args.sparsity)
         if all_args.num_factor is None:
             num_factor_full = math.factorial(N) // (math.factorial(K) * math.factorial(N-K)) #C(n,k)
 
@@ -395,19 +500,22 @@ def main(args):
 
 
     # create policies and mapping fn
+    def get_unit_dim(cent_obs_dim, local_obs_dim):
+        """QPLEX mixer 需要可整除的 state unit；其他算法不使用该约束。"""
+        if all_args.algorithm_name != "qplex":
+            return local_obs_dim
+        if cent_obs_dim % all_args.max_player_num != 0:
+            raise ValueError(
+                "QPLEX requires cent_obs_dim divisible by max_player_num, "
+                f"got cent_obs_dim={cent_obs_dim}, "
+                f"max_player_num={all_args.max_player_num}"
+            )
+        return cent_obs_dim // all_args.max_player_num
+
     if all_args.share_policy:
         cent_obs_dim = get_dim_from_space(env.share_observation_space[0])
         obs_dim = get_dim_from_space(env.observation_space[0])
-
-        # QPLEX 的 unit_dim 不是 local obs_dim。
-        # DMAQ_Qatten 会将 centralized state reshape 成:
-        # [batch, num_agents, unit_dim]
-        # 因此必须满足 cent_obs_dim == num_agents * unit_dim。
-        assert cent_obs_dim % all_args.max_player_num == 0, (
-            f"QPLEX requires cent_obs_dim divisible by max_player_num, "
-            f"got cent_obs_dim={cent_obs_dim}, max_player_num={all_args.max_player_num}"
-        )
-        qplex_unit_dim = cent_obs_dim // all_args.max_player_num
+        unit_dim = get_unit_dim(cent_obs_dim, obs_dim)
 
         policy_info = {
             'policy_0': {"cent_obs_dim": get_dim_from_space(env.share_observation_space[0]),
@@ -415,10 +523,7 @@ def main(args):
                          "obs_space": env.observation_space[0],
                          "share_obs_space": env.share_observation_space[0],
                          "act_space": env.action_space[0],
-                         #"unit_dim": getattr(env.envs[0], "unit_dim", 0)
-                         # For QPLEX DMAQ attention mixer.
-                         # 当前 Wolfpack share_obs_dim=50, max_player_num=5, 所以 unit_dim=10。
-                        "unit_dim": qplex_unit_dim,}
+                         "unit_dim": unit_dim,}
         }
 
         def policy_mapping_fn(id):
@@ -428,13 +533,8 @@ def main(args):
 
         for agent_id in range(N):
             cent_obs_dim = get_dim_from_space(env.share_observation_space[agent_id])
-
-            assert cent_obs_dim % all_args.max_player_num == 0, (
-                f"QPLEX requires cent_obs_dim divisible by max_player_num, "
-                f"got cent_obs_dim={cent_obs_dim}, max_player_num={all_args.max_player_num}"
-            )
-
-            qplex_unit_dim = cent_obs_dim // all_args.max_player_num
+            obs_dim = get_dim_from_space(env.observation_space[agent_id])
+            unit_dim = get_unit_dim(cent_obs_dim, obs_dim)
 
             policy_info['policy_' + str(agent_id)] = {
                 "cent_obs_dim": cent_obs_dim,
@@ -442,7 +542,7 @@ def main(args):
                 "obs_space": env.observation_space[agent_id],
                 "share_obs_space": env.share_observation_space[agent_id],
                 "act_space": env.action_space[agent_id],
-                "unit_dim": qplex_unit_dim,
+                "unit_dim": unit_dim,
             }
 
         def policy_mapping_fn(agent_id):

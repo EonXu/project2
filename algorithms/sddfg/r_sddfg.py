@@ -1,6 +1,6 @@
 import torch
 import copy
-from utils.util import soft_update, huber_loss, mse_loss, to_torch, log_loss, update_linear_schedule
+from utils.util import soft_update, huber_loss, mse_loss, to_torch
 import numpy as np
 from utils.popart import PopArt
 
@@ -8,12 +8,8 @@ def _to_float(x):
     """兼容 torch 标量 / python float / numpy float"""
     if x is None:
         return 0.0
-    try:
-        import torch
-        if torch.is_tensor(x):
-            return x.detach().cpu().item()
-    except Exception:
-        pass
+    if torch.is_tensor(x):
+        return x.detach().cpu().item()
     try:
         return float(x)
     except Exception:
@@ -53,8 +49,8 @@ def _nan_to_num_compat(x, nan=0.0, posinf=None, neginf=None):
         )
 
     return out
-# from pathos.multiprocessing import ProcessingPool as Pool
-# import pathos.multiprocessing as mp
+
+
 class R_SDDFG:
     def __init__(self, args, num_agents, policies, adj_network, policy_mapping_fn, device=torch.device("cuda:0"),
                  episode_length=25, vdn=False):
@@ -129,20 +125,6 @@ class R_SDDFG:
         self.adj_parameters += self.adj_network.parameters()
         self.adj_optimizer = torch.optim.Adam(params=self.adj_parameters, lr=self.adj_lr, eps=self.opti_eps)
 
-        if args.use_double_q:
-            print("double Q learning will be used")
-
-    # def lr_decay(self, episode, episodes):
-    #     """
-    #     Decay the actor and critic learning rates.
-    #     :param episode: (int) current training episode.
-    #     :param episodes: (int) total number of training episodes.
-    #     """
-    #     update_linear_schedule(self.adj_optimizer, episode, episodes, self.adj_lr)
-    #     update_linear_schedule(self.policy_optimizer, episode, episodes, self.lr)
-    #     update_linear_schedule(self.critic_fv_optimizer, episode, episodes, self.critic_lr)
-    #     update_linear_schedule(self.critic_vtot_optimizer, episode, episodes, self.critic_lr)
-    # ==================== 修改点：替换 r_sddfg.py::lr_decay ====================
     def _set_optimizer_lr_with_floor(self, optimizer, init_lr, episode, episodes, floor_lr):
         """
         线性衰减，但不低于 floor_lr。
@@ -256,7 +238,6 @@ class R_SDDFG:
                                                  stacked_act_batch))  # [26,256,5]
             stacked_act_batch_ind = stacked_act_batch.max(dim=-1)[1]  # [25,256]
 
-            # ===== 修改点：r_sddfg.py::train_policy_on_batch，替换 adj_input 构造分支 =====
             alive_mask = (1.0 - dones.float()).clamp(0.0, 1.0)
 
             eye = torch.eye(
@@ -374,23 +355,18 @@ class R_SDDFG:
             loss_fv = mse_loss(error_fv).sum() / valid_denom
 
         self.policy_optimizer.zero_grad()
-        if self.use_vfunction:
-            loss.backward()
-            # newloss.backward()
-        else:
-            loss.backward()
+        loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.policy_parameters, self.args.max_grad_norm)
         self.policy_optimizer.step()
-        # import pdb;pdb.set_trace()
         if self.use_vfunction:
             self.critic_vtot_optimizer.zero_grad()
             loss_v.backward()
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic_vtot_parameters, self.args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.critic_vtot_parameters, self.args.max_grad_norm)
             self.critic_vtot_optimizer.step()
 
             self.critic_fv_optimizer.zero_grad()
             loss_fv.backward()
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic_fv_parameters, self.args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.critic_fv_parameters, self.args.max_grad_norm)
             self.critic_fv_optimizer.step()
 
         train_info = {}
@@ -403,20 +379,14 @@ class R_SDDFG:
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):
         """See parent class."""
 
-        obs_batch, share_obs_batch, dones_batch, \
+        obs_batch, _share_obs_batch, dones_batch, \
             dones_env_batch, adj_batch, prob_adj_batch, \
-            advantages_batch, f_advts_batch, rnn_obs_batch = batch
-        # individual agent q values: each element is of shape (batch_size, 1)
-        qs = []
-        target_qs = []
+            _advantages_batch, f_advts_batch, rnn_obs_batch = batch
         tarprob_adj = []
-        tarprob_extra = []
         adj_entropy = []
-        # import pdb;pdb.set_trace()
         adj = to_torch(adj_batch)  # [batch_size,step,num_agent,-1]
         batch_size = adj.shape[0] * adj.shape[1]
         adj = adj.reshape(batch_size, self.num_agents, -1).to(**self.tpdv)
-        state_batch = to_torch(share_obs_batch).reshape(batch_size, -1).to(**self.tpdv)
         dones = to_torch(dones_batch).reshape(batch_size, self.num_agents, -1).to(self.device)
         dones_env = to_torch(dones_env_batch).reshape(batch_size, -1).to(**self.tpdv)
         prob_adj = to_torch(prob_adj_batch).reshape(batch_size, self.num_agents, -1).to(**self.tpdv)
@@ -425,21 +395,14 @@ class R_SDDFG:
             **self.tpdv)  # [batch_size,step-1,1]
         obs = to_torch(obs_batch).reshape(batch_size, self.num_agents, -1).to(**self.tpdv)
 
-        for p_id in self.policy_ids:
-            # ===== 修改点：评估旧 adj 的概率，而不是重新 sample 当前图 =====
-            if hasattr(self.adj_network, "evaluate_prob"):
-                target_prob_adj, entropy = self.adj_network.evaluate_prob(
-                    obs=obs,
-                    rnn_obs=rnn_obs,
-                    use_adj_init=use_adj_init,
-                    dones=dones.bool(),
-                    adj=adj
-                )
-            else:
-                # 兼容旧版 adj_network；不建议三阶 SDDFG 下继续使用
-                target_prob_adj, _, entropy = self.adj_network.sample(
-                    obs, rnn_obs, use_adj_init, dones.bool()
-                )
+        for _ in self.policy_ids:
+            target_prob_adj, entropy = self.adj_network.evaluate_prob(
+                obs=obs,
+                rnn_obs=rnn_obs,
+                use_adj_init=use_adj_init,
+                dones=dones.bool(),
+                adj=adj
+            )
 
             target_prob = torch.where(
                 adj == 1,
@@ -460,7 +423,6 @@ class R_SDDFG:
         ).clamp_min(1e-8)
         log_prob_adj = torch.log(prob_adj_safe)
 
-        # ===== 修改点：r_sddfg.py::train_adj_on_batch，替换 active_masks 到 ratio 前处理部分 =====
         active_masks = (1.0 - dones.float()).clamp(0.0, 1.0)  # [B, N, 1]
 
         adj_binary = (adj > 0.5).float()  # [B, N, F]
@@ -556,24 +518,64 @@ class R_SDDFG:
 
         surr1 = imp_weights_multinomial * f_advts
         surr2 = clamp_imp_weights * f_advts
+        factor_mask = valid_factor_masks.transpose(1, 2)
+
+        clipped_surr = torch.min(surr1, surr2)
+        clipped_surr = clipped_surr * factor_mask
+
+        valid_factor_count = factor_mask.sum(
+            dim=-2, keepdim=False
+        ).clamp_min(1.0)
+
+        per_transition_surr = (
+                clipped_surr.sum(dim=-2)
+                / valid_factor_count
+        )
+
+        has_valid_factor = (
+                factor_mask.sum(dim=-2) > 0
+        ).float()
+
+        transition_mask = (
+                (1.0 - bad_transitions_mask)
+                * has_valid_factor
+        )
+
         rl_loss = -(
-                torch.sum(torch.min(surr1, surr2), dim=-2) * (1 - bad_transitions_mask)
-        ).sum() / ((1 - bad_transitions_mask).sum() + 1e-3)
+                per_transition_surr * transition_mask
+        ).sum() / transition_mask.sum().clamp_min(1.0)
 
-        #entropy_loss = (adj_entropy_batch * (1 - dones_env)).sum() / ((1 - dones_env).sum() + 1e-3)
-        # =========================================================================
-        # 核心修复区 2：强制在个体层面和环境层面双重切断熵(Entropy)的梯度
-        # =========================================================================
-        # 将环境 mask 也扩展以匹配维度
+        # 仅对环境未结束且在线的 agent 计算图熵。
         valid_env_masks = (1.0 - bad_transitions_mask).view(-1, 1, 1)
-
-        # 只有在 环境没结束 且 智能体存活 时，这部分熵才有效
         valid_agent_masks = active_masks * valid_env_masks
 
-        entropy_loss = (adj_entropy_batch * valid_agent_masks).sum() / (valid_agent_masks.sum() + 1e-3)
-        # =========================================================================
+        # 先对每个 transition 的在线 agent 求平均，再对有效 transition 求平均。
+        active_count = active_masks.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1.0)
+
+        entropy_per_transition = (
+                (adj_entropy_batch * active_masks).sum(
+                    dim=1, keepdim=True
+                )
+                / active_count
+        )
+
+        entropy_transition_mask = (
+                (1.0 - bad_transitions_mask)
+                .view(-1, 1, 1)
+                * (active_count > 0).float()
+        )
+
+        entropy_loss = (
+            entropy_per_transition * entropy_transition_mask
+        ).sum() / entropy_transition_mask.sum().clamp_min(1.0)
 
         loss = rl_loss - self.entropy_coef * entropy_loss
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                "non-finite SDDFG adjacency loss"
+            )
 
         self.adj_optimizer.zero_grad()
         loss.backward()
@@ -588,12 +590,6 @@ class R_SDDFG:
                     (imp_weights_multinomial > 1.0 + self.clip_param) |
                     (imp_weights_multinomial < 1.0 - self.clip_param)
             ).float().mean()
-
-            nan_flag = (
-                    torch.isnan(loss).any() |
-                    torch.isnan(rl_loss).any() |
-                    torch.isnan(entropy_loss).any()
-            ).float()
 
             current_adj_lr = self.adj_optimizer.param_groups[0]["lr"]
 
@@ -610,14 +606,11 @@ class R_SDDFG:
         train_info['entropy_loss'] = _to_float(entropy_loss)
         train_info['grad_norm'] = _to_float(grad_norm)
         train_info['adj_lr'] = float(current_adj_lr)
-        train_info['nan_flag'] = _to_float(nan_flag)
 
         return train_info, None, None
 
     def hard_target_updates(self):
         """Hard update the target networks."""
-        print("hard update targets")
-
         for policy_id in self.policy_ids:
             self.target_policies[policy_id].load_state(
                 self.policies[policy_id])
