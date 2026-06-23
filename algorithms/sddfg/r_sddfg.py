@@ -51,6 +51,26 @@ def _nan_to_num_compat(x, nan=0.0, posinf=None, neginf=None):
     return out
 
 
+def _infer_inactive_dones_from_obs(obs_seq: torch.Tensor) -> torch.Tensor:
+    """
+    Infer fixed-capacity inactive slots from Wolfpack padded observations.
+
+    In intra-episode dynamic Wolfpack, inactive / empty capacity slots are
+    represented by an all -1 observation vector.  The replay buffer stores
+    agent dones for the *next* state only, so the initial state s0 must be
+    reconstructed from observations; otherwise the learner treats empty
+    capacity slots as live agents at the beginning of every episode.
+
+    Args:
+        obs_seq: [B, T, N, obs_dim] or [B, N, obs_dim].
+    Returns:
+        Float mask with shape obs_seq[..., :1], where 1 means inactive/done.
+    """
+    obs_seq = to_torch(obs_seq)
+    finite_obs = torch.where(torch.isfinite(obs_seq), obs_seq, torch.zeros_like(obs_seq))
+    return torch.all(finite_obs <= -0.999, dim=-1, keepdim=True).float()
+
+
 class R_SDDFG:
     def __init__(self, args, num_agents, policies, adj_network, policy_mapping_fn, device=torch.device("cuda:0"),
                  episode_length=25, vdn=False):
@@ -213,7 +233,7 @@ class R_SDDFG:
             policy = self.policies[p_id]
             target_policy = self.target_policies[p_id]
             # get data related to the policy id
-            dones = to_torch(dones_batch[p_id]).permute(1, 2, 0, 3).to(self.device)
+            stored_next_dones = to_torch(dones_batch[p_id]).permute(1, 2, 0, 3).to(self.device)
             rewards = to_torch(rew_batch[p_id][0]).transpose(0, 1).to(**self.tpdv)  # [25,32,1]
             curr_obs_batch = to_torch(obs_batch[p_id]).transpose(0, 2)  # [3,26,32,18]
             curr_act_batch = to_torch(act_batch[p_id]).transpose(0, 2).to(**self.tpdv)  # [3,25,32,5]
@@ -228,9 +248,29 @@ class R_SDDFG:
             act_dim = curr_act_batch.shape[3]
             step = rewards.shape[1] + 1
             batch_size = curr_obs_batch.shape[0]
-            dones = torch.cat((torch.zeros(1, batch_size, self.num_agents, 1).to(**self.tpdv), dones), dim=0)
+
+            # Intra-episode dynamic fix:
+            # replay stores agent dones as next-state masks.  For the current
+            # state sequence [s0...sT], prepend the true s0 inactive mask
+            # inferred from padded observations instead of all-zero dones.
+            # OR with observation-derived masks for all states as a guard
+            # against any stale buffer transition around join/recover events.
+            obs_inactive_dones = _infer_inactive_dones_from_obs(curr_obs_batch).permute(1, 0, 2, 3).to(**self.tpdv)
+            if obs_inactive_dones.shape[0] != stored_next_dones.shape[0] + 1:
+                raise RuntimeError(
+                    "SDDFG replay mask length mismatch: "
+                    f"obs states={obs_inactive_dones.shape[0]}, "
+                    f"stored next dones={stored_next_dones.shape[0]}"
+                )
+            dones = torch.cat((obs_inactive_dones[:1], stored_next_dones), dim=0)
+            dones = torch.maximum(dones.float(), obs_inactive_dones.float())
+
             dones_batch = torch.cat((torch.zeros(batch_size, 1, 1).to(**self.tpdv), dones_env_batch), dim=1)
             bad_transitions_mask = dones_batch[:, :-1]
+            active_transition_mask = (
+                (1.0 - dones[:-1].float()).sum(dim=2).gt(0.0).float().transpose(0, 1)
+            )
+            valid_transition_mask = (1.0 - bad_transitions_mask) * active_transition_mask
 
             stacked_act_batch = torch.cat(list(curr_act_batch), dim=-2)  # [25,256,5]
             stacked_obs_batch = torch.cat(list(curr_obs_batch), dim=-2)  # [26,256,48]
@@ -326,8 +366,8 @@ class R_SDDFG:
             Q_tot_targets = self.value_normalizer[p_id](Q_tot_targets)
         else:
             Q_tot_targets = rewards + (1 - dones_env_batch) * self.args.gamma * next_step_Q_tot
-        error = (curr_Q_tot - Q_tot_targets.detach()) * (1 - bad_transitions_mask)
-        valid_denom = (1 - bad_transitions_mask).sum().clamp_min(1.0)
+        error = (curr_Q_tot - Q_tot_targets.detach()) * valid_transition_mask
+        valid_denom = valid_transition_mask.sum().clamp_min(1.0)
 
         if self.use_per:
             if self.use_huber_loss:
@@ -350,11 +390,11 @@ class R_SDDFG:
             curr_v_tot = torch.cat(vtot, dim=-1).unsqueeze(-1)
             next_step_v_tot = torch.cat(target_vtot, dim=-1).unsqueeze(-1)
             v_tot_targets = rewards + (1 - dones_env_batch) * self.args.gamma * next_step_v_tot
-            error_v = (curr_v_tot - v_tot_targets.detach()) * (1 - bad_transitions_mask)
+            error_v = (curr_v_tot - v_tot_targets.detach()) * valid_transition_mask
             loss_v = mse_loss(error_v).sum() / valid_denom
 
             f_v_tot = torch.cat(fv, dim=-1).unsqueeze(-1)
-            error_fv = (f_v_tot - curr_v_tot.detach()) * (1 - bad_transitions_mask)
+            error_fv = (f_v_tot - curr_v_tot.detach()) * valid_transition_mask
             loss_fv = mse_loss(error_fv).sum() / valid_denom
             if not torch.isfinite(loss_v):
                 raise FloatingPointError("non-finite SDDFG total-value loss")
@@ -393,6 +433,8 @@ class R_SDDFG:
         train_info['policy_grad_norm'] = _to_float(grad_norm)
         train_info['vtot_grad_norm'] = _to_float(vtot_grad_norm) if self.use_vfunction else 0.0
         train_info['fv_grad_norm'] = _to_float(fv_grad_norm) if self.use_vfunction else 0.0
+        train_info['valid_transition_ratio'] = _to_float(valid_transition_mask.mean())
+        train_info['active_transition_ratio'] = _to_float(active_transition_mask.mean())
         return train_info, new_priorities, idxes
 
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):

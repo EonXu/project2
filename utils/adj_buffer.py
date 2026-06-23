@@ -409,12 +409,19 @@ class AdjPolicyBuffer(object):
             for i in range(num_mini_batch)
         ]
 
-        obs = self.obs[:-1, :valid_episodes].transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
+        obs_seq = self.obs[:-1, :valid_episodes]
+        obs = obs_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
 
-        dones = np.concatenate((
-            np.zeros((1, valid_episodes, self.num_agents, 1), dtype=np.float32),
-            self.dones[:-1, :valid_episodes]
-        ))
+        # Intra-episode dynamic fix:
+        # Adj/GAT training needs the alive mask of the *current* graph state.
+        # The replay buffer's self.dones stores next-state masks, and a zero
+        # prefix makes initially empty capacity slots look alive at s0.  Use
+        # Wolfpack's padded all--1 observations to reconstruct current inactive
+        # slots for every sampled transition, including s0.
+        dones = np.all(obs_seq <= -0.999, axis=-1, keepdims=True).astype(np.float32)
+
+        # Keep environment termination semantics from the original shifted
+        # dones_env path; only per-slot activity is reconstructed from obs.
         dones_env = np.concatenate((
             np.zeros((1, valid_episodes, 1), dtype=np.float32),
             self.dones_env[:-1, :valid_episodes]
