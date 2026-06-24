@@ -87,6 +87,12 @@ case "${algorithm}" in
       --mixer_hidden_dim 32
       --hypernet_hidden_dim 64
       --hypernet_layers 2
+      # Wolfpack state contains raw grid coordinates. Normalize only the QMIX
+      # hypernetwork input; this adds no trainable parameters.
+      --qmix_normalize_mixer_state
+      # The shared parser uses store_false: passing this disables soft target
+      # updates and restores QMIX's periodic hard target update.
+      --use_soft_update
     )
     ;;
   qplex)

@@ -46,7 +46,7 @@ class RNNBase(MLPBase):
                             self._recurrent_N, self._use_orthogonal, self._use_cell)
         self.to(device)  # 移动到指定设备
 
-    def forward(self, x, hxs):
+    def forward(self, x, hxs, rnn_masks=None):
         # 特征归一化
         if self._use_feature_normalization:
             x = self.feature_norm(x)
@@ -62,7 +62,40 @@ class RNNBase(MLPBase):
         x = self.mlp(x)
 
         # 通过RNN层
-        if self._use_cell:
+        if rnn_masks is not None:
+            # A fixed Wolfpack slot can leave and later be occupied by a
+            # joined/recovered agent. Replay must reset hidden state at the
+            # same boundary as online rollout.
+            rnn_masks = torch.as_tensor(
+                rnn_masks, device=x.device, dtype=x.dtype
+            )
+            if rnn_masks.dim() == 2:
+                rnn_masks = rnn_masks.unsqueeze(-1)
+            if x.dim() != 3 or rnn_masks.shape[:2] != x.shape[:2]:
+                raise ValueError(
+                    "rnn_masks must have shape [sequence, batch, 1], "
+                    f"got x={tuple(x.shape)}, masks={tuple(rnn_masks.shape)}"
+                )
+
+            outputs = []
+            if self._use_cell:
+                hidden = hxs[-1] if hxs.dim() == 3 else hxs
+                for t in range(x.size(0)):
+                    hidden = hidden * rnn_masks[t]
+                    hidden = self.rnn.rnn(x[t], hidden)
+                    outputs.append(hidden.unsqueeze(0))
+                x = torch.cat(outputs, dim=0)
+                hxs = hidden
+            else:
+                hidden = hxs if hxs.dim() == 3 else hxs.unsqueeze(0)
+                self.rnn.rnn.flatten_parameters()
+                for t in range(x.size(0)):
+                    hidden = hidden * rnn_masks[t].unsqueeze(0)
+                    out_t, hidden = self.rnn.rnn(x[t:t + 1], hidden)
+                    outputs.append(out_t)
+                x = torch.cat(outputs, dim=0)
+                hxs = hidden[-1]
+        elif self._use_cell:
             hxs = self.rnn(x, hxs)
         else:
             x, hxs = self.rnn(x, hxs)

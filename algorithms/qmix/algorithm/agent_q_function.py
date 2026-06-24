@@ -23,7 +23,10 @@ class AgentQFunction(nn.Module):
         self.tpdv = dict(dtype=torch.float32, device=device)
 
         if self._use_rnn_layer:
-            self.rnn = RNNBase(args, input_dim)
+            # Respect the runner-selected device. The previous constructor
+            # briefly forced cuda:0 through RNNBase's default argument, which
+            # breaks CPU runs and non-zero GPU placement.
+            self.rnn = RNNBase(args, input_dim, device=device)
         else:
             self.mlp = MLPBase(args, input_dim)
 
@@ -31,7 +34,7 @@ class AgentQFunction(nn.Module):
 
         self.to(device)
 
-    def forward(self, obs, rnn_states):
+    def forward(self, obs, rnn_states, rnn_masks=None):
         """
         Compute q values for every action given observations and rnn states.
         :param obs: (torch.Tensor) observations from which to compute q values.
@@ -56,8 +59,10 @@ class AgentQFunction(nn.Module):
 
         inp = obs
 
-        if self._use_rnn_layer: 
-            rnn_outs, h_final = self.rnn(inp, rnn_states) 
+        if self._use_rnn_layer:
+            rnn_outs, h_final = self.rnn(
+                inp, rnn_states, rnn_masks=rnn_masks
+            )
         else:
             rnn_outs = self.mlp(inp)
             h_final = rnn_states[0, :, :]

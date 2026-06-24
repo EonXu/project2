@@ -202,6 +202,15 @@ def get_config():
     # hypernet 隐藏层维度（当 hypernet_layers == 2 时），默认 64
     parser.add_argument('--hypernet_hidden_dim', type=int, default=64,
                         help="Dimension of hidden layer of hypernetwork (only applicable if hypernet_layers == 2")
+    parser.add_argument(
+        '--qmix_normalize_mixer_state',
+        action='store_true',
+        default=False,
+        help=(
+            "Apply non-parametric LayerNorm to the centralized state before "
+            "QMIX hypernetworks; intended for raw-coordinate environments."
+        ),
+    )
 
     # -----------------------------
     # qplex parameters

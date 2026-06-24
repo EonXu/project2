@@ -68,8 +68,22 @@ class QMix(Trainer):
         for policy in self.policies.values():
             self.parameters += policy.parameters()
         self.parameters += self.mixer.parameters()
-        self.optimizer = torch.optim.Adam(
-            params=self.parameters, lr=self.lr, eps=self.opti_eps)
+        if vdn:
+            # Keep the existing VDN baseline unchanged; this correction is
+            # scoped to the QMIX port.
+            self.optimizer = torch.optim.Adam(
+                params=self.parameters, lr=self.lr, eps=self.opti_eps
+            )
+        else:
+            # Standard QMIX uses RMSProp. The previous port ignored
+            # opti_alpha and used Adam despite exposing RMSProp parameters.
+            self.optimizer = torch.optim.RMSprop(
+                params=self.parameters,
+                lr=self.lr,
+                alpha=self.args.opti_alpha,
+                eps=self.opti_eps,
+                weight_decay=self.weight_decay,
+            )
 
 
     def train_policy_on_batch(self, batch, update_policy_id=None):
@@ -109,15 +123,30 @@ class QMix(Trainer):
             # inactive slots are padded by all -1 in the Wolfpack wrapper.
             # curr_alive: [T, B, n_agents]
             # next_alive: [T, B, n_agents]
-            curr_alive = (pol_obs_batch[:, :-1] != -1.0).any(dim=-1).float().permute(1, 2, 0)
-            next_alive = (pol_obs_batch[:, 1:] != -1.0).any(dim=-1).float().permute(1, 2, 0)
+            alive_by_agent = (
+                (pol_obs_batch != -1.0).any(dim=-1).float()
+            )
+            curr_alive = alive_by_agent[:, :-1].permute(1, 2, 0)
+            next_alive = alive_by_agent[:, 1:].permute(1, 2, 0)
 
             # stack over policy's agents to process them at once
             stacked_act_batch = torch.cat(list(curr_act_batch), dim=-2)
             stacked_obs_batch = torch.cat(list(pol_obs_batch), dim=-2)
+            stacked_alive = torch.cat(
+                list(alive_by_agent), dim=-1
+            ).unsqueeze(-1)
+            previous_alive = torch.cat(
+                (torch.zeros_like(stacked_alive[:1]), stacked_alive[:-1]),
+                dim=0,
+            )
+            # Carry hidden state only while the same slot remains active.
+            # Inactive, newly joined and recovered slots all start from zero.
+            rnn_keep_masks = stacked_alive * previous_alive
 
             if avail_act_batch[p_id] is not None:
-                curr_avail_act_batch = to_torch(avail_act_batch[p_id])
+                curr_avail_act_batch = to_torch(
+                    avail_act_batch[p_id]
+                ).to(**self.tpdv)
                 stacked_avail_act_batch = torch.cat(list(curr_avail_act_batch), dim=-2)
             else:
                 stacked_avail_act_batch = None
@@ -128,11 +157,27 @@ class QMix(Trainer):
 
             sum_act_dim = int(sum(policy.act_dim)) if policy.multidiscrete else policy.act_dim
 
-            pol_prev_act_buffer_seq = torch.cat((torch.zeros(1, total_batch_size, sum_act_dim).to(**self.tpdv),
-                                                 stacked_act_batch))
+            # A new member must not inherit the inactive slot's forced stay
+            # action as its previous action.
+            prev_action_valid = stacked_alive[:-1] * stacked_alive[1:]
+            masked_stacked_actions = (
+                stacked_act_batch * prev_action_valid
+            )
+            pol_prev_act_buffer_seq = torch.cat(
+                (
+                    torch.zeros(
+                        1, total_batch_size, sum_act_dim
+                    ).to(**self.tpdv),
+                    masked_stacked_actions,
+                )
+            )
             # sequence of q values for all possible actions
-            pol_all_q_seq, _ = policy.get_q_values(stacked_obs_batch, pol_prev_act_buffer_seq,
-                                                                            policy.init_hidden(-1, total_batch_size))
+            pol_all_q_seq, _ = policy.get_q_values(
+                stacked_obs_batch,
+                pol_prev_act_buffer_seq,
+                policy.init_hidden(-1, total_batch_size),
+                rnn_masks=rnn_keep_masks,
+            )
             # get only the q values corresponding to actions taken in action_batch. Ignore the last time dimension.
             if policy.multidiscrete:
                 pol_all_q_curr_seq = [q_seq[:-1] for q_seq in pol_all_q_seq]
@@ -146,12 +191,26 @@ class QMix(Trainer):
             agent_alive_seq.append(curr_alive)
 
             with torch.no_grad():
+                target_all_q_seq, _ = target_policy.get_q_values(
+                    stacked_obs_batch,
+                    pol_prev_act_buffer_seq,
+                    target_policy.init_hidden(-1, total_batch_size),
+                    rnn_masks=rnn_keep_masks,
+                )
                 if self.args.use_double_q:
                     # choose greedy actions from live, but get corresponding q values from target
                     greedy_actions, _ = policy.actions_from_q(pol_all_q_seq, available_actions=stacked_avail_act_batch)
-                    target_q_seq, _ = target_policy.get_q_values(stacked_obs_batch, pol_prev_act_buffer_seq, target_policy.init_hidden(-1, total_batch_size), action_batch=greedy_actions)
+                    greedy_actions = to_torch(
+                        greedy_actions
+                    ).to(**self.tpdv)
+                    target_q_seq = target_policy.q_values_from_actions(
+                        target_all_q_seq, greedy_actions
+                    )
                 else:
-                    _, _, target_q_seq = target_policy.get_actions(stacked_obs_batch, pol_prev_act_buffer_seq, target_policy.init_hidden(-1, total_batch_size))
+                    _, target_q_seq = target_policy.actions_from_q(
+                        target_all_q_seq,
+                        available_actions=stacked_avail_act_batch,
+                    )
             # don't need the first Q values for next step
             target_q_seq = target_q_seq[1:]
             agent_nq_sequence = target_q_seq.split(split_size=batch_size, dim=-2)
@@ -182,6 +241,18 @@ class QMix(Trainer):
 
         # bootstrapped targets
         Q_tot_target_seq = rewards + (1 - dones_env_batch) * self.args.gamma * next_step_Q_tot_seq
+
+        for tensor_name, tensor_value in (
+            ("agent_q_seq", agent_q_seq),
+            ("Q_tot_seq", Q_tot_seq),
+            ("next_step_Q_tot_seq", next_step_Q_tot_seq),
+            ("Q_tot_target_seq", Q_tot_target_seq),
+        ):
+            if not torch.isfinite(tensor_value).all():
+                raise FloatingPointError(
+                    f"non-finite {tensor_name} in "
+                    f"{self.args.algorithm_name}"
+                )
         
         # Bellman error and mask out invalid transitions
         error = (Q_tot_seq - Q_tot_target_seq.detach()) * (1 - bad_transitions_mask)
@@ -227,6 +298,18 @@ class QMix(Trainer):
         train_info['grad_was_clipped'] = float(grad_norm_value > self.args.max_grad_norm)
         train_info['grad_norm_after_clip_bound'] = min(grad_norm_value, float(self.args.max_grad_norm))
         train_info['Q_tot'] = (Q_tot_seq * (1 - bad_transitions_mask)).mean()
+        train_info['agent_q_abs_mean'] = agent_q_seq.detach().abs().mean()
+        train_info['agent_q_abs_max'] = agent_q_seq.detach().abs().max()
+        train_info['target_q_tot_abs_mean'] = (
+            Q_tot_target_seq.detach().abs().mean()
+        )
+        train_info['target_q_tot_abs_max'] = (
+            Q_tot_target_seq.detach().abs().max()
+        )
+        train_info['td_error_abs_mean'] = error.detach().abs().mean()
+        train_info['td_error_abs_max'] = error.detach().abs().max()
+        if hasattr(self.mixer, "last_diagnostics"):
+            train_info.update(self.mixer.last_diagnostics)
 
         return train_info, new_priorities, idxes
 

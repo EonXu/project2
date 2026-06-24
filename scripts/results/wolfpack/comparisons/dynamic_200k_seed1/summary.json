@@ -1,0 +1,102 @@
+{
+  "SDDFG": {
+    "final_reward": 2.1349998,
+    "final_win_rate": 0.5,
+    "best_reward": 2.4999995,
+    "best_reward_step": 160000,
+    "best_win_rate": 0.6,
+    "mean_eval_reward": -0.131300288,
+    "eval_reward_std": 2.038296953826701,
+    "last3_reward": 1.8676663133333333,
+    "last3_win_rate": 0.5,
+    "positive_evaluations": 5,
+    "final_episode_std": 4.4682686838311305,
+    "gradient_clip_ratio": null,
+    "gradient_norm_mean": null,
+    "gradient_norm_max": null,
+    "stage_rewards": {
+      "Initial: 4": 0.005819999562,
+      "Leave 1: 2": 0.02379999972,
+      "Join 1: 3": 0.00979999975,
+      "Recover 1: 5": 0.00439999946,
+      "Leave 2: 3": 0.0006000001000000001,
+      "Join 2: 4": 0.02214999971,
+      "Recover 2: 6": 0.015699999242
+    }
+  },
+  "QMIX": {
+    "final_reward": -0.759,
+    "final_win_rate": 0.0,
+    "best_reward": -0.759,
+    "best_reward_step": 200000,
+    "best_win_rate": 0.0,
+    "mean_eval_reward": -3.7957002699999998,
+    "eval_reward_std": 1.7100906643631806,
+    "last3_reward": -1.8116666666666665,
+    "last3_win_rate": 0.0,
+    "positive_evaluations": 0,
+    "final_episode_std": 0.9767133633437195,
+    "gradient_clip_ratio": 1.0,
+    "gradient_norm_mean": 906.2688003779814,
+    "gradient_norm_max": 2170.565844114881,
+    "stage_rewards": {
+      "Initial: 4": -0.0099999999,
+      "Leave 1: 2": -3.469446951953614e-20,
+      "Join 1: 3": -0.00019999999999999996,
+      "Recover 1: 5": -0.0006999999874999999,
+      "Leave 2: 3": -0.0036,
+      "Join 2: 4": -0.00214999994,
+      "Recover 2: 6": -0.002959999996
+    }
+  },
+  "QPLEX": {
+    "final_reward": -1.4870002,
+    "final_win_rate": 0.1,
+    "best_reward": -0.036000036,
+    "best_reward_step": 20000,
+    "best_win_rate": 0.3,
+    "mean_eval_reward": -3.3761004666,
+    "eval_reward_std": 3.0073138387090177,
+    "last3_reward": -2.4913336333333334,
+    "last3_win_rate": 0.16666666666666666,
+    "positive_evaluations": 0,
+    "final_episode_std": 5.608315378747131,
+    "gradient_clip_ratio": 0.0625,
+    "gradient_norm_mean": 3.9653045236528257,
+    "gradient_norm_max": 33.37116585709479,
+    "stage_rewards": {
+      "Initial: 4": -0.019720000286000003,
+      "Leave 1: 2": 0.01969999994,
+      "Join 1: 3": -0.01745000015,
+      "Recover 1: 5": 0.004499999712499999,
+      "Leave 2: 3": 0.0039000001800000004,
+      "Join 2: 4": -0.02765000023,
+      "Recover 2: 6": -0.00030000052800000193
+    }
+  },
+  "VDN": {
+    "final_reward": -3.2690005,
+    "final_win_rate": 0.4,
+    "best_reward": -1.6100003,
+    "best_reward_step": 20000,
+    "best_win_rate": 0.4,
+    "mean_eval_reward": -3.62190061,
+    "eval_reward_std": 1.536742748628423,
+    "last3_reward": -2.8376672333333333,
+    "last3_win_rate": 0.33333333333333337,
+    "positive_evaluations": 0,
+    "final_episode_std": 6.967855450566117,
+    "gradient_clip_ratio": 0.0,
+    "gradient_norm_mean": 0.28634849589330996,
+    "gradient_norm_max": 0.5257609349197238,
+    "stage_rewards": {
+      "Initial: 4": -0.01656000075,
+      "Leave 1: 2": -0.01690000016,
+      "Join 1: 3": -0.027600000455000002,
+      "Recover 1: 5": -0.008925000827500001,
+      "Leave 2: 3": -0.03790000057,
+      "Join 2: 4": -0.03085000065,
+      "Recover 2: 6": -0.007340001000000003
+    }
+  }
+}

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wolfpack 动态智能体 200k 单种子对比</title>
+  <style>
+    body { margin: 0; background: #fcfcfd; color: #1f2430;
+            font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+    main { max-width: 1080px; margin: 0 auto; padding: 40px 28px 64px; }
+    h1 { font-size: 30px; margin-bottom: 24px; }
+    h2 { margin-top: 38px; font-size: 21px; }
+    p, li { line-height: 1.7; }
+    .summary { border-left: 5px solid #5477c4; background: white;
+               padding: 18px 22px; border-radius: 8px; }
+    .chart { width: 100%; background: white; border-radius: 10px;
+              margin: 14px 0 8px; }
+    table { width: 100%; border-collapse: collapse; background: white; }
+    th, td { padding: 11px 10px; border-bottom: 1px solid #e6e8f0;
+              text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    .note { color: #6f768a; font-size: 14px; }
+    code { background: #f1f3f7; padding: 2px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body><main>
+  <h1>Wolfpack 动态智能体 200k 单种子对比</h1>
+
+  <section class="summary">
+    <h2>技术结论</h2>
+    <ul>
+      <li>SDDFG 在最终奖励、最终胜率、最近三次评估奖励和全程平均奖励上均为四种算法最高。</li>
+      <li>SDDFG 最终奖励为 2.135，胜率为 0.50；
+          最近三次奖励均值为 1.868。</li>
+      <li>最终策略在七个动态人数阶段的逐步平均奖励全部为非负，说明退出、加入和恢复机制没有再次触发系统性性能掉点。</li>
+      <li>当前没有日志或代码证据支持继续修改 SDDFG。结果仍是单 seed、每次仅十个评估回合，尚不能视为统计显著结论。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>SDDFG 在后期形成稳定领先</h2>
+    <p>奖励曲线显示 SDDFG 的最后三次评估全部为正，而三种值分解基线的最后三次均值仍为负。
+       这比单独比较 200k 最终点更能排除一次评估随机波动。</p>
+    <img class="chart" src="evaluation_reward_curve.png" alt="Evaluation reward curves">
+  </section>
+
+  <section>
+    <h2>动态人数切换阶段不再系统性失分</h2>
+    <p>SDDFG 在最终评估的七个阶段全部保持非负逐步奖励。VDN 七个阶段全部为负；
+       QPLEX 仅部分阶段为正；QMIX 接近零但捕获胜率为零，属于低活动、低收益状态。</p>
+    <img class="chart" src="dynamic_stage_rewards.png" alt="Dynamic stage rewards">
+  </section>
+
+  <section>
+    <h2>核心指标对比</h2>
+    <table>
+      <thead><tr>
+        <th>算法</th><th>最终奖励</th><th>最终胜率</th><th>最近三次奖励</th>
+        <th>全程平均奖励</th><th>最佳奖励</th><th>正奖励评估</th><th>梯度裁剪比例</th>
+      </tr></thead>
+      <tbody><tr><td>SDDFG</td><td>2.135</td><td>0.50</td><td>1.868</td><td>-0.131</td><td>2.500</td><td>5/10</td><td>N/A</td></tr>
+<tr><td>QMIX</td><td>-0.759</td><td>0.00</td><td>-1.812</td><td>-3.796</td><td>-0.759</td><td>0/10</td><td>100.0%</td></tr>
+<tr><td>QPLEX</td><td>-1.487</td><td>0.10</td><td>-2.491</td><td>-3.376</td><td>-0.036</td><td>0/10</td><td>6.2%</td></tr>
+<tr><td>VDN</td><td>-3.269</td><td>0.40</td><td>-2.838</td><td>-3.622</td><td>-1.610</td><td>0/10</td><td>0.0%</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>配置与测量范围</h2>
+    <p>四组实验均为 seed 1、200k environment steps、episode length 200、初始 4 人、
+       最大容量 6 人，并使用相同的 50/120 shock、退出 2 人、延迟加入 1 人和 30 步恢复设置。
+       评估每 20k 执行一次，每次十个回合。</p>
+    <p>比较使用保存的 progress、逐步人数/奖励轨迹、训练指标和控制台日志。
+       算法专属参数（动态图、QPLEX mixer 等）不要求相同。</p>
+  </section>
+
+  <section>
+    <h2>稳定性与限制</h2>
+    <ul>
+      <li>SDDFG 邻接 PPO 平均裁剪率约 0.49%，动态图训练处于稳定区间。</li>
+      <li>QMIX 的预裁剪梯度均值约 906，全部更新都触发梯度裁剪，Q_tot 约 90–100；
+          因此 QMIX 结果存在明确数值稳定性问题，不宜作为唯一的优势证据。</li>
+      <li>最终十回合奖励方差仍较大。单 seed 和十回合评估不足以证明统计显著性，
+          只能支持“当前实现和该 seed 下描述性领先”。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>推荐下一步</h2>
+    <ol>
+      <li>保持当前 SDDFG 代码不变，进行四种算法各自的 seed 1、2M 单种子验证。</li>
+      <li>完整实验将 <code>num_eval_episodes</code> 提高到至少 30。</li>
+      <li>QMIX 在进入正式结论前应单独诊断 mixer 状态输入和梯度爆炸问题。</li>
+      <li>单 seed 2M 排名符合预期后，再运行 seeds 1–5 并报告均值、标准差和置信区间。</li>
+    </ol>
+  </section>
+
+  <p class="note">生成来源：本地四组 200k 训练结果；生成脚本 scripts/analyze_wolfpack_dynamic_200k.py。</p>
+</main></body></html>
