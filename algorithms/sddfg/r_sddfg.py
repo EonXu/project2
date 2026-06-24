@@ -262,8 +262,12 @@ class R_SDDFG:
                     f"obs states={obs_inactive_dones.shape[0]}, "
                     f"stored next dones={stored_next_dones.shape[0]}"
                 )
-            dones = torch.cat((obs_inactive_dones[:1], stored_next_dones), dim=0)
-            dones = torch.maximum(dones.float(), obs_inactive_dones.float())
+            dones = torch.cat((obs_inactive_dones[:1], stored_next_dones), dim=0).float()
+            obs_inactive_dones = obs_inactive_dones.float()
+            # Old PyTorch on the server does not provide torch.maximum.
+            # This is elementwise max(a, b): keep a slot done if either replay
+            # next-done or observation-derived inactive mask marks it inactive.
+            dones = torch.where(dones >= obs_inactive_dones, dones, obs_inactive_dones)
 
             dones_batch = torch.cat((torch.zeros(batch_size, 1, 1).to(**self.tpdv), dones_env_batch), dim=1)
             bad_transitions_mask = dones_batch[:, :-1]
@@ -502,73 +506,30 @@ class R_SDDFG:
         # 后续 order 判定必须使用 valid_adj
         valid_adj = adj_binary * active_masks * valid_factor_masks
 
-        max_log_ratio = 10.0
-
-        if self.highest_orders == 3:
-            sort_tar_proadj = torch.topk(tarlog_prob_adj, k=self.highest_orders, dim=1, largest=False)[0].to(
-                self.device)
-            sort_proadj = torch.topk(log_prob_adj, k=self.highest_orders, dim=1, largest=False)[0].to(self.device)
-
-            idx1 = torch.tensor([[[2], [1], [0]]], device=self.device)
-            idx2 = torch.tensor([[[1], [2], [0]]], device=self.device)
-            idx_order2 = (valid_adj.sum(-2) == 1).unsqueeze(1)
-
-            log_tar_1 = torch.where(idx_order2, sort_tar_proadj * idx1, sort_tar_proadj).sum(-2)
-            log_tar_2 = torch.where(idx_order2, sort_tar_proadj * idx2, sort_tar_proadj).sum(-2)
-            log_1 = torch.where(idx_order2, sort_proadj * idx1, sort_proadj).sum(-2)
-            log_2 = torch.where(idx_order2, sort_proadj * idx2, sort_proadj).sum(-2)
-
-            log_tar_1 = log_tar_1.clamp(min=-max_log_ratio, max=max_log_ratio)
-            log_tar_2 = log_tar_2.clamp(min=-max_log_ratio, max=max_log_ratio)
-            log_1 = log_1.clamp(min=-max_log_ratio, max=max_log_ratio)
-            log_2 = log_2.clamp(min=-max_log_ratio, max=max_log_ratio)
-
-            denom = (torch.exp(log_1) + torch.exp(log_2)).clamp_min(1e-8)
-            imp_weights = (torch.exp(log_tar_1) + torch.exp(log_tar_2)) / denom
-            imp_weights = _nan_to_num_compat(
-                imp_weights,
-                nan=1.0,
-                posinf=1.0 + self.clip_param,
-                neginf=1.0 - self.clip_param
-            )
-
-            imp_weights_multinomial = torch.where(
-                valid_adj.sum(-2) == 1,
-                imp_weights * imp_weights * imp_weights,
-                imp_weights
-            ).unsqueeze(-1)
-
-        elif self.highest_orders == 2:
-            diff_log = (tarlog_prob_adj.sum(-2) - log_prob_adj.sum(-2)).clamp(
-                min=-max_log_ratio,
-                max=max_log_ratio
-            )
-            imp_weights = torch.exp(diff_log)
-            imp_weights = _nan_to_num_compat(
-                imp_weights,
-                nan=1.0,
-                posinf=1.0 + self.clip_param,
-                neginf=1.0 - self.clip_param
-            )
-            imp_weights_multinomial = torch.where(
-                valid_adj.sum(-2) == 1,
-                imp_weights * imp_weights,
-                imp_weights
-            ).unsqueeze(-1)
-
-        else:
-            diff_log = (tarlog_prob_adj.sum(-2) - log_prob_adj.sum(-2)).clamp(
-                min=-max_log_ratio,
-                max=max_log_ratio
-            )
-            imp_weights = torch.exp(diff_log)
-            imp_weights = _nan_to_num_compat(
-                imp_weights,
-                nan=1.0,
-                posinf=1.0 + self.clip_param,
-                neginf=1.0 - self.clip_param
-            )
-            imp_weights_multinomial = imp_weights.unsqueeze(-1)
+        # Each selected column is one pair/triplet factor action. The generator
+        # stores the same categorical factor probability on every participating
+        # node, so average node log-probability recovers the joint factor
+        # log-probability. The previous order-specific square/cube logic counted
+        # one factor multiple times and caused most adjacency updates to clip.
+        factor_den = factor_size.squeeze(1).clamp_min(1.0)
+        target_factor_logp = (
+            (tarlog_prob_adj * valid_adj).sum(dim=1) / factor_den
+        )
+        behavior_factor_logp = (
+            (log_prob_adj * valid_adj).sum(dim=1) / factor_den
+        )
+        diff_log = (target_factor_logp - behavior_factor_logp).clamp(
+            min=-10.0,
+            max=10.0,
+        )
+        imp_weights = torch.exp(diff_log)
+        imp_weights = _nan_to_num_compat(
+            imp_weights,
+            nan=1.0,
+            posinf=1.0 + self.clip_param,
+            neginf=1.0 - self.clip_param,
+        )
+        imp_weights_multinomial = imp_weights.unsqueeze(-1)
 
         bad_transitions_mask = dones_env
         clamp_imp_weights = torch.clamp(
@@ -647,10 +608,34 @@ class R_SDDFG:
             valid_transition_ratio = float((1.0 - bad_transitions_mask).mean().detach().cpu().item())
             valid_agent_ratio = float(valid_agent_masks.mean().detach().cpu().item())
 
+            valid_factor_stats_mask = (
+                factor_mask
+                * (1.0 - bad_transitions_mask).view(-1, 1, 1)
+            )
+            valid_factor_stats_count = valid_factor_stats_mask.sum().clamp_min(1.0)
             clip_fraction = (
-                    (imp_weights_multinomial > 1.0 + self.clip_param) |
-                    (imp_weights_multinomial < 1.0 - self.clip_param)
-            ).float().mean()
+                (
+                    (imp_weights_multinomial > 1.0 + self.clip_param)
+                    | (imp_weights_multinomial < 1.0 - self.clip_param)
+                ).float()
+                * valid_factor_stats_mask
+            ).sum() / valid_factor_stats_count
+
+            valid_imp_weights = imp_weights_multinomial[
+                valid_factor_stats_mask > 0.5
+            ]
+            if valid_imp_weights.numel() == 0:
+                imp_weight_mean = torch.tensor(1.0, device=self.device)
+                imp_weight_max = torch.tensor(1.0, device=self.device)
+                imp_weight_std = torch.tensor(0.0, device=self.device)
+            else:
+                imp_weight_mean = valid_imp_weights.mean()
+                imp_weight_max = valid_imp_weights.max()
+                imp_weight_std = (
+                    valid_imp_weights.std()
+                    if valid_imp_weights.numel() > 1
+                    else torch.tensor(0.0, device=self.device)
+                )
 
             current_adj_lr = self.adj_optimizer.param_groups[0]["lr"]
 
@@ -658,9 +643,9 @@ class R_SDDFG:
         train_info['advantage'] = _to_float(f_advts.mean())
         train_info['f_advts_abs_mean'] = _to_float(f_advts.abs().mean())
         train_info['clamp_ratio'] = _to_float(clip_fraction)
-        train_info['imp_weight_mean'] = _to_float(imp_weights_multinomial.mean())
-        train_info['imp_weight_max'] = _to_float(imp_weights_multinomial.max())
-        train_info['imp_weight_std'] = _to_float(imp_weights_multinomial.std())
+        train_info['imp_weight_mean'] = _to_float(imp_weight_mean)
+        train_info['imp_weight_max'] = _to_float(imp_weight_max)
+        train_info['imp_weight_std'] = _to_float(imp_weight_std)
         train_info['valid_transition_ratio'] = valid_transition_ratio
         train_info['valid_agent_ratio'] = valid_agent_ratio
         train_info['rl_loss'] = _to_float(rl_loss)

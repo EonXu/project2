@@ -158,7 +158,8 @@ class WolfpackRunner(RecRunner):
         )
 
     @staticmethod
-    def _calc_adj_metrics(adj, dones, num_agents: int) -> Dict[str, float]:
+    def _calc_adj_metrics(adj, dones, num_agents: int,
+                          prob_adj=None, prev_adj=None) -> Dict[str, float]:
         """
         统计当前邻接图结构质量。兼容 DDFG 原邻接生成器与 SDDFG/GAT 邻接生成器。
 
@@ -192,6 +193,54 @@ class WolfpackRunner(RecRunner):
 
             total = float(max(B * F, 1))
             valid_num = float(valid_factor.float().sum().item())
+            valid_adj = adj_t * valid_factor.unsqueeze(1).to(adj_t.dtype)
+            dynamic_degree = valid_adj.sum(dim=2)  # [B, N], excludes appended self-factors
+            alive_agents = alive.squeeze(-1) > 0.5
+            active_agent_total = float(alive_agents.float().sum().item())
+            covered_agents = alive_agents & (dynamic_degree > 0.0)
+            covered_agent_num = float(covered_agents.float().sum().item())
+            selected_prob_mean = 0.0
+            selected_prob_min = 0.0
+            if prob_adj is not None and valid_num > 0:
+                prob_t = (
+                    prob_adj.detach().float()
+                    if torch.is_tensor(prob_adj)
+                    else torch.as_tensor(prob_adj).float()
+                )
+                if prob_t.dim() == 2:
+                    prob_t = prob_t.unsqueeze(0)
+                prob_t = prob_t.to(adj_t.device)
+                factor_prob = (
+                    (prob_t * valid_adj).sum(dim=1)
+                    / factor_order.clamp_min(1.0)
+                )
+                valid_factor_prob = factor_prob[valid_factor]
+                selected_prob_mean = float(valid_factor_prob.mean().item())
+                selected_prob_min = float(valid_factor_prob.min().item())
+
+            factor_retention_ratio = 1.0
+            if prev_adj is not None and valid_num > 0:
+                prev_t = (
+                    prev_adj.detach().float()
+                    if torch.is_tensor(prev_adj)
+                    else torch.as_tensor(prev_adj).float()
+                )
+                if prev_t.dim() == 2:
+                    prev_t = prev_t.unsqueeze(0)
+                prev_t = prev_t.to(adj_t.device)
+                prev_factor_order = prev_t.sum(dim=1)
+                exact_match = (
+                    adj_t.transpose(1, 2).unsqueeze(2)
+                    == prev_t.transpose(1, 2).unsqueeze(1)
+                ).all(dim=-1)
+                retained = (
+                    exact_match
+                    & valid_factor.unsqueeze(2)
+                    & (prev_factor_order > 0).unsqueeze(1)
+                ).any(dim=2)
+                factor_retention_ratio = float(
+                    retained.float().sum().item() / max(valid_num, 1.0)
+                )
 
             return {
                 "adj_valid_factor_ratio": valid_num / total,
@@ -201,6 +250,20 @@ class WolfpackRunner(RecRunner):
                 "adj_order3_ratio": float(((factor_order == 3) & valid_factor).float().sum().item() / total),
                 "adj_invalid_factor_ratio": float(((factor_order > 0) & (~valid_factor)).float().sum().item() / total),
                 "adj_mean_order": float(factor_order[valid_factor].mean().item()) if valid_num > 0 else 0.0,
+                # Dynamic graph coverage is critical for intra-episode joins:
+                # a live node with zero dynamic degree only receives its
+                # self-factor and cannot exchange cooperative messages.
+                "adj_active_agent_coverage": covered_agent_num / max(active_agent_total, 1.0),
+                "adj_uncovered_active_agent_ratio": (
+                    active_agent_total - covered_agent_num
+                ) / max(active_agent_total, 1.0),
+                "adj_active_agent_degree": (
+                    float(dynamic_degree[alive_agents].mean().item())
+                    if active_agent_total > 0.0 else 0.0
+                ),
+                "adj_selected_prob_mean": selected_prob_mean,
+                "adj_selected_prob_min": selected_prob_min,
+                "adj_factor_retention_ratio": factor_retention_ratio,
             }
         except Exception:
             return {}
@@ -575,6 +638,12 @@ class WolfpackRunner(RecRunner):
             "adj_order3_ratio": [],
             "adj_invalid_factor_ratio": [],
             "adj_mean_order": [],
+            "adj_active_agent_coverage": [],
+            "adj_uncovered_active_agent_ratio": [],
+            "adj_active_agent_degree": [],
+            "adj_selected_prob_mean": [],
+            "adj_selected_prob_min": [],
+            "adj_factor_retention_ratio": [],
         }
 
         for ep_i in range(self.args.num_eval_episodes):
@@ -759,6 +828,7 @@ class WolfpackRunner(RecRunner):
         topology_events_traj: List[Dict[str, Any]] = []
         team_rewards_traj: List[float] = []
         adj_metrics_traj: List[Dict[str, float]] = []  # list of per-step adj structure metrics
+        prev_adj_for_metrics = None
 
         # 显式事件计数避免仅依赖 num_players 差分；同一步退出和加入可能相互抵消。
         explicit_event_info_seen = False
@@ -1146,7 +1216,18 @@ class WolfpackRunner(RecRunner):
                 try:
                     adj_metrics_traj.append(
                         # adj 是 s_t 的图，必须使用事件发生前的 dones_curr。
-                        self._calc_adj_metrics(adj, dones_curr, self.num_agents)
+                        self._calc_adj_metrics(
+                            adj,
+                            dones_curr,
+                            self.num_agents,
+                            prob_adj=prob_adj,
+                            prev_adj=prev_adj_for_metrics,
+                        )
+                    )
+                    prev_adj_for_metrics = (
+                        adj.detach().clone()
+                        if torch.is_tensor(adj)
+                        else np.array(adj, copy=True)
                     )
                 except Exception:
                     pass
@@ -1533,6 +1614,12 @@ class WolfpackRunner(RecRunner):
             "adj_mean_order": [],
 
             # 探索强度
+            "adj_active_agent_coverage": [],
+            "adj_uncovered_active_agent_ratio": [],
+            "adj_active_agent_degree": [],
+            "adj_selected_prob_mean": [],
+            "adj_selected_prob_min": [],
+            "adj_factor_retention_ratio": [],
             "epsilon": [],
             "adj_epsilon": [],
         }

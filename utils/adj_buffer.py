@@ -91,7 +91,6 @@ class AdjBuffer(object):
         """
         replace = self.__len__() < batch_size
         inds = self.rng.choice(self.__len__(), batch_size, replace=replace)
-        #import pdb;pdb.set_trace()
         obs_batch, share_obs_batch, dones_batch, dones_env_batch, adj_batch, prob_adj_batch, advantages_batch, f_advts_batch, rnn_obs_batch = {}, {}, {}, {}, {}, {}, {}, {}, {}
         for p_id in self.policy_info.keys():
             obs_batch[p_id], share_obs_batch[p_id], dones_batch[p_id], dones_env_batch[p_id], adj_batch[p_id], prob_adj_batch[p_id], advantages_batch[p_id], f_advts_batch[p_id], rnn_obs_batch[p_id] = self.policy_buffers[p_id].sample_inds(inds,data_chunk_length,num_mini_batch)
@@ -187,44 +186,92 @@ class AdjPolicyBuffer(object):
         return self.filled_i
 
     def compute_advantage(self, idx, value_normalizer=None):
+        """
+        Compute factor GAE by matching node sets across adjacent graph states.
 
-        gae = 0
-        m_gae = np.zeros((len(idx), self.num_agents, 1), dtype=np.float32)
-        f_gae = np.zeros((len(idx), self.num_factor, 1), dtype=np.float32)
-        '''delta = 1/self.gamma * (self.rewards[step-1,idx,0] + self.gamma * value_normalizer.denormalize(self.qtot[step,idx]).cpu().numpy() * (1-self.dones_env[step-1,idx]) -  value_normalizer.denormalize(self.qtot[step-1,idx]).cpu().numpy())
-            gae = delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * gae
-            self.advantage[step,idx] = gae    
-            f_delta = 1/self.gamma * (self.rewards[step,idx,0] + self.gamma *  value_normalizer.denormalize(self.f_q[step,idx]).cpu().numpy() * (1-self.dones_env[step-1,idx]) -  value_normalizer.denormalize(self.f_q[step-1,idx]).cpu().numpy())
-            f_gae = f_delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * f_gae
-            self.f_advt[step,idx] = f_gae
+        A factor slot has no persistent identity under dynamic Top-K. Carrying
+        GAE by slot index mixes unrelated factors after graph reordering or a
+        roster event, so temporal credit is transferred only through an exact
+        factor-membership match.
+        """
+        episode_idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        num_episodes = int(episode_idx.size)
+        if num_episodes == 0:
+            return idx
 
-            f_delta = 1/self.gamma * (self.rewards[step,idx,0] + self.gamma *  self.f_q[step,idx] * (1-self.dones_env[step-1,idx]) -  self.f_q[step-1,idx])
-            f_gae = f_delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * f_gae'''
-        # self.f_advt = self.f_q
-        # import pdb;pdb.set_trace()
-        for step in reversed(range(0, self.rewards.shape[0])):
-            # value_normalizer.denormalize(self.qtot[step,idx]
-            f_delta = self.f_q[step, idx, :self.num_factor] - self.f_v[step, idx, :self.num_factor]
-            f_gae = f_delta + self.gamma * self.gae_lambda * (1 - self.dones_env[step, idx]) * f_gae
-            self.f_advt[step, idx] = f_gae
-            # self.f_advt[step,idx] = self.f_v[step,idx,:self.num_factor]
-            '''delta = self.qtot[step,idx] -  self.f_v[step,idx].sum()
-            gae = delta + self.gamma * self.gae_lambda * (1-self.dones_env[step-1,idx]) * gae
-            self.advantage[step,idx] = gae'''
+        next_gae = np.zeros(
+            (num_episodes, self.num_factor, 1),
+            dtype=np.float32,
+        )
+        self.f_advt[:, episode_idx] = 0.0
 
-            '''if step == self.rewards.shape[0]-1:
-                delta = self.rewards[step,idx,0] - self.f_v[step,idx].sum()
-            else:
-                delta = self.rewards[step,idx,0] + self.gamma * self.f_v[step+1,idx].sum() * \
-                (1-self.dones_env[step,idx]) -  self.f_v[step,idx].sum()
-            gae = delta + self.gamma * self.gae_lambda * (1-self.dones_env[step,idx]) * gae
-            self.advantage[step,idx] = gae'''
+        for step in reversed(range(self.episode_length)):
+            current_adj = self.adj[
+                step, episode_idx, :, :self.num_factor
+            ].astype(np.int64, copy=False)
+            current_active = ~np.all(
+                self.obs[step, episode_idx] <= -0.999,
+                axis=-1,
+            )
+            current_size = current_adj.sum(axis=1)
+            current_alive_count = (
+                current_adj * current_active[:, :, None]
+            ).sum(axis=1)
+            current_valid = (
+                (current_size > 0)
+                & (current_alive_count == current_size)
+            )
 
-        '''back_reward = 0 
-        for step in reversed(range(0,self.episode_length)):
-            discount_reward = self.rewards[step,idx,0] + self.gamma * back_reward
-            self.advantage[step,idx] = discount_reward
-            back_reward = discount_reward'''
+            carried_gae = np.zeros_like(next_gae)
+            if step + 1 < self.episode_length:
+                next_adj = self.adj[
+                    step + 1, episode_idx, :, :self.num_factor
+                ].astype(np.int64, copy=False)
+                next_active = ~np.all(
+                    self.obs[step + 1, episode_idx] <= -0.999,
+                    axis=-1,
+                )
+                next_size = next_adj.sum(axis=1)
+                next_alive_count = (
+                    next_adj * next_active[:, :, None]
+                ).sum(axis=1)
+                next_valid = (
+                    (next_size > 0)
+                    & (next_alive_count == next_size)
+                )
+
+                current_factor_nodes = current_adj.transpose(0, 2, 1)
+                next_factor_nodes = next_adj.transpose(0, 2, 1)
+                exact_match = np.all(
+                    current_factor_nodes[:, :, None, :]
+                    == next_factor_nodes[:, None, :, :],
+                    axis=-1,
+                )
+                exact_match &= current_valid[:, :, None]
+                exact_match &= next_valid[:, None, :]
+                carried_gae = np.einsum(
+                    "efg,egk->efk",
+                    exact_match.astype(np.float32),
+                    next_gae,
+                )
+
+            f_delta = (
+                self.f_q[step, episode_idx, :self.num_factor]
+                - self.f_v[step, episode_idx, :self.num_factor]
+            )
+            env_continuation = (
+                1.0 - self.dones_env[step, episode_idx]
+            ).reshape(num_episodes, 1, 1)
+            current_gae = (
+                f_delta
+                + self.gamma
+                * self.gae_lambda
+                * env_continuation
+                * carried_gae
+            )
+            current_gae *= current_valid[:, :, None].astype(np.float32)
+            self.f_advt[step, episode_idx] = current_gae
+            next_gae = current_gae
 
         return idx
 
@@ -296,7 +343,6 @@ class AdjPolicyBuffer(object):
     #     :return: valid_transition: (np.ndarray) whether each sampled transition in episodes are valid or not (invalid if corresponding agent is dead)
     #     :return: avail_acts: (np.ndarray) sampled available actions corresponding to that policy
     #     """
-    #     #import pdb;pdb.set_trace()
     #     batch_size = self.episode_length * self.buffer_size
     #     data_chunks = batch_size // data_chunk_length
     #     mini_batch_size = data_chunks // num_mini_batch
@@ -338,7 +384,6 @@ class AdjPolicyBuffer(object):
     #     f_advt_copy[np.tile(dones_env,self.num_factor) == 1.0] = np.nan
     #     mean_advt_f = np.nanmean(f_advt_copy.reshape(batch_size,self.num_factor,-1),axis=0)
     #     std_advt_f = np.nanstd(f_advt_copy.reshape(batch_size,self.num_factor,-1),axis=0)'''
-    #     #import pdb;pdb.set_trace()
     #     f_advt = (f_advt - mean_advt_f) / (std_advt_f + 1e-5)
     #     f_advts = f_advt.transpose(1,0,2,3).reshape(batch_size,self.num_factor,-1)
     #     #rewards = self.rewards.reshape(batch_size,self.num_agents,-1)
@@ -437,8 +482,20 @@ class AdjPolicyBuffer(object):
         f_advt = self.f_advt[:, :valid_episodes]
         f_advt_copy = f_advt.copy()
 
-        env_mask_for_factor = np.tile(dones_env, self.num_factor)
-        f_advt_copy[env_mask_for_factor == 1.0] = np.nan
+        # Normalize only currently valid factors. Empty capacity slots are
+        # intentional under the roster-dependent sparse factor budget.
+        active_seq = ~np.all(obs_seq <= -0.999, axis=-1)
+        adj_seq = self.adj[:-1, :valid_episodes, :, :self.num_factor]
+        factor_size = adj_seq.sum(axis=2)
+        factor_alive_count = (
+            adj_seq * active_seq[:, :, :, None]
+        ).sum(axis=2)
+        valid_factor = (
+            (factor_size > 0)
+            & (factor_alive_count == factor_size)
+            & (dones_env[..., 0, None] < 0.5)
+        )
+        f_advt_copy[~valid_factor[..., None]] = np.nan
 
         # [修改点] 防止全 NaN
         finite_mask = np.isfinite(f_advt_copy)
@@ -452,6 +509,7 @@ class AdjPolicyBuffer(object):
             std_advt_f = 1.0
 
         f_advt = (f_advt - mean_advt_f) / (std_advt_f + 1e-5)
+        f_advt[~valid_factor[..., None]] = 0.0
         f_advts = f_advt.transpose(1, 0, 2, 3).reshape(batch_size, self.num_factor, -1)
 
         dones = dones.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)

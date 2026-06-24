@@ -71,6 +71,7 @@ class Adj_Generator(nn.Module):
         self.num_variable = args.max_player_num
         self.num_factor = args.num_factor
         self.highest_orders = args.highest_orders
+        self.sparsity = max(0.0, min(1.0, float(getattr(args, "sparsity", 1.0))))
         self._triplet_cache = {}
 
         self.rng = np.random.RandomState(int(getattr(args, "seed", 0)) + 520000)
@@ -233,9 +234,49 @@ class Adj_Generator(nn.Module):
         entropy = entropy_scalar * exist_mask
         return entropy
 
-    def _select_candidates(self, pair_score):
+    def _active_factor_budget(self, num_active, num_valid_candidates):
+        """Return the active-roster sparse factor budget."""
+        if num_active < 2 or num_valid_candidates <= 0:
+            return 0
+
+        min_pair_cover = (int(num_active) + 1) // 2
+        sparse_target = int(np.ceil(self.sparsity * float(num_valid_candidates)))
+        return min(
+            int(self.num_factor),
+            int(num_valid_candidates),
+            max(min_pair_cover, sparse_target),
+        )
+
+    def _selection_rank(self, probabilities, explore, t_env):
         """
-        从二阶 pair 与三阶 hyperedge 候选中统一 TopK。
+        Perturb candidate ordering without changing replay probabilities.
+
+        Gumbel ranking replaces additive score noise. The stored behavior score
+        and evaluate_prob() now share one categorical probability definition.
+        """
+        rank = torch.log(probabilities.clamp_min(1e-8))
+        if not explore or probabilities.numel() == 0:
+            return rank
+
+        eps = float(self.exploration.eval(t_env if t_env is not None else 0))
+        if eps <= 0.0:
+            return rank
+
+        uniform_np = self.rng.uniform(
+            low=1e-6,
+            high=1.0 - 1e-6,
+            size=tuple(probabilities.shape),
+        ).astype(np.float32)
+        uniform = torch.from_numpy(uniform_np).to(
+            device=probabilities.device,
+            dtype=probabilities.dtype,
+        )
+        gumbel = -torch.log(-torch.log(uniform))
+        return rank + eps * gumbel
+
+    def _select_candidates(self, pair_score, explore=False, t_env=None):
+        """
+        Build a coverage-safe sparse graph from pair and triplet candidates.
         return:
             prob_adj: [B, N, F]
             cond_adj: [B, N, F]
@@ -283,26 +324,123 @@ class Adj_Generator(nn.Module):
             valid_scores = all_scores[valid]
             valid_kinds = all_kinds[valid]
             valid_local_idx = all_local_idx[valid]
+            score_normalizer = valid_scores.sum().clamp_min(1e-8)
+            valid_probs = valid_scores / score_normalizer
+            valid_rank = self._selection_rank(valid_probs, explore, t_env)
 
-            k_select = min(F_total, valid_scores.numel())
-            topk_vals, topk_order = torch.topk(valid_scores, k=k_select, dim=0)
+            pair_probs = pair_scores[b] / score_normalizer
+            pair_valid = pair_scores[b] > 0.0
+            pair_rank = torch.full_like(pair_scores[b], -float("inf"))
+            if torch.any(pair_valid):
+                pair_rank[pair_valid] = self._selection_rank(
+                    pair_probs[pair_valid],
+                    explore,
+                    t_env,
+                )
 
-            for f in range(k_select):
-                kind = int(valid_kinds[topk_order[f]].item())
-                local_idx = int(valid_local_idx[topk_order[f]].item())
-                p = topk_vals[f].clamp_min(1e-8)
+            if triplet_scores.shape[1] > 0:
+                triplet_probs = triplet_scores[b] / score_normalizer
+            else:
+                triplet_probs = triplet_scores[b]
 
+            active_nodes = torch.where(pair_score[b].sum(dim=-1) > 0.0)[0]
+            factor_budget = self._active_factor_budget(
+                num_active=int(active_nodes.numel()),
+                num_valid_candidates=int(valid_scores.numel()),
+            )
+            if factor_budget <= 0:
+                continue
+
+            selected = set()
+            next_slot = 0
+
+            def write_pair(local_idx, score):
+                nonlocal next_slot
+                if next_slot >= factor_budget:
+                    return False
+                key = ("pair", int(local_idx))
+                if key in selected:
+                    return False
+
+                nodes = torch.stack([pair_i[local_idx], pair_j[local_idx]], dim=0)
+                prob_adj[b, :, next_slot] = 1e-8
+                cond_adj[b, :, next_slot] = 0
+                prob_adj[b, nodes, next_slot] = score.clamp_min(1e-8)
+                cond_adj[b, nodes, next_slot] = 1
+                selected.add(key)
+                next_slot += 1
+                return True
+
+            def write_triplet(local_idx, score):
+                nonlocal next_slot
+                if next_slot >= factor_budget:
+                    return False
+                key = ("triplet", int(local_idx))
+                if key in selected:
+                    return False
+
+                nodes = triplets[local_idx]
+                prob_adj[b, :, next_slot] = 1e-8
+                cond_adj[b, :, next_slot] = 0
+                prob_adj[b, nodes, next_slot] = score.clamp_min(1e-8)
+                cond_adj[b, nodes, next_slot] = 1
+                selected.add(key)
+                next_slot += 1
+                return True
+
+            # Minimum-cardinality greedy edge cover. Prefer an edge covering
+            # two new nodes, then use the learned (possibly explored) rank.
+            covered = torch.zeros(N, dtype=torch.bool, device=device)
+            pair_valid_idx = torch.where(pair_valid)[0]
+            while (
+                pair_valid_idx.numel() > 0
+                and next_slot < factor_budget
+                and active_nodes.numel() > 0
+                and not bool(torch.all(covered[active_nodes]).item())
+            ):
+                best_local_idx = None
+                best_uncovered = -1
+                best_rank = -float("inf")
+
+                for pos in range(int(pair_valid_idx.numel())):
+                    local_idx = int(pair_valid_idx[pos].item())
+                    if ("pair", local_idx) in selected:
+                        continue
+                    nodes = torch.stack([pair_i[local_idx], pair_j[local_idx]], dim=0)
+                    uncovered_count = int((~covered[nodes]).sum().item())
+                    rank_value = float(pair_rank[local_idx].detach().cpu().item())
+                    if (
+                        uncovered_count > best_uncovered
+                        or (
+                            uncovered_count == best_uncovered
+                            and rank_value > best_rank
+                        )
+                    ):
+                        best_local_idx = local_idx
+                        best_uncovered = uncovered_count
+                        best_rank = rank_value
+
+                if best_local_idx is None or best_uncovered <= 0:
+                    break
+
+                nodes = torch.stack(
+                    [pair_i[best_local_idx], pair_j[best_local_idx]],
+                    dim=0,
+                )
+                if write_pair(best_local_idx, pair_probs[best_local_idx]):
+                    covered[nodes] = True
+
+            _, ranked_order = torch.sort(valid_rank, descending=True)
+            for order_pos in range(int(ranked_order.numel())):
+                if next_slot >= factor_budget:
+                    break
+                idx = ranked_order[order_pos]
+                kind = int(valid_kinds[idx].item())
+                local_idx = int(valid_local_idx[idx].item())
                 if kind == 0:
-                    # 二阶 factor: {i, j}
-                    i = pair_i[local_idx]
-                    j = pair_j[local_idx]
-                    nodes = torch.stack([i, j], dim=0)
+                    write_pair(local_idx, pair_probs[local_idx])
                 else:
-                    # 三阶 factor: {i, j, k}
-                    nodes = triplets[local_idx]
-
-                prob_adj[b, nodes, f] = p
-                cond_adj[b, nodes, f] = 1
+                    write_triplet(local_idx, triplet_probs[local_idx])
 
         return prob_adj, cond_adj
 
@@ -318,24 +456,13 @@ class Adj_Generator(nn.Module):
         rnn_obs, exist_mask = self._prepare_inputs(rnn_obs, dones)
 
         A = self.gat(rnn_obs, exist_mask)
-        pair_score, pair_mask = self._pair_score(A, exist_mask)
+        pair_score, _ = self._pair_score(A, exist_mask)
 
-        # 探索噪声只作用于合法 pair；三阶分数会基于加噪后的 pair_score 计算
-        if explore:
-            eps = float(self.exploration.eval(t_env if t_env is not None else 0))
-            if eps > 0:
-                noise_np = self.rng.random_sample(tuple(pair_score.shape)).astype(np.float32)
-                noise = torch.from_numpy(noise_np).to(
-                    device=pair_score.device,
-                    dtype=pair_score.dtype
-                ) * eps
-
-                pair_score = (pair_score + noise) * pair_mask.to(pair_score.dtype)
-                pair_score = pair_score / pair_score.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                pair_score = pair_score * pair_mask.to(pair_score.dtype)
-
+        # Candidate ordering handles exploration; policy probabilities remain unchanged.
         prob_adj, cond_adj = self._select_candidates(
             pair_score=pair_score,
+            explore=explore,
+            t_env=t_env,
         )
 
         entropy = self._candidate_entropy(pair_score, exist_mask)
@@ -363,6 +490,19 @@ class Adj_Generator(nn.Module):
         A = self.gat(rnn_obs, exist_mask)
         pair_score, _ = self._pair_score(A, exist_mask)
 
+        pair_i, pair_j = torch.triu_indices(N, N, offset=1, device=self.device)
+        pair_scores = pair_score[:, pair_i, pair_j]
+        triplets = self._triplet_indices(N, self.device)
+        if self.highest_orders >= 3:
+            triplet_scores = self._score_triplets(pair_score, triplets)
+        else:
+            triplet_scores = torch.empty(
+                B, 0, dtype=pair_score.dtype, device=self.device
+            )
+        candidate_normalizer = (
+            pair_scores.sum(dim=1) + triplet_scores.sum(dim=1)
+        ).clamp_min(1e-8)
+
         prob_adj = torch.ones(B, N, F_total, device=self.device, dtype=torch.float32)
         eps = 1e-8
 
@@ -373,7 +513,9 @@ class Adj_Generator(nn.Module):
 
                 if n_nodes == 2:
                     i, j = nodes[0], nodes[1]
-                    p = pair_score[b, i, j].clamp_min(eps)
+                    p = (
+                        pair_score[b, i, j] / candidate_normalizer[b]
+                    ).clamp_min(eps)
                     prob_adj[b, nodes, f] = p
 
                 elif n_nodes == 3:
@@ -387,7 +529,9 @@ class Adj_Generator(nn.Module):
                     valid = bool(torch.all(feats > 0.0).item())
                     if valid:
                         gate = torch.sigmoid(self.hyperedge_scorer(feats)).view(())
-                        p = (feats.mean() * gate).clamp_min(eps)
+                        p = (
+                            feats.mean() * gate / candidate_normalizer[b]
+                        ).clamp_min(eps)
                     else:
                         p = torch.tensor(eps, dtype=torch.float32, device=self.device)
 
