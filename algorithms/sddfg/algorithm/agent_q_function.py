@@ -68,10 +68,14 @@ class AgentQFunction(nn.Module):
         q_value = self.output_layer(rnn_obs)
 
         #这一步用于做一种特殊的尺度调整（避免在后续组合（不同阶相乘 / 合并）时数值爆炸）
-        norm_q = torch.abs(q_value+ 1e-8) ** (1-1/self.num_orders)
-
-        # 用 q_value 除以 norm_q 得到归一化后的 q_value_norm（逐元素缩放）
-        q_value_norm = q_value / norm_q
+        # Stable signed n-th root used by the low-rank factor product. The old
+        # q / abs(q + eps) ** exponent has a zero denominator around q=-eps,
+        # exactly where the small-gain output layer is initialized.
+        root_exponent = 1.0 - 1.0 / float(self.num_orders)
+        q_value_norm = q_value / torch.pow(
+            torch.abs(q_value) + 1e-8,
+            root_exponent,
+        )
         #q_value_norm = q_value
         #[bs,1, hidden_dim] * [bs,hidden_dim, order*act_dim] -> [bs,1,  order*act_dim]-> [bs,order*act_dim]
         
@@ -80,5 +84,3 @@ class AgentQFunction(nn.Module):
             q_value_norm = q_value_norm[0, :, :]
 
         return q_value_norm
-
-

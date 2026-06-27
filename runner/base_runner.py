@@ -367,6 +367,20 @@ class RecRunner(object):
                                     self.gamma,
                                     self.gae_lambda,
                                     self.hidden_size,
+                                    adj_return_adv_coef=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_return_adv_coef",
+                                            1.0,
+                                        )
+                                    ),
+                                    adj_factor_adv_coef=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_factor_adv_coef",
+                                            0.0,
+                                        )
+                                    ),
                                     seed=int(self.args.seed) + 420000,
                                     )
 
@@ -397,7 +411,15 @@ class RecRunner(object):
                 # 训练邻接网络的具体实现由 batch_train_adj 完成
                 self.train_adj()
                 self.log_train_adj(self.train_adj_infos)
-            self.last_train_adj_episode = self.num_episodes_collected
+            # Keep both sides of the scheduling delta in the same counter
+            # domain.  Warmup episodes increment num_episodes_collected but
+            # are intentionally excluded from num_adj_episodes_collected.
+            # Storing the total counter here made the next adjacency update
+            # wait dozens of episodes (and progressively longer) instead of
+            # the configured train_adj_episode interval.
+            self.last_train_adj_episode = (
+                self.num_adj_episodes_collected
+            )
         # save：按间隔保存模型
         if self.use_save and (self.total_env_steps - self.last_save_T) / self.save_interval >= 1:
             self.saver()

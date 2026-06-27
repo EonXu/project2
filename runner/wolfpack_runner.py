@@ -1332,17 +1332,17 @@ class WolfpackRunner(RecRunner):
         if explore:
             self.num_episodes_collected += self.num_envs
 
-            ind = self.buffer.insert(self.num_envs,  # push all episodes collected in this rollout step to the buffer
-                                     episode_obs,
-                                     episode_share_obs,
-                                     episode_acts,
-                                     episode_rewards,
-                                     episode_dones,
-                                     episode_dones_env,
-                                     episode_avail_acts,
-                                     episode_adj,
-                                     episode_prob_adj,
-                                     )
+            self.buffer.insert(self.num_envs,  # push all episodes collected in this rollout step to the buffer
+                               episode_obs,
+                               episode_share_obs,
+                               episode_acts,
+                               episode_rewards,
+                               episode_dones,
+                               episode_dones_env,
+                               episode_avail_acts,
+                               episode_adj,
+                               episode_prob_adj,
+                               )
 
             if (
                 self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS
@@ -1350,13 +1350,18 @@ class WolfpackRunner(RecRunner):
                 and not warmup
             ):
                 self.num_adj_episodes_collected += self.num_envs
-                rewards_normed = self.buffer.norm_reward(ind)
 
                 idx = self.adj_buffer.insert(self.num_envs,
                                              episode_obs,
                                              episode_share_obs,
                                              episode_acts,
-                                             rewards_normed,
+                                             # Graph-return advantages are
+                                             # standardized inside AdjBuffer.
+                                             # Keep raw rewards here so old
+                                             # and new episodes do not use
+                                             # different running-normalizer
+                                             # scales.
+                                             episode_rewards,
                                              episode_dones,
                                              episode_dones_env,
                                              episode_avail_acts,
@@ -1551,7 +1556,11 @@ class WolfpackRunner(RecRunner):
             pass
 
         try:
-            if hasattr(self.adj_network, "exploration"):
+            if hasattr(self.adj_network, "exploration_mix"):
+                schedule_info["adj_epsilon"] = float(
+                    self.adj_network.exploration_mix
+                )
+            elif hasattr(self.adj_network, "exploration"):
                 schedule_info["adj_epsilon"] = float(self.adj_network.exploration.eval(self.total_env_steps))
         except Exception:
             pass

@@ -72,6 +72,10 @@ class Adj_Generator(nn.Module):
         self.num_factor = args.num_factor
         self.highest_orders = args.highest_orders
         self.sparsity = max(0.0, min(1.0, float(getattr(args, "sparsity", 1.0))))
+        self.exploration_mix = max(
+            0.0,
+            min(1.0, float(getattr(args, "adj_exploration_mix", 0.0))),
+        )
         self._triplet_cache = {}
 
         self.rng = np.random.RandomState(int(getattr(args, "seed", 0)) + 520000)
@@ -85,14 +89,19 @@ class Adj_Generator(nn.Module):
             negative_slope=gat_slope
         )
 
-        # 输入为三条 pair score: [s_ij, s_ik, s_jk]
-        # 输出为 gate，最终 hyperedge_score = mean(pair_scores) * sigmoid(gate)
+        # Three pair scores [s_ij, s_ik, s_jk] produce a bounded residual
+        # multiplier around one for the corresponding third-order factor.
         hyperedge_hidden = int(getattr(args, "gat_hyperedge_hidden", getattr(args, "adj_hidden_dim", 32)))
         self.hyperedge_scorer = nn.Sequential(
             nn.Linear(3, hyperedge_hidden),
             nn.LeakyReLU(gat_slope),
             nn.Linear(hyperedge_hidden, 1)
         )
+        # Start triplets on the same scale as their constituent pairs. The
+        # former sigmoid gate was always below one and structurally suppressed
+        # every triplet before the graph policy had learned anything.
+        nn.init.zeros_(self.hyperedge_scorer[-1].weight)
+        nn.init.zeros_(self.hyperedge_scorer[-1].bias)
 
         self.exploration = DecayThenFlatSchedule(
             args.epsilon_start,
@@ -192,11 +201,14 @@ class Adj_Generator(nn.Module):
         feats = torch.stack([sij, sik, sjk], dim=-1)  # [B, T, 3]
         valid = (feats > 0.0).all(dim=-1)
 
-        gate_logits = self.hyperedge_scorer(feats.reshape(-1, 3)).reshape(B, -1)
-        gate = torch.sigmoid(gate_logits)
+        gate_logits = self.hyperedge_scorer(
+            feats.reshape(-1, 3)
+        ).reshape(B, -1)
+        multiplier = torch.exp(0.5 * torch.tanh(gate_logits))
 
-        # 与 pair score 保持同一数量级，避免三阶候选因 sigmoid 初值过大而压倒二阶边
-        triplet_score = feats.mean(dim=-1) * gate
+        # Stay on the pair-score scale while allowing learned promotion or
+        # suppression of cooperative third-order interactions.
+        triplet_score = feats.mean(dim=-1) * multiplier
         triplet_score = triplet_score * valid.to(triplet_score.dtype)
         return triplet_score
 
@@ -226,6 +238,13 @@ class Adj_Generator(nn.Module):
         probs = all_scores / score_sum.clamp_min(1e-8)
 
         entropy_scalar = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=1, keepdim=True)
+        valid_count = (all_scores > 0.0).float().sum(
+            dim=1,
+            keepdim=True,
+        )
+        entropy_scalar = entropy_scalar / torch.log(
+            valid_count.clamp_min(2.0)
+        )
 
         has_candidate = score_sum > 1e-8
         entropy_scalar = torch.where(has_candidate, entropy_scalar, torch.zeros_like(entropy_scalar))
@@ -239,208 +258,232 @@ class Adj_Generator(nn.Module):
         if num_active < 2 or num_valid_candidates <= 0:
             return 0
 
-        min_pair_cover = (int(num_active) + 1) // 2
+        min_cover = (int(num_active) + 1) // 2
         sparse_target = int(np.ceil(self.sparsity * float(num_valid_candidates)))
         return min(
             int(self.num_factor),
             int(num_valid_candidates),
-            max(min_pair_cover, sparse_target),
+            max(min_cover, sparse_target),
         )
 
-    def _selection_rank(self, probabilities, explore, t_env):
-        """
-        Perturb candidate ordering without changing replay probabilities.
-
-        Gumbel ranking replaces additive score noise. The stored behavior score
-        and evaluate_prob() now share one categorical probability definition.
-        """
-        rank = torch.log(probabilities.clamp_min(1e-8))
-        if not explore or probabilities.numel() == 0:
-            return rank
-
-        eps = float(self.exploration.eval(t_env if t_env is not None else 0))
-        if eps <= 0.0:
-            return rank
-
-        uniform_np = self.rng.uniform(
-            low=1e-6,
-            high=1.0 - 1e-6,
-            size=tuple(probabilities.shape),
-        ).astype(np.float32)
-        uniform = torch.from_numpy(uniform_np).to(
-            device=probabilities.device,
-            dtype=probabilities.dtype,
-        )
-        gumbel = -torch.log(-torch.log(uniform))
-        return rank + eps * gumbel
-
-    def _select_candidates(self, pair_score, explore=False, t_env=None):
-        """
-        Build a coverage-safe sparse graph from pair and triplet candidates.
-        return:
-            prob_adj: [B, N, F]
-            cond_adj: [B, N, F]
-        """
+    def _candidate_catalog(self, pair_score):
+        """Return candidate scores and static node-membership masks."""
         B, N, _ = pair_score.shape
-        F_total = self.num_factor
         device = pair_score.device
 
-        prob_adj = torch.ones(B, N, F_total, device=device, dtype=torch.float32) * 1e-8
-        cond_adj = torch.zeros(B, N, F_total, device=device, dtype=torch.int64)
+        pair_i, pair_j = torch.triu_indices(
+            N,
+            N,
+            offset=1,
+            device=device,
+        )
+        pair_scores = pair_score[:, pair_i, pair_j]
+        pair_nodes = torch.zeros(
+            pair_scores.shape[1],
+            N,
+            dtype=torch.bool,
+            device=device,
+        )
+        pair_rows = torch.arange(
+            pair_scores.shape[1],
+            device=device,
+        )
+        pair_nodes[pair_rows, pair_i] = True
+        pair_nodes[pair_rows, pair_j] = True
 
-        pair_i, pair_j = torch.triu_indices(N, N, offset=1, device=device)
-        pair_scores = pair_score[:, pair_i, pair_j]  # [B, P]
-        num_pairs = pair_scores.shape[1]
-
-        triplets = self._triplet_indices(N, device)
+        scores = [pair_scores]
+        node_masks = [pair_nodes]
         if self.highest_orders >= 3:
-            triplet_scores = self._score_triplets(pair_score, triplets)  # [B, T]
+            triplets = self._triplet_indices(N, device)
+            triplet_scores = self._score_triplets(
+                pair_score,
+                triplets,
+            )
+            triplet_nodes = torch.zeros(
+                triplet_scores.shape[1],
+                N,
+                dtype=torch.bool,
+                device=device,
+            )
+            if triplets.numel() > 0:
+                triplet_rows = torch.arange(
+                    triplet_scores.shape[1],
+                    device=device,
+                ).unsqueeze(1).expand(-1, 3)
+                triplet_nodes[triplet_rows, triplets] = True
+            scores.append(triplet_scores)
+            node_masks.append(triplet_nodes)
+
+        return torch.cat(scores, dim=1), torch.cat(node_masks, dim=0)
+
+    @staticmethod
+    def _constrained_probabilities(
+            scores,
+            candidate_nodes,
+            remaining,
+            covered,
+            active_nodes,
+            slots_after=0,
+            max_factor_order=3):
+        """
+        Conditional distribution for one factor slot.
+
+        While some active agents are uncovered, candidates must add at least
+        one new node and their policy weight is multiplied by that coverage
+        gain. Once coverage is complete, all remaining candidates compete.
+        This keeps pair and triplet choices learnable while still guaranteeing
+        coverage under the pair-cover factor budget.
+        """
+        valid = (scores > 0.0) & remaining
+        if not bool(torch.any(valid).item()):
+            return torch.zeros_like(scores), valid
+
+        uncovered = active_nodes & (~covered)
+        if bool(torch.any(uncovered).item()):
+            gains = (
+                candidate_nodes
+                & uncovered.unsqueeze(0)
+            ).long().sum(dim=1)
+            uncovered_count = int(uncovered.long().sum().item())
+            min_required_gain = max(
+                1,
+                uncovered_count
+                - int(max_factor_order) * int(slots_after),
+            )
+            eligible = (
+                valid
+                & (gains >= min_required_gain)
+            )
+            coverage_weight = gains.to(scores.dtype)
         else:
-            triplet_scores = torch.empty(B, 0, dtype=pair_score.dtype, device=device)
+            eligible = valid
+            coverage_weight = torch.ones_like(scores)
 
+        weights = (
+            scores
+            * coverage_weight
+            * eligible.to(scores.dtype)
+        )
+        probabilities = weights / weights.sum().clamp_min(1e-8)
+        return probabilities, eligible
+
+    def _select_candidates(
+            self,
+            pair_score,
+            exist_mask,
+            explore=False,
+            t_env=None):
+        """
+        Build a coverage-safe sparse graph by sequential constrained sampling.
+
+        ``prob_adj`` stores the exact conditional behavior probability for
+        every selected factor. The old implementation stored a marginal
+        candidate score even though factors were chosen by Gumbel Top-K plus a
+        separate greedy pair cover, making the PPO importance ratio invalid.
+        """
+        B, N, _ = pair_score.shape
+        device = pair_score.device
+        prob_adj = torch.ones(
+            B,
+            N,
+            self.num_factor,
+            device=device,
+            dtype=torch.float32,
+        ) * 1e-8
+        cond_adj = torch.zeros(
+            B,
+            N,
+            self.num_factor,
+            device=device,
+            dtype=torch.int64,
+        )
+
+        candidate_scores, candidate_nodes = self._candidate_catalog(
+            pair_score
+        )
         for b in range(B):
-            candidate_scores = [pair_scores[b]]
-            candidate_kinds = [
-                torch.zeros(num_pairs, dtype=torch.long, device=device)  # 0 = pair
-            ]
-            candidate_local_idx = [
-                torch.arange(num_pairs, dtype=torch.long, device=device)
-            ]
-
-            if self.highest_orders >= 3 and triplet_scores.shape[1] > 0:
-                num_triplets = triplet_scores.shape[1]
-                candidate_scores.append(triplet_scores[b])
-                candidate_kinds.append(torch.ones(num_triplets, dtype=torch.long, device=device))  # 1 = triplet
-                candidate_local_idx.append(torch.arange(num_triplets, dtype=torch.long, device=device))
-
-            all_scores = torch.cat(candidate_scores, dim=0)
-            all_kinds = torch.cat(candidate_kinds, dim=0)
-            all_local_idx = torch.cat(candidate_local_idx, dim=0)
-
-            valid = all_scores > 0.0
-            if not torch.any(valid):
-                continue
-
-            valid_scores = all_scores[valid]
-            valid_kinds = all_kinds[valid]
-            valid_local_idx = all_local_idx[valid]
-            score_normalizer = valid_scores.sum().clamp_min(1e-8)
-            valid_probs = valid_scores / score_normalizer
-            valid_rank = self._selection_rank(valid_probs, explore, t_env)
-
-            pair_probs = pair_scores[b] / score_normalizer
-            pair_valid = pair_scores[b] > 0.0
-            pair_rank = torch.full_like(pair_scores[b], -float("inf"))
-            if torch.any(pair_valid):
-                pair_rank[pair_valid] = self._selection_rank(
-                    pair_probs[pair_valid],
-                    explore,
-                    t_env,
-                )
-
-            if triplet_scores.shape[1] > 0:
-                triplet_probs = triplet_scores[b] / score_normalizer
-            else:
-                triplet_probs = triplet_scores[b]
-
-            active_nodes = torch.where(pair_score[b].sum(dim=-1) > 0.0)[0]
+            scores = candidate_scores[b]
+            valid = scores > 0.0
+            num_valid = int(valid.long().sum().item())
+            num_active = int(
+                (exist_mask[b] > 0.5).long().sum().item()
+            )
             factor_budget = self._active_factor_budget(
-                num_active=int(active_nodes.numel()),
-                num_valid_candidates=int(valid_scores.numel()),
+                num_active=num_active,
+                num_valid_candidates=num_valid,
             )
             if factor_budget <= 0:
                 continue
 
-            selected = set()
-            next_slot = 0
+            remaining = valid.clone()
+            covered = torch.zeros(
+                N,
+                dtype=torch.bool,
+                device=device,
+            )
+            active_nodes = exist_mask[b] > 0.5
 
-            def write_pair(local_idx, score):
-                nonlocal next_slot
-                if next_slot >= factor_budget:
-                    return False
-                key = ("pair", int(local_idx))
-                if key in selected:
-                    return False
+            for slot in range(factor_budget):
+                policy_probs, eligible = self._constrained_probabilities(
+                    scores=scores,
+                    candidate_nodes=candidate_nodes,
+                    remaining=remaining,
+                    covered=covered,
+                    active_nodes=active_nodes,
+                    slots_after=factor_budget - slot - 1,
+                    max_factor_order=self.highest_orders,
+                )
+                eligible_count = int(
+                    eligible.long().sum().item()
+                )
+                if eligible_count <= 0:
+                    break
 
-                nodes = torch.stack([pair_i[local_idx], pair_j[local_idx]], dim=0)
-                prob_adj[b, :, next_slot] = 1e-8
-                cond_adj[b, :, next_slot] = 0
-                prob_adj[b, nodes, next_slot] = score.clamp_min(1e-8)
-                cond_adj[b, nodes, next_slot] = 1
-                selected.add(key)
-                next_slot += 1
-                return True
+                if explore:
+                    epsilon = self.exploration_mix
+                    uniform_probs = (
+                        eligible.to(policy_probs.dtype)
+                        / float(eligible_count)
+                    )
+                    behavior_probs = (
+                        (1.0 - epsilon) * policy_probs
+                        + epsilon * uniform_probs
+                    )
+                    sample_probs = behavior_probs.detach().cpu().numpy()
+                    sample_probs = np.maximum(sample_probs, 0.0)
+                    sample_probs = sample_probs / max(
+                        float(sample_probs.sum()),
+                        1e-8,
+                    )
+                    selected_idx = int(
+                        self.rng.choice(
+                            sample_probs.shape[0],
+                            p=sample_probs,
+                        )
+                    )
+                    selected_probability = behavior_probs[selected_idx]
+                else:
+                    selected_idx = int(
+                        torch.argmax(policy_probs).item()
+                    )
+                    selected_probability = policy_probs[selected_idx]
 
-            def write_triplet(local_idx, score):
-                nonlocal next_slot
-                if next_slot >= factor_budget:
-                    return False
-                key = ("triplet", int(local_idx))
-                if key in selected:
-                    return False
+                nodes = candidate_nodes[selected_idx]
+                prob_adj[b, nodes, slot] = (
+                    selected_probability.clamp_min(1e-8)
+                )
+                cond_adj[b, nodes, slot] = 1
+                remaining[selected_idx] = False
+                covered = covered | nodes
 
-                nodes = triplets[local_idx]
-                prob_adj[b, :, next_slot] = 1e-8
-                cond_adj[b, :, next_slot] = 0
-                prob_adj[b, nodes, next_slot] = score.clamp_min(1e-8)
-                cond_adj[b, nodes, next_slot] = 1
-                selected.add(key)
-                next_slot += 1
-                return True
-
-            # Minimum-cardinality greedy edge cover. Prefer an edge covering
-            # two new nodes, then use the learned (possibly explored) rank.
-            covered = torch.zeros(N, dtype=torch.bool, device=device)
-            pair_valid_idx = torch.where(pair_valid)[0]
-            while (
-                pair_valid_idx.numel() > 0
-                and next_slot < factor_budget
-                and active_nodes.numel() > 0
+            if (
+                factor_budget > 0
                 and not bool(torch.all(covered[active_nodes]).item())
             ):
-                best_local_idx = None
-                best_uncovered = -1
-                best_rank = -float("inf")
-
-                for pos in range(int(pair_valid_idx.numel())):
-                    local_idx = int(pair_valid_idx[pos].item())
-                    if ("pair", local_idx) in selected:
-                        continue
-                    nodes = torch.stack([pair_i[local_idx], pair_j[local_idx]], dim=0)
-                    uncovered_count = int((~covered[nodes]).sum().item())
-                    rank_value = float(pair_rank[local_idx].detach().cpu().item())
-                    if (
-                        uncovered_count > best_uncovered
-                        or (
-                            uncovered_count == best_uncovered
-                            and rank_value > best_rank
-                        )
-                    ):
-                        best_local_idx = local_idx
-                        best_uncovered = uncovered_count
-                        best_rank = rank_value
-
-                if best_local_idx is None or best_uncovered <= 0:
-                    break
-
-                nodes = torch.stack(
-                    [pair_i[best_local_idx], pair_j[best_local_idx]],
-                    dim=0,
+                raise RuntimeError(
+                    "SDDFG constrained graph selection failed to cover all "
+                    "active agents"
                 )
-                if write_pair(best_local_idx, pair_probs[best_local_idx]):
-                    covered[nodes] = True
-
-            _, ranked_order = torch.sort(valid_rank, descending=True)
-            for order_pos in range(int(ranked_order.numel())):
-                if next_slot >= factor_budget:
-                    break
-                idx = ranked_order[order_pos]
-                kind = int(valid_kinds[idx].item())
-                local_idx = int(valid_local_idx[idx].item())
-                if kind == 0:
-                    write_pair(local_idx, pair_probs[local_idx])
-                else:
-                    write_triplet(local_idx, triplet_probs[local_idx])
 
         return prob_adj, cond_adj
 
@@ -458,9 +501,11 @@ class Adj_Generator(nn.Module):
         A = self.gat(rnn_obs, exist_mask)
         pair_score, _ = self._pair_score(A, exist_mask)
 
-        # Candidate ordering handles exploration; policy probabilities remain unchanged.
+        # Training uses an epsilon mixture over the exact constrained policy;
+        # the selected conditional behavior probability is stored for PPO.
         prob_adj, cond_adj = self._select_candidates(
             pair_score=pair_score,
+            exist_mask=exist_mask,
             explore=explore,
             t_env=t_env,
         )
@@ -490,62 +535,87 @@ class Adj_Generator(nn.Module):
         A = self.gat(rnn_obs, exist_mask)
         pair_score, _ = self._pair_score(A, exist_mask)
 
-        pair_i, pair_j = torch.triu_indices(N, N, offset=1, device=self.device)
-        pair_scores = pair_score[:, pair_i, pair_j]
-        triplets = self._triplet_indices(N, self.device)
-        if self.highest_orders >= 3:
-            triplet_scores = self._score_triplets(pair_score, triplets)
-        else:
-            triplet_scores = torch.empty(
-                B, 0, dtype=pair_score.dtype, device=self.device
-            )
-        candidate_normalizer = (
-            pair_scores.sum(dim=1) + triplet_scores.sum(dim=1)
-        ).clamp_min(1e-8)
-
-        prob_adj = torch.ones(B, N, F_total, device=self.device, dtype=torch.float32)
+        candidate_scores, candidate_nodes = self._candidate_catalog(
+            pair_score
+        )
+        prob_adj = torch.ones(
+            B,
+            N,
+            F_total,
+            device=self.device,
+            dtype=torch.float32,
+        )
         eps = 1e-8
 
         for b in range(B):
+            scores = candidate_scores[b]
+            remaining = scores > 0.0
+            covered = torch.zeros(
+                N,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            active_nodes = exist_mask[b] > 0.5
+            factor_budget = self._active_factor_budget(
+                num_active=int(active_nodes.long().sum().item()),
+                num_valid_candidates=int(
+                    remaining.long().sum().item()
+                ),
+            )
+
             for f in range(F_total):
-                nodes = torch.where(adj_t[b, :, f] > 0.5)[0]
-                n_nodes = int(nodes.numel())
-
-                if n_nodes == 2:
-                    i, j = nodes[0], nodes[1]
-                    p = (
-                        pair_score[b, i, j] / candidate_normalizer[b]
-                    ).clamp_min(eps)
-                    prob_adj[b, nodes, f] = p
-
-                elif n_nodes == 3:
-                    i, j, k = nodes[0], nodes[1], nodes[2]
-                    feats = torch.stack([
-                        pair_score[b, i, j],
-                        pair_score[b, i, k],
-                        pair_score[b, j, k],
-                    ], dim=0).view(1, 3)
-
-                    valid = bool(torch.all(feats > 0.0).item())
-                    if valid:
-                        gate = torch.sigmoid(self.hyperedge_scorer(feats)).view(())
-                        p = (
-                            feats.mean() * gate / candidate_normalizer[b]
-                        ).clamp_min(eps)
-                    else:
-                        p = torch.tensor(eps, dtype=torch.float32, device=self.device)
-
-                    prob_adj[b, nodes, f] = p
-
-                elif n_nodes == 1:
-                    # 兼容异常旧 buffer；正常 GAT 动态 factor 不应是一阶，一阶 self-factor 由 runner/trainer 追加。
-                    i = nodes[0]
-                    p = exist_mask[b, i].clamp_min(eps)
-                    prob_adj[b, i, f] = p
-
-                else:
-                    # 空 factor 或异常 factor：保持 1，trainer 中非 adj==1 位置会被忽略。
+                selected_nodes = adj_t[b, :, f] > 0.5
+                n_nodes = int(selected_nodes.long().sum().item())
+                if n_nodes == 0:
                     continue
+                if n_nodes == 1:
+                    # Compatibility for a legacy self factor. Dynamic SDDFG
+                    # emits only pair/triplet factors.
+                    node_idx = torch.where(selected_nodes)[0][0]
+                    prob_adj[b, node_idx, f] = (
+                        exist_mask[b, node_idx].clamp_min(eps)
+                    )
+                    continue
+
+                policy_probs, _ = self._constrained_probabilities(
+                    scores=scores,
+                    candidate_nodes=candidate_nodes,
+                    remaining=remaining,
+                    covered=covered,
+                    active_nodes=active_nodes,
+                    slots_after=max(factor_budget - f - 1, 0),
+                    max_factor_order=self.highest_orders,
+                )
+                if self.exploration_mix > 0.0:
+                    eligible = policy_probs > 0.0
+                    eligible_count = eligible.float().sum().clamp_min(1.0)
+                    uniform_probs = (
+                        eligible.to(policy_probs.dtype) / eligible_count
+                    )
+                    policy_probs = (
+                        (1.0 - self.exploration_mix) * policy_probs
+                        + self.exploration_mix * uniform_probs
+                    )
+                membership_match = torch.all(
+                    candidate_nodes
+                    == selected_nodes.unsqueeze(0),
+                    dim=1,
+                )
+                membership_match = membership_match & remaining
+                matched = torch.where(membership_match)[0]
+                if matched.numel() == 0:
+                    # Keep a finite diagnostic value for a legacy/corrupted
+                    # factor. The trainer validity mask excludes it.
+                    prob_adj[b, selected_nodes, f] = eps
+                    continue
+
+                selected_idx = int(matched[0].item())
+                selected_probability = policy_probs[
+                    selected_idx
+                ].clamp_min(eps)
+                prob_adj[b, selected_nodes, f] = selected_probability
+                remaining[selected_idx] = False
+                covered = covered | candidate_nodes[selected_idx]
 
         entropy = self._candidate_entropy(pair_score, exist_mask)
         return prob_adj, entropy

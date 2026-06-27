@@ -1,69 +1,145 @@
 import numpy as np
 import torch
-#import torch_scatter  # 用于图神经网络中的散射操作
-# def scatter_add(src, index, dim=0, out=None, dim_size=None):
-#     """
-#     使用 torch 原生函数模拟 torch_scatter.scatter_add，支持自动广播 index
-#     """
-#     if dim_size is None:
-#         dim_size = index.max().item() + 1
-#
-#     # 构造输出 tensor 的形状
-#     out_size = list(src.size())
-#     out_size[dim] = dim_size
-#
-#     if out is None:
-#         out = torch.zeros(out_size, dtype=src.dtype, device=src.device)
-#
-#     # [关键修复] 如果 index 维度少于 src，则自动扩展 index 以匹配 src 的形状
-#     if index.dim() != src.dim():
-#         # 假设 index 是一维的，我们需要将其 unsqueeze 并 expand 到与 src 相同的形状
-#         # 例如：src [E, D], index [E] -> index [E, 1] -> index [E, D]
-#
-#         # 1. 构建 view_shape: 在 dim 之后的所有维度补 1
-#         # 例如 src.dim()=2, dim=0 => view_shape=[E, 1]
-#         # 例如 src.dim()=4, dim=0 => view_shape=[E, 1, 1, 1]
-#         view_shape = list(index.shape)
-#         for _ in range(src.dim() - index.dim()):
-#             view_shape.append(1)
-#
-#         # 2. 调整形状并扩展
-#         index = index.view(view_shape).expand_as(src)
-#
-#     return out.scatter_add_(dim, index, src)
-def scatter_add(src, index, dim=0, out=None, dim_size=None):
-    """
-    Deterministic debug version for SDDFG.
 
-    目的：
-    避免 CUDA scatter_add_ 在重复 index 下的非确定性累加顺序。
-    当前 rSDDFGPolicy.py 内部只需要 dim=0 的 scatter_add。
-    这个版本速度较慢，但用于 10k determinism 验证足够。
-    """
-    if dim != 0:
-        raise NotImplementedError("deterministic scatter_add only supports dim=0 in this debug patch")
 
+def _deterministic_scatter_add_dim0(src, index, dim_size, out=None):
+    """Segment-sum fallback for strict deterministic CUDA execution.
+
+    CUDA ``scatter_add_`` uses atomic additions on the supported server
+    versions and is rejected when PyTorch strict determinism is enabled.  A
+    stable sort followed by cumulative segment sums has the same forward and
+    backward result without atomic writes.  All SDDFG call sites aggregate on
+    dimension zero with a one-dimensional destination index.
+    """
     if index.dim() != 1:
-        index_flat = index.reshape(-1)
-    else:
-        index_flat = index
+        raise RuntimeError(
+            "deterministic SDDFG scatter_add expects a 1-D index"
+        )
+    if src.shape[0] != index.shape[0]:
+        raise RuntimeError(
+            "scatter_add source/index length mismatch: {} vs {}".format(
+                src.shape[0],
+                index.shape[0],
+            )
+        )
 
+    result_shape = list(src.shape)
+    result_shape[0] = int(dim_size)
+    result = torch.zeros(
+        result_shape,
+        dtype=src.dtype,
+        device=src.device,
+    )
+    if index.numel() > 0:
+        sorted_index, permutation = torch.sort(index.long())
+        sorted_src = src[permutation]
+        prefix = torch.cumsum(sorted_src, dim=0)
+        is_segment_end = torch.cat(
+            (
+                sorted_index[1:] != sorted_index[:-1],
+                torch.ones(
+                    1,
+                    dtype=torch.bool,
+                    device=index.device,
+                ),
+            ),
+            dim=0,
+        )
+        end_positions = torch.where(is_segment_end)[0]
+        segment_sums = prefix[end_positions]
+        previous_prefix = torch.cat(
+            (
+                torch.zeros_like(segment_sums[:1]),
+                prefix[end_positions[:-1]],
+            ),
+            dim=0,
+        )
+        segment_sums = segment_sums - previous_prefix
+        unique_indices = sorted_index[end_positions]
+        result[unique_indices] = segment_sums
+
+    return result if out is None else out + result
+
+
+def scatter_add(src, index, dim=0, out=None, dim_size=None):
+    """Dependency-free ``torch_scatter.scatter_add`` equivalent.
+
+    Use the native fast path normally.  Under strict deterministic CUDA mode,
+    use a vectorized segment sum because atomic ``scatter_add_`` is forbidden
+    by PyTorch 1.8 and several later releases.
+    """
     if dim_size is None:
-        dim_size = int(index_flat.max().item()) + 1
+        dim_size = int(index.max().item()) + 1
+
+    deterministic_cuda = False
+    if src.is_cuda and hasattr(
+            torch,
+            "are_deterministic_algorithms_enabled"):
+        deterministic_cuda = bool(
+            torch.are_deterministic_algorithms_enabled()
+        )
+    if deterministic_cuda:
+        if dim != 0:
+            raise RuntimeError(
+                "deterministic SDDFG scatter_add only supports dim=0"
+            )
+        return _deterministic_scatter_add_dim0(
+            src,
+            index,
+            dim_size,
+            out=out,
+        )
 
     if out is None:
-        out_shape = list(src.shape)
-        out_shape[0] = int(dim_size)
+        out_shape = list(src.size())
+        out_shape[dim] = int(dim_size)
         out = torch.zeros(out_shape, dtype=src.dtype, device=src.device)
-    else:
-        out.zero_()
 
-    # 固定 Python 顺序累加，避免 CUDA atomic add 的顺序漂移
-    for i in range(index_flat.shape[0]):
-        dst = int(index_flat[i].item())
-        out[dst] = out[dst] + src[i]
+    if index.dim() != src.dim():
+        view_shape = list(index.shape)
+        view_shape.extend([1] * (src.dim() - index.dim()))
+        index = index.view(view_shape).expand_as(src)
 
-    return out
+    return out.scatter_add_(dim, index, src)
+
+
+def _gather_last_dim(values, indices):
+    """Select one action per row without nondeterministic GatherBackward.
+
+    PyTorch 1.8 implements CUDA ``GatherBackward`` with scatter-add and rejects
+    it under strict deterministic mode.  Every SDDFG action lookup has a
+    unique row, so two-dimensional advanced indexing is equivalent and has a
+    deterministic backward implementation.  Keep native gather as the normal
+    fast path.
+    """
+    deterministic_cuda = False
+    if values.is_cuda and hasattr(
+            torch,
+            "are_deterministic_algorithms_enabled"):
+        deterministic_cuda = bool(
+            torch.are_deterministic_algorithms_enabled()
+        )
+    if not deterministic_cuda:
+        return values.gather(dim=-1, index=indices)
+
+    if values.dim() != 2 or indices.numel() != values.shape[0]:
+        raise RuntimeError(
+            "deterministic action lookup expects values [E,A] and one "
+            "index per row, got {} and {}".format(
+                tuple(values.shape),
+                tuple(indices.shape),
+            )
+        )
+    row_indices = torch.arange(
+        values.shape[0],
+        device=values.device,
+        dtype=torch.long,
+    )
+    selected = values[
+        row_indices,
+        indices.reshape(-1).long(),
+    ]
+    return selected.unsqueeze(-1)
 
 from algorithms.sddfg.algorithm.agent_q_function import AgentQFunction
 from algorithms.sddfg.algorithm.agent_v_function import AgentVFunction
@@ -288,11 +364,17 @@ class R_SDDFGPolicy(MLPPolicy):
         num_edges = adj_input.sum()
 
         # ===== 修改点 4：rSDDFGPolicy.py::get_v_batch 和 get_rnn_batch，替换分母归一化 =====
-        idx_factor = torch.sum(adj_input.transpose(1, 2), dim=1)
+        # Apply one fixed global scale to every factor. The former per-order
+        # mean made a lone triplet weigh as much as all pair factors and made
+        # each new agent less influential as the roster grew.
+        fixed_factor_scale = float(max(
+            1,
+            self.n_agents,
+            int(self.args.num_factor),
+        ))
         for i in range(len(idx_node_order)):
             if len(idx_node_order[i]) != 0:
-                denom = torch.sum(idx_factor == i + 1, dim=-1)[idx_node_order[i][:, 0]].unsqueeze(-1)
-                q_batch[i] = q_batch[i] / denom.clamp_min(1.0)
+                q_batch[i] = q_batch[i] / fixed_factor_scale
 
         # n_f = self.args.num_factor
         # q_batch[0] = torch.where((idx_node_order[0][:,1].unsqueeze(-1)>n_f) & (dones[idx_node_order[0][:,0],torch.clamp(idx_node_order[0][:,1]-n_f,min=-1)]==1),torch.zeros_like(q_batch[0]),q_batch[0])
@@ -393,11 +475,14 @@ class R_SDDFGPolicy(MLPPolicy):
         num_edges = adj_input.sum()
 
         # ===== 修改点 4：替换 get_v_batch/get_rnn_batch 中相同的分母归一化代码 =====
-        idx_factor = torch.sum(adj_input.transpose(1, 2), dim=1)
+        fixed_factor_scale = float(max(
+            1,
+            self.n_agents,
+            int(self.args.num_factor),
+        ))
         for i in range(len(idx_node_order)):
             if len(idx_node_order[i]) != 0:
-                denom = torch.sum(idx_factor == i + 1, dim=-1)[idx_node_order[i][:, 0]].unsqueeze(-1)
-                q_batch[i] = q_batch[i] / denom.clamp_min(1.0)
+                q_batch[i] = q_batch[i] / fixed_factor_scale
 
         return q_batch, idx_node_order, adj_input.transpose(1, 2), num_edges
 
@@ -437,7 +522,7 @@ class R_SDDFGPolicy(MLPPolicy):
             edge_actions_1 = actions[idx_a_of_Q[0][0], idx_a_of_Q[0][1]]
             if len(edge_actions_1.shape) == 1:
                 edge_actions_1 = edge_actions_1.unsqueeze(dim=-1)
-            tmp1 = torch.cat([f_q[0].gather(dim=-1, index=edge_actions_1), torch.zeros((1, 1)).to(self.device)], dim=0)
+            tmp1 = torch.cat([_gather_last_dim(f_q[0], edge_actions_1), torch.zeros((1, 1)).to(self.device)], dim=0)
             if len(idx_a_of_Q[0][0].shape) == 0:
                 index1 = torch.cat([idx_a_of_Q[0][0].unsqueeze(0), torch.tensor([batch_size]).to(self.device)])
             else:
@@ -450,7 +535,7 @@ class R_SDDFGPolicy(MLPPolicy):
                 idx_a_of_Q[1][0], idx_a_of_Q[1][2]]
             if len(edge_actions_2.shape) == 1:
                 edge_actions_2 = edge_actions_2.unsqueeze(dim=-1)
-            tmp2 = torch.cat([f_q[1].gather(dim=-1, index=edge_actions_2), torch.zeros((1, 1)).to(self.device)], dim=0)
+            tmp2 = torch.cat([_gather_last_dim(f_q[1], edge_actions_2), torch.zeros((1, 1)).to(self.device)], dim=0)
             if len(idx_a_of_Q[1][0].shape) == 0:
                 index2 = torch.cat([idx_a_of_Q[1][0].unsqueeze(0), torch.tensor([batch_size]).to(self.device)])
             else:
@@ -462,7 +547,7 @@ class R_SDDFGPolicy(MLPPolicy):
                 idx_a_of_Q[2][0], idx_a_of_Q[2][2]]) * self.act_dim + actions[idx_a_of_Q[2][0], idx_a_of_Q[2][3]]
             if len(edge_actions_3.shape) == 1:
                 edge_actions_3 = edge_actions_3.unsqueeze(dim=-1)
-            tmp3 = torch.cat([f_q[2].gather(dim=-1, index=edge_actions_3), torch.zeros((1, 1)).to(self.device)], dim=0)
+            tmp3 = torch.cat([_gather_last_dim(f_q[2], edge_actions_3), torch.zeros((1, 1)).to(self.device)], dim=0)
             if len(idx_a_of_Q[2][0].shape) == 0:
                 index3 = torch.cat([idx_a_of_Q[2][0].unsqueeze(0), torch.tensor([batch_size]).to(self.device)])
             else:
@@ -490,21 +575,27 @@ class R_SDDFGPolicy(MLPPolicy):
                 idx_a_of_Q[0][0], idx_a_of_Q[0][1]]) * self.act_dim + actions[idx_a_of_Q[0][0], idx_a_of_Q[0][1]]
             if len(edge_actions_1.shape) == 1:
                 edge_actions_1 = edge_actions_1.unsqueeze(dim=-1)
-            values_f[0, idx_node_order[0][:, 1]] = f[0][idx_node_order[0][:, 1]].gather(dim=-1, index=edge_actions_1)
+            values_f[0, idx_node_order[0][:, 1]] = _gather_last_dim(
+                f[0][idx_node_order[0][:, 1]], edge_actions_1
+            )
 
         if self.highest_orders > 1 and len(idx_node_order[1]) != 0:
             edge_actions_2 = (actions[idx_a_of_Q[1][0], idx_a_of_Q[1][1]] * self.act_dim + actions[
                 idx_a_of_Q[1][0], idx_a_of_Q[1][2]]) * self.act_dim + actions[idx_a_of_Q[1][0], idx_a_of_Q[1][2]]
             if len(edge_actions_2.shape) == 1:
                 edge_actions_2 = edge_actions_2.unsqueeze(dim=-1)
-            values_f[0, idx_node_order[1][:, 1]] = f[0][idx_node_order[1][:, 1]].gather(dim=-1, index=edge_actions_2)
+            values_f[0, idx_node_order[1][:, 1]] = _gather_last_dim(
+                f[0][idx_node_order[1][:, 1]], edge_actions_2
+            )
 
         if self.highest_orders == 3 and len(idx_node_order[2]) != 0:
             edge_actions_3 = (actions[idx_a_of_Q[2][0], idx_a_of_Q[2][1]] * self.act_dim + actions[
                 idx_a_of_Q[2][0], idx_a_of_Q[2][2]]) * self.act_dim + actions[idx_a_of_Q[2][0], idx_a_of_Q[2][3]]
             if len(edge_actions_3.shape) == 1:
                 edge_actions_3 = edge_actions_3.unsqueeze(dim=-1)
-            values_f[0, idx_node_order[2][:, 1]] = f[0][idx_node_order[2][:, 1]].gather(dim=-1, index=edge_actions_3)
+            values_f[0, idx_node_order[2][:, 1]] = _gather_last_dim(
+                f[0][idx_node_order[2][:, 1]], edge_actions_3
+            )
         # Return the Q-values for the given actions
         # import pdb;pdb.set_trace()
         return values_f

@@ -5,6 +5,7 @@ set -euo pipefail
 #   bash scripts/train_wolfpack_sddfg_intra_episode_dynamic.sh [seed] [gpu] [num_env_steps]
 # Environment overrides:
 #   PYTHON_BIN=python CUDA_DEVICE=0 USER_NAME=local
+#   SKIP_SDDFG_PREFLIGHT=1  # only after the same revision has passed once
 
 seed="${1:-1}"
 gpu="${2:-${CUDA_DEVICE:-0}}"
@@ -68,6 +69,14 @@ fi
   echo "Console log: ${console_log}"
 } | tee "${console_log}"
 
+# Fail before allocating a long training run if the dynamic graph, adjacency
+# buffer axes, factor-Q gradients, or critic-free trainer initialization are
+# inconsistent with the server's PyTorch/Gym versions.
+if [[ "${SKIP_SDDFG_PREFLIGHT:-0}" != "1" ]]; then
+  "${python_bin}" "${script_dir}/validate_sddfg_dynamic_graph.py" \
+    2>&1 | tee -a "${console_log}"
+fi
+
 CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --env_name "${env_name}" \
   --wolfpack_id "${wolfpack_id}" \
@@ -91,8 +100,6 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --use_linear_lr_decay \
   --policy_lr_decay_floor 0.00001 \
   --critic_lr_decay_floor 0.00001 \
-  --use_valuenorm \
-  --use_vfunction \
   --use_dyn_graph \
   --msg_iterations 4 \
   --highest_orders 3 \
@@ -102,11 +109,13 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --gat_heads 4 \
   --gat_negative_slope 0.2 \
   --gat_hyperedge_hidden 64 \
+  --adj_return_adv_coef 1.0 \
+  --adj_factor_adv_coef 0.0 \
+  --adj_exploration_mix 0.0 \
   --adj_begin_step 5000 \
-  --adj_buffer_size 8 \
+  --adj_buffer_size 16 \
   --train_adj_episode 4 \
-  --num_mini_batch 1 \
-  --adj_anneal_time 500000 \
+  --num_mini_batch 2 \
   --clip_param 0.2 \
   --entropy_coef 0.01 \
   --max_grad_norm 10 \

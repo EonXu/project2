@@ -146,6 +146,34 @@ def get_config():
     parser.add_argument("--gat_heads", type=int, default=4, help="Number of multi-head attention for GAT")
     parser.add_argument("--gat_negative_slope", type=float, default=0.2, help="LeakyReLU negative slope in GAT")
     parser.add_argument( "--gat_hyperedge_hidden",type=int,default=32,help="Hidden dimension of pair-to-hyperedge scorer for 3-order SDDFG")
+    parser.add_argument(
+        "--adj_return_adv_coef",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of trajectory return advantage for SDDFG adjacency "
+            "learning."
+        ),
+    )
+    parser.add_argument(
+        "--adj_factor_adv_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of centered factor Q-V advantage used as auxiliary "
+            "credit for SDDFG adjacency learning."
+        ),
+    )
+    parser.add_argument(
+        "--adj_exploration_mix",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed uniform-mixture probability for constrained SDDFG graph "
+            "sampling. Zero keeps behavior and PPO target distributions "
+            "identical while categorical sampling still explores."
+        ),
+    )
     parser.add_argument("--min_adj_begin_step", type=int, default=5000,
                         help="Recommended lower bound for dynamic adj warmup steps")
 

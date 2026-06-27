@@ -51,6 +51,17 @@ def _nan_to_num_compat(x, nan=0.0, posinf=None, neginf=None):
     return out
 
 
+def _parameter_grad_norm(parameters):
+    """Return the finite L2 norm of an explicit parameter collection."""
+    total_sq = 0.0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad_norm = float(parameter.grad.detach().norm(2).cpu().item())
+        total_sq += grad_norm * grad_norm
+    return float(total_sq ** 0.5)
+
+
 def _infer_inactive_dones_from_obs(obs_seq: torch.Tensor) -> torch.Tensor:
     """
     Infer fixed-capacity inactive slots from Wolfpack padded observations.
@@ -130,16 +141,27 @@ class R_SDDFG:
         self.policy_optimizer = torch.optim.Adam(params=self.policy_parameters, lr=self.lr, eps=self.opti_eps)
 
         self.critic_fv_parameters = []
-        for policy in self.policies.values():
-            self.critic_fv_parameters += policy.critic_fv_parameters()
-        self.critic_fv_optimizer = torch.optim.Adam(params=self.critic_fv_parameters, lr=self.critic_lr,
-                                                    eps=self.opti_eps)
-
         self.critic_vtot_parameters = []
-        for policy in self.policies.values():
-            self.critic_vtot_parameters += policy.critic_vtot_parameters()
-        self.critic_vtot_optimizer = torch.optim.Adam(params=self.critic_vtot_parameters, lr=self.critic_lr,
-                                                      eps=self.opti_eps)
+        self.critic_fv_optimizer = None
+        self.critic_vtot_optimizer = None
+        if self.use_vfunction:
+            for policy in self.policies.values():
+                self.critic_fv_parameters += policy.critic_fv_parameters()
+                self.critic_vtot_parameters += policy.critic_vtot_parameters()
+            if not self.critic_fv_parameters or not self.critic_vtot_parameters:
+                raise RuntimeError(
+                    "use_vfunction=True but SDDFG critic parameters are empty"
+                )
+            self.critic_fv_optimizer = torch.optim.Adam(
+                params=self.critic_fv_parameters,
+                lr=self.critic_lr,
+                eps=self.opti_eps,
+            )
+            self.critic_vtot_optimizer = torch.optim.Adam(
+                params=self.critic_vtot_parameters,
+                lr=self.critic_lr,
+                eps=self.opti_eps,
+            )
 
         self.adj_parameters = []
         self.adj_parameters += self.adj_network.parameters()
@@ -183,20 +205,21 @@ class R_SDDFG:
             episodes,
             policy_floor
         )
-        self._set_optimizer_lr_with_floor(
-            self.critic_fv_optimizer,
-            self.critic_lr,
-            episode,
-            episodes,
-            critic_floor
-        )
-        self._set_optimizer_lr_with_floor(
-            self.critic_vtot_optimizer,
-            self.critic_lr,
-            episode,
-            episodes,
-            critic_floor
-        )
+        if self.use_vfunction:
+            self._set_optimizer_lr_with_floor(
+                self.critic_fv_optimizer,
+                self.critic_lr,
+                episode,
+                episodes,
+                critic_floor
+            )
+            self._set_optimizer_lr_with_floor(
+                self.critic_vtot_optimizer,
+                self.critic_lr,
+                episode,
+                episodes,
+                critic_floor
+            )
 
         # adj/GAT 默认不跟随全局 linear decay
         if use_adj_decay:
@@ -407,6 +430,16 @@ class R_SDDFG:
 
         self.policy_optimizer.zero_grad()
         loss.backward()
+        q_grad_parameters = []
+        rnn_grad_parameters = []
+        for policy in self.policies.values():
+            rnn_grad_parameters += list(policy.rnn_network.parameters())
+            for order in range(1, self.highest_orders + 1):
+                q_grad_parameters += list(
+                    policy.q_network[order].parameters()
+                )
+        q_network_grad_norm = _parameter_grad_norm(q_grad_parameters)
+        rnn_network_grad_norm = _parameter_grad_norm(rnn_grad_parameters)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.policy_parameters, self.args.max_grad_norm)
         if not torch.isfinite(torch.as_tensor(grad_norm)):
             raise FloatingPointError("non-finite SDDFG policy gradient norm")
@@ -435,10 +468,29 @@ class R_SDDFG:
         train_info['loss_v'] = _to_float(loss_v) if self.use_vfunction else 0.0
         train_info['loss_fv'] = _to_float(loss_fv) if self.use_vfunction else 0.0
         train_info['policy_grad_norm'] = _to_float(grad_norm)
+        train_info['q_network_grad_norm'] = q_network_grad_norm
+        train_info['rnn_network_grad_norm'] = rnn_network_grad_norm
         train_info['vtot_grad_norm'] = _to_float(vtot_grad_norm) if self.use_vfunction else 0.0
         train_info['fv_grad_norm'] = _to_float(fv_grad_norm) if self.use_vfunction else 0.0
         train_info['valid_transition_ratio'] = _to_float(valid_transition_mask.mean())
         train_info['active_transition_ratio'] = _to_float(active_transition_mask.mean())
+        train_info['q_tot_mean'] = _to_float(
+            (curr_Q_tot.detach() * valid_transition_mask).sum()
+            / valid_denom
+        )
+        train_info['q_target_mean'] = _to_float(
+            (Q_tot_targets.detach() * valid_transition_mask).sum()
+            / valid_denom
+        )
+        train_info['td_abs_mean'] = _to_float(
+            error.detach().abs().sum() / valid_denom
+        )
+        train_info['policy_lr'] = float(
+            self.policy_optimizer.param_groups[0]['lr']
+        )
+        train_info['policy_grad_was_clipped'] = float(
+            _to_float(grad_norm) > float(self.args.max_grad_norm)
+        )
         return train_info, new_priorities, idxes
 
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):
@@ -518,41 +570,49 @@ class R_SDDFG:
         behavior_factor_logp = (
             (log_prob_adj * valid_adj).sum(dim=1) / factor_den
         )
-        diff_log = (target_factor_logp - behavior_factor_logp).clamp(
-            min=-10.0,
-            max=10.0,
-        )
-        imp_weights = torch.exp(diff_log)
-        imp_weights = _nan_to_num_compat(
-            imp_weights,
+        factor_mask = valid_factor_masks.transpose(1, 2)
+        factor_mask_2d = factor_mask.squeeze(-1)
+        valid_factor_count = factor_mask.sum(
+            dim=-2,
+            keepdim=False,
+        ).clamp_min(1.0)
+
+        # The ordered factor sequence is one structured graph action. Its
+        # probability is the product of the conditional factor probabilities,
+        # so PPO must use the sum of their log-probabilities. Treating every
+        # factor as an independent action gives the wrong objective and makes
+        # roster sizes with more factor slots receive larger updates.
+        target_graph_logp = (
+            target_factor_logp * factor_mask_2d
+        ).sum(dim=-1, keepdim=True)
+        behavior_graph_logp = (
+            behavior_factor_logp * factor_mask_2d
+        ).sum(dim=-1, keepdim=True)
+        graph_diff_log = (
+            target_graph_logp - behavior_graph_logp
+        ).clamp(min=-10.0, max=10.0)
+        graph_imp_weights = torch.exp(graph_diff_log)
+        graph_imp_weights = _nan_to_num_compat(
+            graph_imp_weights,
             nan=1.0,
             posinf=1.0 + self.clip_param,
             neginf=1.0 - self.clip_param,
         )
-        imp_weights_multinomial = imp_weights.unsqueeze(-1)
 
         bad_transitions_mask = dones_env
-        clamp_imp_weights = torch.clamp(
-            imp_weights_multinomial,
+        clipped_graph_imp_weights = torch.clamp(
+            graph_imp_weights,
             1.0 - self.clip_param,
             1.0 + self.clip_param
         )
 
-        surr1 = imp_weights_multinomial * f_advts
-        surr2 = clamp_imp_weights * f_advts
-        factor_mask = valid_factor_masks.transpose(1, 2)
-
-        clipped_surr = torch.min(surr1, surr2)
-        clipped_surr = clipped_surr * factor_mask
-
-        valid_factor_count = factor_mask.sum(
-            dim=-2, keepdim=False
-        ).clamp_min(1.0)
-
-        per_transition_surr = (
-                clipped_surr.sum(dim=-2)
-                / valid_factor_count
+        graph_advantage = (
+            (f_advts * factor_mask).sum(dim=-2)
+            / valid_factor_count
         )
+        surr1 = graph_imp_weights * graph_advantage
+        surr2 = clipped_graph_imp_weights * graph_advantage
+        per_transition_surr = torch.min(surr1, surr2)
 
         has_valid_factor = (
                 factor_mask.sum(dim=-2) > 0
@@ -613,21 +673,31 @@ class R_SDDFG:
                 * (1.0 - bad_transitions_mask).view(-1, 1, 1)
             )
             valid_factor_stats_count = valid_factor_stats_mask.sum().clamp_min(1.0)
+            valid_graph_stats_mask = transition_mask > 0.5
             clip_fraction = (
                 (
-                    (imp_weights_multinomial > 1.0 + self.clip_param)
-                    | (imp_weights_multinomial < 1.0 - self.clip_param)
+                    (graph_imp_weights > 1.0 + self.clip_param)
+                    | (graph_imp_weights < 1.0 - self.clip_param)
                 ).float()
-                * valid_factor_stats_mask
-            ).sum() / valid_factor_stats_count
+                * transition_mask
+            ).sum() / transition_mask.sum().clamp_min(1.0)
 
-            valid_imp_weights = imp_weights_multinomial[
-                valid_factor_stats_mask > 0.5
+            valid_imp_weights = graph_imp_weights[
+                valid_graph_stats_mask
+            ]
+            valid_target_probs = torch.exp(target_factor_logp)[
+                valid_factor_stats_mask.squeeze(-1) > 0.5
+            ]
+            valid_behavior_probs = torch.exp(behavior_factor_logp)[
+                valid_factor_stats_mask.squeeze(-1) > 0.5
             ]
             if valid_imp_weights.numel() == 0:
                 imp_weight_mean = torch.tensor(1.0, device=self.device)
                 imp_weight_max = torch.tensor(1.0, device=self.device)
                 imp_weight_std = torch.tensor(0.0, device=self.device)
+                target_prob_mean = torch.tensor(0.0, device=self.device)
+                behavior_prob_mean = torch.tensor(0.0, device=self.device)
+                positive_adv_fraction = torch.tensor(0.0, device=self.device)
             else:
                 imp_weight_mean = valid_imp_weights.mean()
                 imp_weight_max = valid_imp_weights.max()
@@ -636,16 +706,29 @@ class R_SDDFG:
                     if valid_imp_weights.numel() > 1
                     else torch.tensor(0.0, device=self.device)
                 )
+                target_prob_mean = valid_target_probs.mean()
+                behavior_prob_mean = valid_behavior_probs.mean()
+                positive_adv_fraction = (
+                    (graph_advantage > 0.0).float()
+                    * transition_mask
+                ).sum() / transition_mask.sum().clamp_min(1.0)
 
             current_adj_lr = self.adj_optimizer.param_groups[0]["lr"]
 
         train_info = {}
         train_info['advantage'] = _to_float(f_advts.mean())
         train_info['f_advts_abs_mean'] = _to_float(f_advts.abs().mean())
+        train_info['graph_advantage_abs_mean'] = _to_float(
+            (graph_advantage.abs() * transition_mask).sum()
+            / transition_mask.sum().clamp_min(1.0)
+        )
         train_info['clamp_ratio'] = _to_float(clip_fraction)
         train_info['imp_weight_mean'] = _to_float(imp_weight_mean)
         train_info['imp_weight_max'] = _to_float(imp_weight_max)
         train_info['imp_weight_std'] = _to_float(imp_weight_std)
+        train_info['target_factor_prob_mean'] = _to_float(target_prob_mean)
+        train_info['behavior_factor_prob_mean'] = _to_float(behavior_prob_mean)
+        train_info['positive_adv_fraction'] = _to_float(positive_adv_fraction)
         train_info['valid_transition_ratio'] = valid_transition_ratio
         train_info['valid_agent_ratio'] = valid_agent_ratio
         train_info['rl_loss'] = _to_float(rl_loss)
@@ -666,6 +749,25 @@ class R_SDDFG:
         for policy_id in self.policy_ids:
             soft_update(
                 self.target_policies[policy_id], self.policies[policy_id], self.tau)
+            if self.use_vfunction:
+                target_policy = self.target_policies[policy_id]
+                source_policy = self.policies[policy_id]
+                soft_update(
+                    target_policy.rnn_critic_network,
+                    source_policy.rnn_critic_network,
+                    self.tau,
+                )
+                soft_update(
+                    target_policy.vtot_network,
+                    source_policy.vtot_network,
+                    self.tau,
+                )
+                for order in range(1, self.highest_orders + 1):
+                    soft_update(
+                        target_policy.v_network[order],
+                        source_policy.v_network[order],
+                        self.tau,
+                    )
 
     def prep_training(self):
         """See parent class."""
