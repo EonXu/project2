@@ -52,6 +52,33 @@ class WolfpackRunner(RecRunner):
     _BATCHED_FACTOR_GRAPH_ALGOS = {"sddfg", "ddfg", "ddfg_low"}
 
     @staticmethod
+    def _prepare_episode_metrics_for_logging(metric_lists):
+        """Prepare conditional episode metrics for scalar aggregation.
+
+        ``collecter`` uses ``-1`` when an episode never reaches global
+        success. Mixing that sentinel with real steps biases
+        ``first_success_step`` downward. Average successful episodes only, and
+        retain ``-1`` solely when the complete logging window has no success.
+        """
+        prepared = dict(metric_lists)
+        successful_steps = []
+        for value in metric_lists.get("first_success_step", []):
+            try:
+                step = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(step) and step >= 0.0:
+                successful_steps.append(step)
+
+        prepared["first_success_step"] = (
+            successful_steps if successful_steps else [-1.0]
+        )
+        prepared["first_success_step_sample_count"] = [
+            float(len(successful_steps))
+        ]
+        return prepared
+
+    @staticmethod
     def _extract_first_info_dict(infos, env_i=0):
         """
         Robustly extract a representative info dict from env wrappers.
@@ -199,6 +226,38 @@ class WolfpackRunner(RecRunner):
             active_agent_total = float(alive_agents.float().sum().item())
             covered_agents = alive_agents & (dynamic_degree > 0.0)
             covered_agent_num = float(covered_agents.float().sum().item())
+
+            # Coverage does not imply global communication: factors can cover
+            # every agent while forming disconnected components. Compute the
+            # transitive closure of factor co-membership over active agents.
+            co_membership = torch.bmm(
+                valid_adj,
+                valid_adj.transpose(1, 2),
+            ) > 0.0
+            active_pairs = (
+                alive_agents.unsqueeze(2)
+                & alive_agents.unsqueeze(1)
+            )
+            reachability = co_membership & active_pairs
+            active_eye = (
+                torch.eye(N, dtype=torch.bool, device=adj_t.device)
+                .unsqueeze(0)
+                & active_pairs
+            )
+            reachability = reachability | active_eye
+            for _ in range(N):
+                reachability = reachability | (
+                    torch.bmm(
+                        reachability.float(),
+                        reachability.float(),
+                    ) > 0.0
+                )
+            connected_by_batch = (
+                reachability | (~active_pairs)
+            ).reshape(B, -1).all(dim=1)
+            connected_graph_ratio = float(
+                connected_by_batch.float().mean().item()
+            )
             selected_prob_mean = 0.0
             selected_prob_min = 0.0
             if prob_adj is not None and valid_num > 0:
@@ -261,6 +320,7 @@ class WolfpackRunner(RecRunner):
                     float(dynamic_degree[alive_agents].mean().item())
                     if active_agent_total > 0.0 else 0.0
                 ),
+                "adj_connected_graph_ratio": connected_graph_ratio,
                 "adj_selected_prob_mean": selected_prob_mean,
                 "adj_selected_prob_min": selected_prob_min,
                 "adj_factor_retention_ratio": factor_retention_ratio,
@@ -440,6 +500,8 @@ class WolfpackRunner(RecRunner):
                 "joined_count": int(event.get("joined_count", 0)),
                 "recovered_count": int(event.get("recovered_count", 0)),
                 "pending_recovery_count": int(event.get("pending_recovery_count", 0)),
+                "capture_count": int(event.get("capture_count", 0)),
+                "success_now": int(bool(event.get("success_now", False))),
                 "left_slots": ",".join(map(str, event.get("left_slots", []))),
                 "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
                 "recovered_slots": ",".join(map(str, event.get("recovered_slots", []))),
@@ -524,6 +586,8 @@ class WolfpackRunner(RecRunner):
                 "joined_count": int(event.get("joined_count", 0)),
                 "recovered_count": int(event.get("recovered_count", 0)),
                 "pending_recovery_count": int(event.get("pending_recovery_count", 0)),
+                "capture_count": int(event.get("capture_count", 0)),
+                "success_now": int(bool(event.get("success_now", False))),
                 "left_slots": ",".join(map(str, event.get("left_slots", []))),
                 "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
                 "recovered_slots": ",".join(map(str, event.get("recovered_slots", []))),
@@ -615,6 +679,9 @@ class WolfpackRunner(RecRunner):
         eval_infos: Dict[str, list] = {
             "win_rate": [],
             "average_episode_rewards": [],
+            "capture_events": [],
+            "first_success_step": [],
+            "partial_capture_without_win": [],
             "num_players": [],
             "num_players_mean": [],
             "num_players_min": [],
@@ -641,6 +708,7 @@ class WolfpackRunner(RecRunner):
             "adj_active_agent_coverage": [],
             "adj_uncovered_active_agent_ratio": [],
             "adj_active_agent_degree": [],
+            "adj_connected_graph_ratio": [],
             "adj_selected_prob_mean": [],
             "adj_selected_prob_min": [],
             "adj_factor_retention_ratio": [],
@@ -660,11 +728,15 @@ class WolfpackRunner(RecRunner):
                     eval_infos[k] = []
                 eval_infos[k].append(v)
 
-        # 计算评估均值，用于 best checkpoint。
-        self.log_env(eval_infos, suffix="eval_")
+        # first_success_step is conditional on an episode succeeding; exclude
+        # the -1 no-success sentinel before scalar aggregation.
+        eval_infos_for_log = self._prepare_episode_metrics_for_logging(
+            eval_infos
+        )
+        self.log_env(eval_infos_for_log, suffix="eval_")
 
         eval_summary = {}
-        for k, v in eval_infos.items():
+        for k, v in eval_infos_for_log.items():
             # Baseline algorithms do not emit SDDFG-only adjacency metrics.  Do
             # not call np.mean([]): besides producing a meaningless NaN, it
             # raises a RuntimeWarning and makes a healthy baseline run look as
@@ -837,6 +909,8 @@ class WolfpackRunner(RecRunner):
         recover_event_count = 0
         topology_change_steps = 0
         pending_recovery_final = 0
+        capture_event_count = 0
+        first_success_step = -1
         # Number of 0->1 slot activations whose recurrent state and previous
         # action were reset. This covers both new joins and recoveries.
         activation_state_reset_count = 0
@@ -1135,6 +1209,16 @@ class WolfpackRunner(RecRunner):
                 except Exception:
                     team_rewards_traj.append(0.0)
 
+            if has_fresh_info:
+                capture_event_count += int(info_dict.get("capture_count", 0))
+                if (
+                    first_success_step < 0
+                    and bool(info_dict.get("success_now", False))
+                ):
+                    first_success_step = int(
+                        info_dict.get("episode_step", t + 1)
+                    )
+
             event_keys = {
                 "left_count", "joined_count", "recovered_count",
                 "topology_changed", "pending_recovery_count"
@@ -1173,6 +1257,8 @@ class WolfpackRunner(RecRunner):
                     "joined_count": joined_count,
                     "recovered_count": recovered_count,
                     "pending_recovery_count": pending_recovery_final,
+                    "capture_count": int(info_dict.get("capture_count", 0)),
+                    "success_now": bool(info_dict.get("success_now", False)),
                     "left_slots": list(info_dict.get("left_slots", [])),
                     "joined_slots": list(info_dict.get("joined_slots", [])),
                     "recovered_slots": list(info_dict.get("recovered_slots", [])),
@@ -1452,6 +1538,11 @@ class WolfpackRunner(RecRunner):
                     pass
 
         env_info.setdefault("win_rate", 0)
+        env_info["capture_events"] = float(capture_event_count)
+        env_info["first_success_step"] = float(first_success_step)
+        env_info["partial_capture_without_win"] = float(
+            capture_event_count > 0 and env_info["win_rate"] < 0.5
+        )
         env_info.setdefault("num_players", 0)
         env_info.setdefault("num_players_mean", float(env_info["num_players"]))
         env_info.setdefault("num_players_min", float(env_info["num_players"]))
@@ -1565,6 +1656,126 @@ class WolfpackRunner(RecRunner):
         except Exception:
             pass
 
+        try:
+            if hasattr(self.adj_network, "current_sampling_temperature"):
+                schedule_info["adj_sampling_temperature"] = float(
+                    self.adj_network.current_sampling_temperature
+                )
+            if hasattr(self.adj_network, "current_order3_bonus"):
+                schedule_info["adj_order3_bonus_current"] = float(
+                    self.adj_network.current_order3_bonus
+                )
+            if hasattr(self.adj_network, "current_min_order3_ratio"):
+                schedule_info["adj_min_order3_ratio_current"] = float(
+                    self.adj_network.current_min_order3_ratio
+                )
+            if hasattr(self.adj_network, "current_max_order3_ratio"):
+                schedule_info["adj_max_order3_ratio_current"] = float(
+                    self.adj_network.current_max_order3_ratio
+                )
+            if hasattr(self.adj_network, "current_greedy_sample_prob"):
+                schedule_info["adj_greedy_sample_prob_current"] = float(
+                    self.adj_network.current_greedy_sample_prob
+                )
+            if hasattr(self.adj_network, "current_order3_credit_gate"):
+                schedule_info["adj_order3_credit_gate_current"] = float(
+                    self.adj_network.current_order3_credit_gate
+                )
+            if hasattr(self.adj_network, "order3_credit_loss_ema"):
+                schedule_info["adj_order3_credit_loss_ema"] = float(
+                    self.adj_network.order3_credit_loss_ema
+                )
+            if hasattr(self.adj_network, "order3_credit_margin_ema"):
+                schedule_info["adj_order3_credit_margin_ema"] = float(
+                    self.adj_network.order3_credit_margin_ema
+                )
+            if hasattr(self.adj_network, "use_relative_order3_credit_gate"):
+                schedule_info["adj_order3_relative_credit_gate"] = float(
+                    bool(self.adj_network.use_relative_order3_credit_gate)
+                )
+            if hasattr(self.adj_network, "greedy_sample_prob_cap"):
+                schedule_info["adj_greedy_sample_prob_cap"] = float(
+                    self.adj_network.greedy_sample_prob_cap
+                )
+            if hasattr(self.adj_network, "order3_credit_gate_max_delta"):
+                schedule_info["adj_order3_credit_gate_max_delta"] = float(
+                    self.adj_network.order3_credit_gate_max_delta
+                )
+            if hasattr(self.adj_network, "order3_soft_quota_coef"):
+                schedule_info["adj_order3_soft_quota_coef"] = float(
+                    self.adj_network.order3_soft_quota_coef
+                )
+            if hasattr(self.adj_network, "triplet_balance_coef"):
+                schedule_info["adj_triplet_balance_coef"] = float(
+                    self.adj_network.triplet_balance_coef
+                )
+            for metric_key in (
+                "raw_order2_factor_rl_loss",
+                "raw_order3_factor_rl_loss",
+                "raw_o3_minus_o2_factor_rl_loss",
+                "order2_positive_adv_fraction",
+                "order3_positive_adv_fraction",
+                "order2_promoted_adv_fraction",
+                "order3_promoted_adv_fraction",
+                "adj_order_adv_positive_only",
+                "adj_order_adv_negative_coef",
+                "adj_order_adv_require_positive_graph_adv",
+                "use_adj_advantage_triplet_scorer",
+                "adv_triplet_credit_pair_updates",
+                "adv_triplet_credit_triplet_updates",
+                "adv_triplet_credit_seen_ratio",
+                "adv_pair_credit_seen_ratio",
+                "adv_triplet_credit_mean",
+                "adv_triplet_marginal_mean",
+                "adv_triplet_marginal_positive_fraction",
+                "use_adj_triplet_credit_direct_rank",
+                "adj_triplet_credit_rank_coef",
+                "adj_triplet_credit_min_multiplier",
+                "adj_triplet_credit_max_multiplier",
+                "adj_triplet_credit_negative_rank_scale",
+                "adj_triplet_credit_min_positive_fraction",
+                "adv_triplet_score_multiplier_mean",
+                "adv_triplet_score_multiplier_min",
+                "adv_triplet_score_multiplier_max",
+                "adv_triplet_score_marginal_mean",
+                "adv_triplet_score_positive_fraction",
+                "adv_triplet_negative_scaled_fraction",
+                "adj_ppo_epochs_ran",
+                "adj_ppo_early_stop_triggered",
+                "adj_ppo_last_epoch_clip_ratio",
+                "adj_ppo_last_epoch_factor_clip_ratio",
+                "adj_ppo_clip_stop_ratio",
+                "adj_ppo_factor_clip_stop_ratio",
+                "adj_ppo_min_epochs",
+                "trusted_clamp_ratio",
+                "trusted_factor_clamp_ratio",
+                "adj_graph_trust_weight_mean",
+                "adj_factor_trust_weight_mean",
+                "adj_graph_stale_ratio",
+                "adj_factor_stale_ratio",
+                "use_adj_ppo_stale_trust",
+                "adj_ppo_stale_trust_clip",
+                "adj_ppo_stale_trust_scale",
+                "adj_ppo_stale_trust_min_weight",
+                "adj_recent_episode_window",
+                "adj_recent_episode_window_config",
+                "adj_dynamic_recent_window_enabled",
+                "adj_recent_window_shrunk",
+                "adj_recent_window_recovered",
+                "adj_recent_window_high_stale_count",
+                "adj_recent_window_low_stale_count",
+                "adj_sample_episode_count",
+                "adj_sample_recent_fraction",
+            ):
+                metric_value = self._latest_train_metric(
+                    metric_key,
+                    np.nan,
+                )
+                if np.isfinite(metric_value):
+                    schedule_info[metric_key] = float(metric_value)
+        except Exception:
+            pass
+
         for k, v in schedule_info.items():
             tag = "schedule/" + k
             if self.use_wandb:
@@ -1580,7 +1791,10 @@ class WolfpackRunner(RecRunner):
                 self.env_infos[k] = []
             self.env_infos[k].append(v)
 
-        self.log_env(self.env_infos)
+        env_infos_for_log = self._prepare_episode_metrics_for_logging(
+            self.env_infos
+        )
+        self.log_env(env_infos_for_log)
         self.log_clear()
 
     def log_clear(self):
@@ -1588,6 +1802,9 @@ class WolfpackRunner(RecRunner):
         self.env_infos = {
             "win_rate": [],
             "average_episode_rewards": [],
+            "capture_events": [],
+            "first_success_step": [],
+            "partial_capture_without_win": [],
 
             # episode 末尾人数
             "num_players": [],
@@ -1626,9 +1843,79 @@ class WolfpackRunner(RecRunner):
             "adj_active_agent_coverage": [],
             "adj_uncovered_active_agent_ratio": [],
             "adj_active_agent_degree": [],
+            "adj_connected_graph_ratio": [],
             "adj_selected_prob_mean": [],
             "adj_selected_prob_min": [],
             "adj_factor_retention_ratio": [],
             "epsilon": [],
             "adj_epsilon": [],
+            "adj_sampling_temperature": [],
+            "adj_order3_bonus_current": [],
+            "adj_min_order3_ratio_current": [],
+            "adj_max_order3_ratio_current": [],
+            "adj_greedy_sample_prob_current": [],
+            "adj_order3_credit_gate_current": [],
+            "adj_order3_credit_loss_ema": [],
+            "adj_order3_credit_margin_ema": [],
+            "adj_order3_relative_credit_gate": [],
+            "adj_greedy_sample_prob_cap": [],
+            "adj_order3_credit_gate_max_delta": [],
+            "adj_order3_soft_quota_coef": [],
+            "adj_triplet_balance_coef": [],
+            "raw_order2_factor_rl_loss": [],
+            "raw_order3_factor_rl_loss": [],
+            "raw_o3_minus_o2_factor_rl_loss": [],
+            "order2_positive_adv_fraction": [],
+            "order3_positive_adv_fraction": [],
+            "order2_promoted_adv_fraction": [],
+            "order3_promoted_adv_fraction": [],
+            "adj_order_adv_positive_only": [],
+            "adj_order_adv_negative_coef": [],
+            "adj_order_adv_require_positive_graph_adv": [],
+            "use_adj_advantage_triplet_scorer": [],
+            "adv_triplet_credit_pair_updates": [],
+            "adv_triplet_credit_triplet_updates": [],
+            "adv_triplet_credit_seen_ratio": [],
+            "adv_pair_credit_seen_ratio": [],
+            "adv_triplet_credit_mean": [],
+            "adv_triplet_marginal_mean": [],
+            "adv_triplet_marginal_positive_fraction": [],
+            "use_adj_triplet_credit_direct_rank": [],
+            "adj_triplet_credit_rank_coef": [],
+            "adj_triplet_credit_min_multiplier": [],
+            "adj_triplet_credit_max_multiplier": [],
+            "adj_triplet_credit_negative_rank_scale": [],
+            "adj_triplet_credit_min_positive_fraction": [],
+            "adv_triplet_score_multiplier_mean": [],
+            "adv_triplet_score_multiplier_min": [],
+            "adv_triplet_score_multiplier_max": [],
+            "adv_triplet_score_marginal_mean": [],
+            "adv_triplet_score_positive_fraction": [],
+            "adv_triplet_negative_scaled_fraction": [],
+            "adj_ppo_epochs_ran": [],
+            "adj_ppo_early_stop_triggered": [],
+            "adj_ppo_last_epoch_clip_ratio": [],
+            "adj_ppo_last_epoch_factor_clip_ratio": [],
+            "adj_ppo_clip_stop_ratio": [],
+            "adj_ppo_factor_clip_stop_ratio": [],
+            "adj_ppo_min_epochs": [],
+            "trusted_clamp_ratio": [],
+            "trusted_factor_clamp_ratio": [],
+            "adj_graph_trust_weight_mean": [],
+            "adj_factor_trust_weight_mean": [],
+            "adj_graph_stale_ratio": [],
+            "adj_factor_stale_ratio": [],
+            "use_adj_ppo_stale_trust": [],
+            "adj_ppo_stale_trust_clip": [],
+            "adj_ppo_stale_trust_scale": [],
+            "adj_ppo_stale_trust_min_weight": [],
+            "adj_recent_episode_window": [],
+            "adj_recent_episode_window_config": [],
+            "adj_dynamic_recent_window_enabled": [],
+            "adj_recent_window_shrunk": [],
+            "adj_recent_window_recovered": [],
+            "adj_recent_window_high_stale_count": [],
+            "adj_recent_window_low_stale_count": [],
+            "adj_sample_episode_count": [],
+            "adj_sample_recent_fraction": [],
         }

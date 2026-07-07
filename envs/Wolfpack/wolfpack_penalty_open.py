@@ -620,6 +620,7 @@ class WolfpackPenaltyOpen(gym.Env):
              - 同一步每个 prey 最多捕获一次（按 prey 遍历一次），避免重复加分。
         """
         self.food_points = [0 for _ in range(self.max_food_num)]
+        self.last_capture_count = 0
 
         # 1) 距离塑形（slot）
         cur_dist_to_food = [None] * self.max_player_num
@@ -661,6 +662,7 @@ class WolfpackPenaltyOpen(gym.Env):
                 self.food_alive_statuses[fid] = False
                 self.food_frozen_time[fid] = self.food_freeze_rate
                 self.food_points[fid] -= 1
+                self.last_capture_count += 1
 
                 # 从 grid/rgb 上清除（冻结期视为“不存在”）
                 self.grid[fx][fy] = 1
@@ -985,6 +987,8 @@ class WolfpackPenaltyOpen(gym.Env):
             "active_masks": active_masks.copy(),
             "individual_rewards": individual_rewards.copy(),
             "team_reward": team_reward_scalar,
+            "capture_count": int(self.last_capture_count),
+            "success_now": bool(success),
             "topology_changed": topology_changed,
             "left_slots": list(event_info["left_slots"]),
             "joined_slots": list(event_info["joined_slots"]),

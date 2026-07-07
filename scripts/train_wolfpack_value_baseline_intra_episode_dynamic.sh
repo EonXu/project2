@@ -137,8 +137,6 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" train/train_wolfpack.py \
   --gamma 0.97 \
   --hard_update_interval_episode 200 \
   --use_reward_normalization \
-  --use_linear_lr_decay \
-  --policy_lr_decay_floor 0.00001 \
   --max_grad_norm 10 \
   --num_agents "${num_agents}" \
   --max_player_num "${max_player_num}" \

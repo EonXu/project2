@@ -97,6 +97,64 @@ class R_SDDFG:
         self.use_huber_loss = self.args.use_huber_loss
         self.huber_delta = self.args.huber_delta
         self.clip_param = self.args.clip_param
+        self.adj_order_adv_coef = max(
+            0.0,
+            float(getattr(self.args, "adj_order_adv_coef", 0.0)),
+        )
+        self.adj_order_adv_positive_only = bool(
+            getattr(self.args, "adj_order_adv_positive_only", False)
+        )
+        self.adj_order_adv_negative_coef = max(
+            0.0,
+            float(getattr(self.args, "adj_order_adv_negative_coef", 0.0)),
+        )
+        self.adj_order_adv_require_positive_graph_adv = bool(
+            getattr(
+                self.args,
+                "adj_order_adv_require_positive_graph_adv",
+                False,
+            )
+        )
+        graph_gate_mode = str(
+            getattr(self.args, "adj_order_adv_graph_gate_mode", "binary")
+        ).lower()
+        if graph_gate_mode not in ("binary", "soft"):
+            graph_gate_mode = "binary"
+        self.adj_order_adv_graph_gate_mode = graph_gate_mode
+        self.adj_order_adv_graph_gate_scale = max(
+            1e-6,
+            float(getattr(self.args, "adj_order_adv_graph_gate_scale", 1.0)),
+        )
+        self.use_adj_ppo_stale_trust = bool(
+            getattr(self.args, "use_adj_ppo_stale_trust", False)
+        )
+        self.adj_ppo_stale_trust_clip = max(
+            0.0,
+            float(
+                getattr(
+                    self.args,
+                    "adj_ppo_stale_trust_clip",
+                    self.clip_param,
+                )
+            ),
+        )
+        self.adj_ppo_stale_trust_scale = max(
+            1e-6,
+            float(getattr(self.args, "adj_ppo_stale_trust_scale", 0.25)),
+        )
+        self.adj_ppo_stale_trust_min_weight = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    getattr(
+                        self.args,
+                        "adj_ppo_stale_trust_min_weight",
+                        0.25,
+                    )
+                ),
+            ),
+        )
         self.use_vfunction = self.args.use_vfunction
         self.device = device
         self.tpdv = dict(dtype=torch.float32, device=device)
@@ -111,7 +169,32 @@ class R_SDDFG:
         self.highest_orders = self.args.highest_orders
         self.use_dyn_graph = self.args.use_dyn_graph
         self.num_factor = self.args.num_factor
-        self.entropy_coef = self.args.entropy_coef
+        # ``entropy_coef`` was historically reused as the SDDFG graph entropy
+        # weight.  In the intra-episode dynamic Wolfpack runs, run21 showed
+        # that the legacy value (1e-3) keeps the graph distribution close to
+        # uniform at 200k steps.  Keep the old fallback, but allow the graph
+        # policy to use its own smaller coefficient.
+        configured_adj_entropy_coef = float(
+            getattr(self.args, "adj_entropy_coef", -1.0)
+        )
+        self.entropy_coef = (
+            float(self.args.entropy_coef)
+            if configured_adj_entropy_coef < 0.0
+            else configured_adj_entropy_coef
+        )
+        self.adj_entropy_coef = float(self.entropy_coef)
+        configured_entropy_final = float(
+            getattr(self.args, "adj_entropy_coef_final", -1.0)
+        )
+        self.adj_entropy_coef_final = (
+            self.adj_entropy_coef
+            if configured_entropy_final < 0.0
+            else configured_entropy_final
+        )
+        self.adj_entropy_anneal_steps = max(
+            0,
+            int(getattr(self.args, "adj_entropy_anneal_steps", 0)),
+        )
         self._use_valuenorm = self.args.use_valuenorm
         self.adj_max_grad_norm = self.args.adj_max_grad_norm
         self.policies = policies
@@ -194,7 +277,6 @@ class R_SDDFG:
         """
         policy_floor = float(getattr(self.args, "policy_lr_decay_floor", 1e-5))
         critic_floor = float(getattr(self.args, "critic_lr_decay_floor", 1e-5))
-        adj_floor = float(getattr(self.args, "adj_lr_decay_floor", 2e-5))
         use_adj_decay = bool(getattr(self.args, "use_adj_linear_lr_decay", False))
 
         # policy / critic 继续衰减，但设置 floor，避免后期完全学不动
@@ -223,16 +305,48 @@ class R_SDDFG:
 
         # adj/GAT 默认不跟随全局 linear decay
         if use_adj_decay:
-            self._set_optimizer_lr_with_floor(
-                self.adj_optimizer,
-                self.adj_lr,
-                episode,
-                episodes,
-                adj_floor
-            )
+            self.adj_lr_decay(episode)
         else:
             for param_group in self.adj_optimizer.param_groups:
                 param_group["lr"] = float(self.adj_lr)
+
+    def adj_lr_decay(self, env_step):
+        """Decay only graph parameters on a fixed environment-step clock.
+
+        Dynamic topology inference remains active after annealing; only the
+        cumulative drift of the GAT/hyperedge parameters is reduced. The
+        caller supplies an explicit environment-step horizon so experiments
+        can either preserve a common prefix or anneal across the full run.
+        """
+        anneal_steps = max(
+            1,
+            int(getattr(self.args, "adj_lr_anneal_steps", 500000)),
+        )
+        adj_floor = float(getattr(self.args, "adj_lr_decay_floor", 2e-5))
+        current_lr = self._set_optimizer_lr_with_floor(
+            self.adj_optimizer,
+            self.adj_lr,
+            env_step,
+            anneal_steps,
+            adj_floor,
+        )
+        if self.adj_entropy_anneal_steps > 0:
+            progress = min(
+                max(
+                    float(env_step)
+                    / float(self.adj_entropy_anneal_steps),
+                    0.0,
+                ),
+                1.0,
+            )
+            self.adj_entropy_coef = (
+                self.entropy_coef
+                + progress
+                * (self.adj_entropy_coef_final - self.entropy_coef)
+            )
+        else:
+            self.adj_entropy_coef = float(self.entropy_coef)
+        return current_lr
 
     def train_policy_on_batch(self, batch, use_same_share_obs=None):
         """See parent class."""
@@ -606,6 +720,7 @@ class R_SDDFG:
             1.0 + self.clip_param
         )
 
+        factor_advantage = f_advts.squeeze(-1)
         graph_advantage = (
             (f_advts * factor_mask).sum(dim=-2)
             / valid_factor_count
@@ -622,10 +737,188 @@ class R_SDDFG:
                 (1.0 - bad_transitions_mask)
                 * has_valid_factor
         )
+        graph_trust_weights = torch.ones_like(graph_imp_weights)
+        if self.use_adj_ppo_stale_trust:
+            # run37 showed that high-clamp early stop reliably stops after one
+            # epoch, but the first epoch is already far outside the PPO trust
+            # region.  That means the buffer is stale before any replay update
+            # happens.  Down-weight those out-of-distribution graph decisions
+            # instead of letting clipped stale samples dominate the gradient.
+            graph_ratio_deviation = (
+                graph_imp_weights.detach() - 1.0
+            ).abs()
+            graph_stale_excess = (
+                graph_ratio_deviation
+                - float(self.adj_ppo_stale_trust_clip)
+            ).clamp_min(0.0)
+            graph_trust_weights = torch.exp(
+                -graph_stale_excess
+                / float(self.adj_ppo_stale_trust_scale)
+            )
+            graph_trust_weights = torch.clamp(
+                graph_trust_weights,
+                min=float(self.adj_ppo_stale_trust_min_weight),
+                max=1.0,
+            ).detach()
+        graph_loss_mask = transition_mask * graph_trust_weights
 
-        rl_loss = -(
-                per_transition_surr * transition_mask
-        ).sum() / transition_mask.sum().clamp_min(1.0)
+        graph_rl_loss = -(
+                per_transition_surr * graph_loss_mask
+        ).sum() / graph_loss_mask.sum().clamp_min(1.0)
+
+        # ``AdjBuffer`` centers the auxiliary factor Q(-V) advantage within
+        # each selected graph. Averaging factors into ``graph_advantage``
+        # therefore cancels that signal exactly. Apply the centered residual
+        # to each sequential conditional factor decision, while retaining the
+        # graph-level PPO objective for the trajectory return advantage.
+        factor_training_mask = (
+            factor_mask_2d * (1.0 - bad_transitions_mask)
+        )
+        factor_order_2d = factor_size.squeeze(1)
+        raw_local_factor_advantage = (
+            factor_advantage - graph_advantage
+        ) * factor_training_mask
+        order_extra = torch.clamp(factor_order_2d - 2.0, min=0.0)
+        positive_order_credit_weight = (
+            1.0 + self.adj_order_adv_coef * order_extra
+        )
+        triplet_order_mask = order_extra > 0.0
+        positive_residual_mask = raw_local_factor_advantage > 0.0
+        graph_promotion_strength = torch.ones_like(graph_advantage)
+        if self.adj_order_adv_require_positive_graph_adv:
+            # A triplet that is locally better than the average factor inside
+            # a bad graph can still be a bad coordination choice.  The first
+            # binary gate fixed that direction, but run34 showed it was too
+            # noisy: promoted fractions collapsed while graph PPO clamp ratios
+            # grew.  Use a continuous positive graph-advantage strength when
+            # requested; negative-return graphs still get zero positive
+            # triplet credit, while mildly positive graphs get a proportional
+            # rather than all-or-nothing promotion.
+            if self.adj_order_adv_graph_gate_mode == "soft":
+                graph_adv_abs_scale = (
+                    (graph_advantage.abs() * transition_mask).sum()
+                    / transition_mask.sum().clamp_min(1.0)
+                ).clamp_min(1e-6)
+                graph_adv_abs_scale = (
+                    graph_adv_abs_scale
+                    * float(self.adj_order_adv_graph_gate_scale)
+                ).clamp_min(1e-6)
+                positive_graph_advantage = torch.clamp(
+                    graph_advantage,
+                    min=0.0,
+                )
+                graph_promotion_strength = (
+                    positive_graph_advantage
+                    / (
+                        positive_graph_advantage
+                        + graph_adv_abs_scale
+                    )
+                )
+            else:
+                graph_promotion_strength = (
+                    graph_advantage > 0.0
+                ).float()
+        promoted_positive_adv_mask = (
+            positive_residual_mask
+            & (
+                graph_promotion_strength
+                > 0.0
+            )
+        )
+        if self.adj_order_adv_positive_only:
+            negative_order_credit_weight = (
+                1.0
+                + self.adj_order_adv_negative_coef
+                * order_extra
+            )
+            # run32 still had a persistent positive order3 PPO loss even
+            # though the structure ratio was already pair-heavy.  The gate
+            # was partly reacting to negative triplet residuals that had
+            # been multiplied by the same order-aware factor used to promote
+            # useful triplets.  Split the two directions: positive triplet
+            # residuals keep the strong promotion signal, while negative
+            # residuals are suppressed at a configurable, usually smaller,
+            # scale so the graph learner is driven by marginal gains instead
+            # of amplified early triplet noise.
+            triplet_positive_weight = (
+                positive_order_credit_weight
+                * graph_promotion_strength
+            )
+            positive_credit_weight = torch.where(
+                triplet_order_mask,
+                triplet_positive_weight,
+                torch.ones_like(positive_order_credit_weight),
+            )
+            order_credit_weight = torch.where(
+                positive_residual_mask,
+                positive_credit_weight,
+                negative_order_credit_weight,
+            )
+        else:
+            order_credit_weight = positive_order_credit_weight
+        order_credit_weight = torch.where(
+            factor_training_mask > 0.0,
+            order_credit_weight,
+            torch.ones_like(order_credit_weight),
+        )
+        local_factor_advantage = (
+            raw_local_factor_advantage
+            * order_credit_weight
+        )
+        factor_diff_log = (
+            target_factor_logp - behavior_factor_logp
+        ).clamp(min=-10.0, max=10.0)
+        factor_imp_weights = torch.exp(factor_diff_log)
+        factor_imp_weights = _nan_to_num_compat(
+            factor_imp_weights,
+            nan=1.0,
+            posinf=1.0 + self.clip_param,
+            neginf=1.0 - self.clip_param,
+        )
+        clipped_factor_imp_weights = torch.clamp(
+            factor_imp_weights,
+            1.0 - self.clip_param,
+            1.0 + self.clip_param,
+        )
+        factor_trust_weights = torch.ones_like(factor_imp_weights)
+        if self.use_adj_ppo_stale_trust:
+            factor_ratio_deviation = (
+                factor_imp_weights.detach() - 1.0
+            ).abs()
+            factor_stale_excess = (
+                factor_ratio_deviation
+                - float(self.adj_ppo_stale_trust_clip)
+            ).clamp_min(0.0)
+            factor_trust_weights = torch.exp(
+                -factor_stale_excess
+                / float(self.adj_ppo_stale_trust_scale)
+            )
+            factor_trust_weights = torch.clamp(
+                factor_trust_weights,
+                min=float(self.adj_ppo_stale_trust_min_weight),
+                max=1.0,
+            ).detach()
+        factor_loss_mask = factor_training_mask * factor_trust_weights
+        factor_surr1 = factor_imp_weights * local_factor_advantage
+        factor_surr2 = (
+            clipped_factor_imp_weights * local_factor_advantage
+        )
+        factor_min_surr = torch.min(factor_surr1, factor_surr2)
+        raw_factor_surr1 = (
+            factor_imp_weights * raw_local_factor_advantage
+        )
+        raw_factor_surr2 = (
+            clipped_factor_imp_weights * raw_local_factor_advantage
+        )
+        raw_factor_min_surr = torch.min(
+            raw_factor_surr1,
+            raw_factor_surr2,
+        )
+        factor_rl_loss = -(
+            factor_min_surr
+            * factor_loss_mask
+        ).sum() / factor_loss_mask.sum().clamp_min(1.0)
+        rl_loss = graph_rl_loss + factor_rl_loss
 
         # 仅对环境未结束且在线的 agent 计算图熵。
         valid_env_masks = (1.0 - bad_transitions_mask).view(-1, 1, 1)
@@ -653,7 +946,7 @@ class R_SDDFG:
             entropy_per_transition * entropy_transition_mask
         ).sum() / entropy_transition_mask.sum().clamp_min(1.0)
 
-        loss = rl_loss - self.entropy_coef * entropy_loss
+        loss = rl_loss - self.adj_entropy_coef * entropy_loss
         if not torch.isfinite(loss):
             raise FloatingPointError(
                 "non-finite SDDFG adjacency loss"
@@ -681,9 +974,171 @@ class R_SDDFG:
                 ).float()
                 * transition_mask
             ).sum() / transition_mask.sum().clamp_min(1.0)
+            factor_clip_fraction = (
+                (
+                    (factor_imp_weights > 1.0 + self.clip_param)
+                    | (factor_imp_weights < 1.0 - self.clip_param)
+                ).float()
+                * factor_training_mask
+            ).sum() / factor_training_mask.sum().clamp_min(1.0)
+            trusted_clip_fraction = (
+                (
+                    (
+                        (graph_imp_weights > 1.0 + self.clip_param)
+                        | (graph_imp_weights < 1.0 - self.clip_param)
+                    ).float()
+                    * graph_loss_mask
+                ).sum()
+                / graph_loss_mask.sum().clamp_min(1.0)
+            )
+            trusted_factor_clip_fraction = (
+                (
+                    (
+                        (factor_imp_weights > 1.0 + self.clip_param)
+                        | (factor_imp_weights < 1.0 - self.clip_param)
+                    ).float()
+                    * factor_loss_mask
+                ).sum()
+                / factor_loss_mask.sum().clamp_min(1.0)
+            )
+            graph_trust_weight_mean = (
+                (graph_trust_weights * transition_mask).sum()
+                / transition_mask.sum().clamp_min(1.0)
+            )
+            factor_trust_weight_mean = (
+                (factor_trust_weights * factor_training_mask).sum()
+                / factor_training_mask.sum().clamp_min(1.0)
+            )
+            graph_stale_ratio = (
+                (
+                    (
+                        (graph_imp_weights.detach() - 1.0).abs()
+                        > float(self.adj_ppo_stale_trust_clip)
+                    ).float()
+                    * transition_mask
+                ).sum()
+                / transition_mask.sum().clamp_min(1.0)
+            )
+            factor_stale_ratio = (
+                (
+                    (
+                        (factor_imp_weights.detach() - 1.0).abs()
+                        > float(self.adj_ppo_stale_trust_clip)
+                    ).float()
+                    * factor_training_mask
+                ).sum()
+                / factor_training_mask.sum().clamp_min(1.0)
+            )
+            order2_factor_mask = (
+                (factor_order_2d == 2.0).float()
+                * factor_training_mask
+            )
+            order3_factor_mask = (
+                (factor_order_2d == 3.0).float()
+                * factor_training_mask
+            )
+            order2_factor_count = order2_factor_mask.sum()
+            order3_factor_count = order3_factor_mask.sum()
+            selected_order_factor_count = (
+                order2_factor_count + order3_factor_count
+            ).clamp_min(1.0)
+            order3_factor_fraction = (
+                order3_factor_count / selected_order_factor_count
+            )
+            order2_factor_advantage_abs_mean = (
+                (raw_local_factor_advantage.abs() * order2_factor_mask).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            order3_factor_advantage_abs_mean = (
+                (raw_local_factor_advantage.abs() * order3_factor_mask).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            weighted_order3_factor_advantage_abs_mean = (
+                (local_factor_advantage.abs() * order3_factor_mask).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            order2_factor_loss_mask = order2_factor_mask * factor_trust_weights
+            order3_factor_loss_mask = order3_factor_mask * factor_trust_weights
+            order2_factor_loss_count = order2_factor_loss_mask.sum()
+            order3_factor_loss_count = order3_factor_loss_mask.sum()
+            order2_factor_rl_loss = -(
+                factor_min_surr * order2_factor_loss_mask
+            ).sum() / order2_factor_loss_count.clamp_min(1.0)
+            order3_factor_rl_loss = -(
+                factor_min_surr * order3_factor_loss_mask
+            ).sum() / order3_factor_loss_count.clamp_min(1.0)
+            raw_order2_factor_rl_loss = -(
+                raw_factor_min_surr * order2_factor_loss_mask
+            ).sum() / order2_factor_loss_count.clamp_min(1.0)
+            raw_order3_factor_rl_loss = -(
+                raw_factor_min_surr * order3_factor_loss_mask
+            ).sum() / order3_factor_loss_count.clamp_min(1.0)
+            order2_positive_adv_fraction = (
+                (
+                    (raw_local_factor_advantage > 0.0).float()
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            order3_positive_adv_fraction = (
+                (
+                    (raw_local_factor_advantage > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            order2_promoted_adv_fraction = (
+                (
+                    promoted_positive_adv_mask.float()
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            order3_promoted_adv_fraction = (
+                (
+                    promoted_positive_adv_mask.float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            order2_promotion_strength_mean = (
+                (
+                    graph_promotion_strength
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            order3_promotion_strength_mean = (
+                (
+                    graph_promotion_strength
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            order3_promoted_adv_weighted_fraction = (
+                (
+                    graph_promotion_strength
+                    * positive_residual_mask.float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            advantage_triplet_credit_info = {}
+            if hasattr(self.adj_network, "update_factor_credit_memory"):
+                advantage_triplet_credit_info = (
+                    self.adj_network.update_factor_credit_memory(
+                        valid_adj.detach(),
+                        raw_local_factor_advantage.detach(),
+                        graph_advantage.detach(),
+                        factor_training_mask.detach(),
+                    )
+                )
 
             valid_imp_weights = graph_imp_weights[
                 valid_graph_stats_mask
+            ]
+            valid_factor_imp_weights = factor_imp_weights[
+                factor_training_mask > 0.5
             ]
             valid_target_probs = torch.exp(target_factor_logp)[
                 valid_factor_stats_mask.squeeze(-1) > 0.5
@@ -713,7 +1168,31 @@ class R_SDDFG:
                     * transition_mask
                 ).sum() / transition_mask.sum().clamp_min(1.0)
 
+            if valid_factor_imp_weights.numel() == 0:
+                factor_imp_weight_mean = torch.tensor(
+                    1.0, device=self.device
+                )
+                factor_imp_weight_max = torch.tensor(
+                    1.0, device=self.device
+                )
+            else:
+                factor_imp_weight_mean = valid_factor_imp_weights.mean()
+                factor_imp_weight_max = valid_factor_imp_weights.max()
+
             current_adj_lr = self.adj_optimizer.param_groups[0]["lr"]
+
+            order3_credit_gate = 1.0
+            if hasattr(self.adj_network, "update_order3_credit_gate"):
+                order3_credit_gate = self.adj_network.update_order3_credit_gate(
+                    _to_float(raw_order3_factor_rl_loss),
+                    _to_float(raw_order2_factor_rl_loss),
+                )
+            order3_credit_loss_ema = float(
+                getattr(self.adj_network, "order3_credit_loss_ema", 0.0)
+            )
+            order3_credit_margin_ema = float(
+                getattr(self.adj_network, "order3_credit_margin_ema", 0.0)
+            )
 
         train_info = {}
         train_info['advantage'] = _to_float(f_advts.mean())
@@ -723,16 +1202,230 @@ class R_SDDFG:
             / transition_mask.sum().clamp_min(1.0)
         )
         train_info['clamp_ratio'] = _to_float(clip_fraction)
+        train_info['factor_clamp_ratio'] = _to_float(
+            factor_clip_fraction
+        )
+        train_info['trusted_clamp_ratio'] = _to_float(
+            trusted_clip_fraction
+        )
+        train_info['trusted_factor_clamp_ratio'] = _to_float(
+            trusted_factor_clip_fraction
+        )
+        train_info['adj_graph_trust_weight_mean'] = _to_float(
+            graph_trust_weight_mean
+        )
+        train_info['adj_factor_trust_weight_mean'] = _to_float(
+            factor_trust_weight_mean
+        )
+        train_info['adj_graph_stale_ratio'] = _to_float(graph_stale_ratio)
+        train_info['adj_factor_stale_ratio'] = _to_float(factor_stale_ratio)
+        train_info['use_adj_ppo_stale_trust'] = float(
+            self.use_adj_ppo_stale_trust
+        )
+        train_info['adj_ppo_stale_trust_clip'] = float(
+            self.adj_ppo_stale_trust_clip
+        )
+        train_info['adj_ppo_stale_trust_scale'] = float(
+            self.adj_ppo_stale_trust_scale
+        )
+        train_info['adj_ppo_stale_trust_min_weight'] = float(
+            self.adj_ppo_stale_trust_min_weight
+        )
         train_info['imp_weight_mean'] = _to_float(imp_weight_mean)
         train_info['imp_weight_max'] = _to_float(imp_weight_max)
         train_info['imp_weight_std'] = _to_float(imp_weight_std)
+        train_info['factor_imp_weight_mean'] = _to_float(
+            factor_imp_weight_mean
+        )
+        train_info['factor_imp_weight_max'] = _to_float(
+            factor_imp_weight_max
+        )
         train_info['target_factor_prob_mean'] = _to_float(target_prob_mean)
         train_info['behavior_factor_prob_mean'] = _to_float(behavior_prob_mean)
         train_info['positive_adv_fraction'] = _to_float(positive_adv_fraction)
         train_info['valid_transition_ratio'] = valid_transition_ratio
         train_info['valid_agent_ratio'] = valid_agent_ratio
         train_info['rl_loss'] = _to_float(rl_loss)
+        train_info['graph_rl_loss'] = _to_float(graph_rl_loss)
+        train_info['factor_rl_loss'] = _to_float(factor_rl_loss)
+        train_info['factor_advantage_abs_mean'] = _to_float(
+            (local_factor_advantage.abs() * factor_training_mask).sum()
+            / factor_training_mask.sum().clamp_min(1.0)
+        )
+        train_info['raw_factor_advantage_abs_mean'] = _to_float(
+            (raw_local_factor_advantage.abs() * factor_training_mask).sum()
+            / factor_training_mask.sum().clamp_min(1.0)
+        )
+        train_info['order3_factor_fraction'] = _to_float(
+            order3_factor_fraction
+        )
+        train_info['order2_factor_advantage_abs_mean'] = _to_float(
+            order2_factor_advantage_abs_mean
+        )
+        train_info['order3_factor_advantage_abs_mean'] = _to_float(
+            order3_factor_advantage_abs_mean
+        )
+        train_info['weighted_order3_factor_advantage_abs_mean'] = _to_float(
+            weighted_order3_factor_advantage_abs_mean
+        )
+        train_info['order2_factor_rl_loss'] = _to_float(
+            order2_factor_rl_loss
+        )
+        train_info['order3_factor_rl_loss'] = _to_float(
+            order3_factor_rl_loss
+        )
+        train_info['raw_order2_factor_rl_loss'] = _to_float(
+            raw_order2_factor_rl_loss
+        )
+        train_info['raw_order3_factor_rl_loss'] = _to_float(
+            raw_order3_factor_rl_loss
+        )
+        train_info['raw_o3_minus_o2_factor_rl_loss'] = _to_float(
+            raw_order3_factor_rl_loss - raw_order2_factor_rl_loss
+        )
+        train_info['order2_positive_adv_fraction'] = _to_float(
+            order2_positive_adv_fraction
+        )
+        train_info['order3_positive_adv_fraction'] = _to_float(
+            order3_positive_adv_fraction
+        )
+        train_info['order2_promoted_adv_fraction'] = _to_float(
+            order2_promoted_adv_fraction
+        )
+        train_info['order3_promoted_adv_fraction'] = _to_float(
+            order3_promoted_adv_fraction
+        )
+        train_info['order2_promotion_strength_mean'] = _to_float(
+            order2_promotion_strength_mean
+        )
+        train_info['order3_promotion_strength_mean'] = _to_float(
+            order3_promotion_strength_mean
+        )
+        train_info['order3_promoted_adv_weighted_fraction'] = _to_float(
+            order3_promoted_adv_weighted_fraction
+        )
+        train_info['adj_order_adv_coef'] = float(self.adj_order_adv_coef)
+        train_info['adj_order_adv_positive_only'] = float(
+            self.adj_order_adv_positive_only
+        )
+        train_info['adj_order_adv_negative_coef'] = float(
+            self.adj_order_adv_negative_coef
+        )
+        train_info['adj_order_adv_require_positive_graph_adv'] = float(
+            self.adj_order_adv_require_positive_graph_adv
+        )
+        train_info['adj_order_adv_graph_gate_soft'] = float(
+            self.adj_order_adv_graph_gate_mode == "soft"
+        )
+        train_info['adj_order_adv_graph_gate_scale'] = float(
+            self.adj_order_adv_graph_gate_scale
+        )
+        for credit_key, credit_value in advantage_triplet_credit_info.items():
+            train_info[credit_key] = float(credit_value)
+        train_info['use_adj_advantage_triplet_scorer'] = float(
+            bool(
+                getattr(
+                    self.adj_network,
+                    "use_advantage_triplet_scorer",
+                    False,
+                )
+            )
+        )
+        train_info['use_adj_triplet_credit_direct_rank'] = float(
+            bool(
+                getattr(
+                    self.adj_network,
+                    "use_triplet_credit_direct_rank",
+                    False,
+                )
+            )
+        )
+        train_info['adj_triplet_credit_rank_coef'] = float(
+            getattr(self.adj_network, "triplet_credit_rank_coef", 0.0)
+        )
+        train_info['adj_triplet_credit_min_multiplier'] = float(
+            getattr(self.adj_network, "triplet_credit_min_multiplier", 1.0)
+        )
+        train_info['adj_triplet_credit_max_multiplier'] = float(
+            getattr(self.adj_network, "triplet_credit_max_multiplier", 1.0)
+        )
+        train_info['adj_triplet_credit_negative_rank_scale'] = float(
+            getattr(
+                self.adj_network,
+                "triplet_credit_negative_rank_scale",
+                1.0,
+            )
+        )
+        train_info['adj_triplet_credit_min_positive_fraction'] = float(
+            getattr(
+                self.adj_network,
+                "triplet_credit_min_positive_fraction",
+                0.0,
+            )
+        )
+        train_info['adv_triplet_score_multiplier_mean'] = float(
+            getattr(
+                self.adj_network,
+                "last_adv_triplet_score_multiplier_mean",
+                1.0,
+            )
+        )
+        train_info['adv_triplet_score_multiplier_min'] = float(
+            getattr(
+                self.adj_network,
+                "last_adv_triplet_score_multiplier_min",
+                1.0,
+            )
+        )
+        train_info['adv_triplet_score_multiplier_max'] = float(
+            getattr(
+                self.adj_network,
+                "last_adv_triplet_score_multiplier_max",
+                1.0,
+            )
+        )
+        train_info['adv_triplet_score_marginal_mean'] = float(
+            getattr(
+                self.adj_network,
+                "last_adv_triplet_score_marginal_mean",
+                0.0,
+            )
+        )
+        train_info['adv_triplet_score_positive_fraction'] = float(
+            getattr(
+                self.adj_network,
+                "last_adv_triplet_score_positive_fraction",
+                0.0,
+            )
+        )
+        train_info['adv_triplet_negative_scaled_fraction'] = float(
+            getattr(
+                self.adj_network,
+                "last_adv_triplet_negative_scaled_fraction",
+                0.0,
+            )
+        )
+        train_info['adj_order3_credit_gate_current'] = float(
+            order3_credit_gate
+        )
+        train_info['adj_order3_credit_loss_ema'] = float(
+            order3_credit_loss_ema
+        )
+        train_info['adj_order3_credit_margin_ema'] = float(
+            order3_credit_margin_ema
+        )
+        train_info['adj_order3_relative_credit_gate'] = float(
+            bool(
+                getattr(
+                    self.adj_network,
+                    "use_relative_order3_credit_gate",
+                    False,
+                )
+            )
+        )
         train_info['entropy_loss'] = _to_float(entropy_loss)
+        train_info['adj_entropy_coef_initial'] = float(self.entropy_coef)
+        train_info['adj_entropy_coef'] = float(self.adj_entropy_coef)
         train_info['grad_norm'] = _to_float(grad_norm)
         train_info['adj_lr'] = float(current_adj_lr)
 

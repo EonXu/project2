@@ -2,6 +2,32 @@ import numpy as np
 import torch
 
 
+def _deterministic_cuda_enabled(tensor):
+    """Return whether SDDFG must avoid nondeterministic CUDA reductions.
+
+    Newer PyTorch releases expose the strict deterministic-algorithms API.
+    The project server uses an older release which only exposes the cuDNN
+    deterministic flag.  Training already sets that flag when
+    ``--cuda_deterministic`` is enabled, so use it as the compatibility signal
+    instead of silently falling back to atomic ``scatter_add_``.
+    """
+    if not tensor.is_cuda:
+        return False
+
+    if hasattr(torch, "are_deterministic_algorithms_enabled"):
+        try:
+            if bool(torch.are_deterministic_algorithms_enabled()):
+                return True
+        except (AttributeError, RuntimeError):
+            pass
+
+    cudnn_backend = getattr(getattr(torch, "backends", None), "cudnn", None)
+    return bool(
+        cudnn_backend is not None
+        and getattr(cudnn_backend, "deterministic", False)
+    )
+
+
 def _deterministic_scatter_add_dim0(src, index, dim_size, out=None):
     """Segment-sum fallback for strict deterministic CUDA execution.
 
@@ -71,13 +97,7 @@ def scatter_add(src, index, dim=0, out=None, dim_size=None):
     if dim_size is None:
         dim_size = int(index.max().item()) + 1
 
-    deterministic_cuda = False
-    if src.is_cuda and hasattr(
-            torch,
-            "are_deterministic_algorithms_enabled"):
-        deterministic_cuda = bool(
-            torch.are_deterministic_algorithms_enabled()
-        )
+    deterministic_cuda = _deterministic_cuda_enabled(src)
     if deterministic_cuda:
         if dim != 0:
             raise RuntimeError(
@@ -112,13 +132,7 @@ def _gather_last_dim(values, indices):
     deterministic backward implementation.  Keep native gather as the normal
     fast path.
     """
-    deterministic_cuda = False
-    if values.is_cuda and hasattr(
-            torch,
-            "are_deterministic_algorithms_enabled"):
-        deterministic_cuda = bool(
-            torch.are_deterministic_algorithms_enabled()
-        )
+    deterministic_cuda = _deterministic_cuda_enabled(values)
     if not deterministic_cuda:
         return values.gather(dim=-1, index=indices)
 

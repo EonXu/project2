@@ -306,7 +306,113 @@ def parse_args(args, parser):
                         default=True, help="Whether to use available actions")
     parser.add_argument('--highest_orders', type=int, default=3, help="number of agents")
 
-    all_args = parser.parse_known_args(args)[0]
+    def add_missing_option(option, *option_args, **option_kwargs):
+        if option not in parser._option_string_actions:
+            parser.add_argument(option, *option_args, **option_kwargs)
+
+    add_missing_option(
+        "--adj_recent_episode_window",
+        type=int,
+        default=0,
+        help="Train adjacency PPO only from the most recent N adj-buffer episodes.",
+    )
+    add_missing_option(
+        "--use_adj_dynamic_recent_window",
+        action="store_true",
+        default=False,
+        help="Adapt the adjacency PPO recent replay window using stale ratios.",
+    )
+    add_missing_option(
+        "--adj_recent_episode_window_min",
+        type=int,
+        default=1,
+        help="Minimum adaptive adjacency PPO recent replay window.",
+    )
+    add_missing_option(
+        "--adj_recent_window_stale_threshold",
+        type=float,
+        default=0.35,
+        help="Graph stale-ratio threshold for adaptive recent replay.",
+    )
+    add_missing_option(
+        "--adj_recent_window_factor_stale_threshold",
+        type=float,
+        default=0.30,
+        help="Factor stale-ratio threshold for adaptive recent replay.",
+    )
+    add_missing_option(
+        "--adj_recent_window_shrink_patience",
+        type=int,
+        default=1,
+        help="Consecutive high-stale updates before shrinking recent replay.",
+    )
+    add_missing_option(
+        "--adj_recent_window_recover_patience",
+        type=int,
+        default=2,
+        help="Consecutive low-stale updates before recovering recent replay.",
+    )
+    add_missing_option(
+        "--adj_recent_window_recover_stale_threshold",
+        type=float,
+        default=-1.0,
+        help="Graph stale threshold for recent-window recovery.",
+    )
+    add_missing_option(
+        "--adj_recent_window_recover_factor_stale_threshold",
+        type=float,
+        default=-1.0,
+        help="Factor stale threshold for recent-window recovery.",
+    )
+    add_missing_option(
+        "--adj_recent_window_severe_margin",
+        type=float,
+        default=0.15,
+        help="Extra stale margin that shrinks recent replay to the minimum.",
+    )
+    add_missing_option(
+        "--use_adj_triplet_credit_direct_rank",
+        action="store_true",
+        default=False,
+        help="Use marginal triplet credit as a direct ranking bias.",
+    )
+    add_missing_option(
+        "--adj_triplet_credit_rank_coef",
+        type=float,
+        default=0.0,
+        help="Direct ranking-bias strength for marginal triplet credit.",
+    )
+    add_missing_option(
+        "--adj_triplet_credit_min_multiplier",
+        type=float,
+        default=0.25,
+        help="Minimum direct triplet-credit ranking multiplier.",
+    )
+    add_missing_option(
+        "--adj_triplet_credit_max_multiplier",
+        type=float,
+        default=3.0,
+        help="Maximum direct triplet-credit ranking multiplier.",
+    )
+    add_missing_option(
+        "--adj_triplet_credit_negative_rank_scale",
+        type=float,
+        default=1.0,
+        help="Scale for negative marginal-credit direct ranking.",
+    )
+    add_missing_option(
+        "--adj_triplet_credit_min_positive_fraction",
+        type=float,
+        default=0.0,
+        help="Candidate positive-fraction floor before strong negative rank.",
+    )
+
+    all_args, unknown_args = parser.parse_known_args(args)
+    if unknown_args:
+        raise ValueError(
+            "Unknown command line arguments were ignored by the parser: "
+            + " ".join(unknown_args)
+        )
 
     if all_args.intra_episode_dynamic:
         try:

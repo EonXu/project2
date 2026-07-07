@@ -36,6 +36,17 @@ def get_config():
                         help="Max # of transitions that replay buffer can contain")
     parser.add_argument('--adj_buffer_size', type=int, default=32,
                         help="Max # of transitions that adj replay buffer can contain")
+    parser.add_argument(
+        "--adj_recent_episode_window",
+        type=int,
+        default=0,
+        help=(
+            "If positive, train the adjacency policy only from the most recent "
+            "N episodes in the adjacency replay buffer while still using the "
+            "full buffer for return baselines. This keeps graph PPO near "
+            "on-policy when topology distributions drift quickly."
+        ),
+    )
     parser.add_argument('--use_reward_normalization', action='store_true',
                         default=False, help="Whether to normalize rewards in replay buffer")
     parser.add_argument('--use_popart', action='store_true', default=False,
@@ -147,6 +158,396 @@ def get_config():
     parser.add_argument("--gat_negative_slope", type=float, default=0.2, help="LeakyReLU negative slope in GAT")
     parser.add_argument( "--gat_hyperedge_hidden",type=int,default=32,help="Hidden dimension of pair-to-hyperedge scorer for 3-order SDDFG")
     parser.add_argument(
+        "--adj_order3_bonus",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplicative prior for third-order SDDFG hyperedge scores. "
+            "Values above one counteract pair-score argmax collapse in "
+            "tasks where three-agent coordination is important."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_bonus_start",
+        type=float,
+        default=-1.0,
+        help=(
+            "Initial third-order hyperedge score multiplier. A negative "
+            "value keeps --adj_order3_bonus constant from the beginning."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_bonus_anneal_steps",
+        type=int,
+        default=0,
+        help=(
+            "Environment steps used to anneal adj_order3_bonus_start to "
+            "--adj_order3_bonus. Zero disables this annealing."
+        ),
+    )
+    parser.add_argument(
+        "--adj_sampling_temperature_start",
+        type=float,
+        default=1.0,
+        help=(
+            "Initial temperature for stochastic SDDFG graph sampling during "
+            "training rollouts. One preserves the raw constrained policy."
+        ),
+    )
+    parser.add_argument(
+        "--adj_sampling_temperature_final",
+        type=float,
+        default=1.0,
+        help=(
+            "Final temperature for stochastic SDDFG graph sampling. Values "
+            "below one anneal training graphs toward eval-time argmax graphs."
+        ),
+    )
+    parser.add_argument(
+        "--adj_sampling_temperature_anneal_steps",
+        type=int,
+        default=0,
+        help=(
+            "Environment steps used to anneal graph sampling temperature. "
+            "Zero keeps the initial temperature."
+        ),
+    )
+    parser.add_argument(
+        "--adj_min_order3_ratio_start",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial minimum fraction of SDDFG factor slots reserved for "
+            "third-order candidates. Zero disables the quota mechanism."
+        ),
+    )
+    parser.add_argument(
+        "--adj_min_order3_ratio_final",
+        type=float,
+        default=0.0,
+        help=(
+            "Final minimum fraction of factor slots reserved for third-order "
+            "candidates. The quota is applied only when at least three agents "
+            "are active and feasible triplets exist."
+        ),
+    )
+    parser.add_argument(
+        "--adj_min_order3_ratio_anneal_steps",
+        type=int,
+        default=0,
+        help=(
+            "Environment steps used to anneal the third-order reservation "
+            "ratio. Zero keeps the final value."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_quota_score_floor",
+        type=float,
+        default=0.0,
+        help=(
+            "Relative score floor for forced third-order quota choices. "
+            "The reference is the best currently eligible pair when one "
+            "exists, otherwise the best eligible candidate. This prevents "
+            "the order3 quota from preserving very weak triplets just to "
+            "meet a count target."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_quota_mode",
+        type=str,
+        default="hard",
+        help=(
+            "How the lower order3 quota is applied in SDDFG graph sampling. "
+            "'hard' keeps the legacy masking behavior. 'soft' converts the "
+            "quota deficit into a probability bonus for high-quality triplets "
+            "instead of forcing triplets when their reward-driven credit is "
+            "negative."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_soft_quota_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Strength of the soft order3 quota probability bonus. Used only "
+            "when --adj_order3_quota_mode=soft."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_feature_mode",
+        type=str,
+        default="pair",
+        help=(
+            "Triplet scorer feature set. 'pair' uses the three internal pair "
+            "scores. 'synergy' uses mean/min/max/std/balance features so the "
+            "hyperedge scorer can learn triplet quality beyond pair mean."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_balance_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Down-weight unbalanced triplets whose weakest internal pair is "
+            "much weaker than the triplet mean. This is a graph-quality prior, "
+            "not an environment reward signal."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_advantage_triplet_scorer",
+        action="store_true",
+        default=False,
+        help=(
+            "Use graph-conditioned raw factor credit to maintain an EMA "
+            "quality score for each pair/triplet candidate, and feed the "
+            "triplet-vs-pair marginal credit back into SDDFG triplet scores. "
+            "Disabled by default to preserve legacy graph behavior."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_ema_alpha",
+        type=float,
+        default=0.05,
+        help=(
+            "EMA rate for advantage-aware pair/triplet candidate quality "
+            "updates."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_score_coef",
+        type=float,
+        default=0.50,
+        help=(
+            "Strength of the advantage-aware marginal triplet credit "
+            "multiplier applied to third-order candidate scores."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_score_scale",
+        type=float,
+        default=0.05,
+        help=(
+            "Raw-credit scale used before tanh when converting triplet "
+            "marginal credit into a bounded score multiplier."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_triplet_credit_direct_rank",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the triplet-vs-pair marginal credit as a direct ranking bias "
+            "on third-order candidates instead of the weaker legacy EMA "
+            "multiplier. This is only active with "
+            "--use_adj_advantage_triplet_scorer."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_rank_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Direct ranking-bias strength for advantage-aware triplet "
+            "marginal credit. Values above zero make positive marginal "
+            "triplets compete directly against pairs and suppress negative "
+            "marginal triplets."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_min_multiplier",
+        type=float,
+        default=0.25,
+        help=(
+            "Lower bound for the direct triplet-credit ranking multiplier. "
+            "Only used when --use_adj_triplet_credit_direct_rank is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_max_multiplier",
+        type=float,
+        default=3.0,
+        help=(
+            "Upper bound for the direct triplet-credit ranking multiplier. "
+            "Only used when --use_adj_triplet_credit_direct_rank is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_negative_rank_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale applied only to negative marginal-credit direct-rank logits. "
+            "Values below 1.0 keep direct rank from eliminating triplet "
+            "coverage based on short-horizon negative credit."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_credit_min_positive_fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "If positive, negative direct-rank suppression is further damped "
+            "when the current triplet candidate catalog has fewer than this "
+            "fraction of positive marginal-credit candidates."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_negative_graph_penalty",
+        type=float,
+        default=0.50,
+        help=(
+            "Penalty applied to locally positive factors selected inside "
+            "negative-advantage graphs when updating advantage-aware triplet "
+            "quality. This prevents low-return topologies from promoting "
+            "their locally best but globally bad triplets."
+        ),
+    )
+    parser.add_argument(
+        "--adj_min_pair_ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum fraction of selected SDDFG factor slots reserved for "
+            "pair factors. This is a complementary guard for Wolfpack: pair "
+            "pursuit edges should not be squeezed out by triplet quotas."
+        ),
+    )
+    parser.add_argument(
+        "--adj_max_order3_ratio_start",
+        type=float,
+        default=1.0,
+        help=(
+            "Initial maximum fraction of selected SDDFG factor slots allowed "
+            "to be third-order. One disables the upper band constraint."
+        ),
+    )
+    parser.add_argument(
+        "--adj_max_order3_ratio_final",
+        type=float,
+        default=1.0,
+        help=(
+            "Final maximum fraction of selected factor slots allowed to be "
+            "third-order. Use this with the min ratio to keep graphs in a "
+            "healthy pair/triplet band instead of all-triplet collapse."
+        ),
+    )
+    parser.add_argument(
+        "--adj_max_order3_ratio_anneal_steps",
+        type=int,
+        default=0,
+        help=(
+            "Environment steps used to anneal the third-order upper-band "
+            "ratio. Zero keeps the final value."
+        ),
+    )
+    parser.add_argument(
+        "--adj_greedy_sample_prob_start",
+        type=float,
+        default=0.0,
+        help=(
+            "Initial probability of taking the constrained argmax graph "
+            "decision during training rollouts. Zero preserves categorical "
+            "sampling."
+        ),
+    )
+    parser.add_argument(
+        "--adj_greedy_sample_prob_final",
+        type=float,
+        default=0.0,
+        help=(
+            "Final probability of using argmax graph decisions during "
+            "training rollouts. Annealing this upward reduces stochastic "
+            "rollout versus argmax-eval graph mismatch."
+        ),
+    )
+    parser.add_argument(
+        "--adj_greedy_sample_prob_anneal_steps",
+        type=int,
+        default=0,
+        help=(
+            "Environment steps used to anneal the argmax graph-decision "
+            "mixture probability. Zero keeps the final value."
+        ),
+    )
+    parser.add_argument(
+        "--adj_greedy_sample_prob_cap",
+        type=float,
+        default=1.0,
+        help=(
+            "Upper bound for the effective greedy graph-decision mixture. "
+            "This prevents late training from locking into low-return graph "
+            "topologies even when train/eval order gaps are already small."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_order3_credit_gate",
+        action="store_true",
+        default=False,
+        help=(
+            "Adaptively relax order3 quota and greedy graph hardening when "
+            "recent third-order factor PPO credit is negative. Disabled by "
+            "default to preserve legacy SDDFG behavior."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_credit_gate_loss_scale",
+        type=float,
+        default=0.005,
+        help=(
+            "Positive order3_factor_rl_loss value that maps to a full "
+            "credit-gate intervention. Larger values make the gate less "
+            "sensitive."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_credit_gate_min_scale",
+        type=float,
+        default=0.55,
+        help=(
+            "Smallest multiplier applied to order3 quota and greedy graph "
+            "sampling when the credit gate is fully active."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_credit_gate_ema_alpha",
+        type=float,
+        default=0.1,
+        help=(
+            "EMA rate for the positive order3_factor_rl_loss signal used by "
+            "the adaptive order3 credit gate."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_credit_gate_max_delta",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum per-update change of the order3 credit gate. Values "
+            "below one make graph hardening react smoothly to noisy relative "
+            "credit estimates."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_order3_relative_credit_gate",
+        action="store_true",
+        default=False,
+        help=(
+            "Drive the order3 credit gate from the excess triplet loss over "
+            "pair loss instead of the absolute triplet loss. This avoids "
+            "suppressing useful triplets merely because all factor-local "
+            "advantages are temporarily noisy."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order3_credit_gate_margin",
+        type=float,
+        default=0.0,
+        help=(
+            "Margin subtracted from order3_factor_rl_loss - "
+            "order2_factor_rl_loss before the relative credit gate reacts."
+        ),
+    )
+    parser.add_argument(
         "--adj_return_adv_coef",
         type=float,
         default=1.0,
@@ -165,6 +566,71 @@ def get_config():
         ),
     )
     parser.add_argument(
+        "--adj_order_adv_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Order-aware multiplier for SDDFG factor-local adjacency credit. "
+            "Triplet factors receive 1 + coef relative weight while pair "
+            "factors keep weight 1.0. Zero preserves the legacy loss."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order_adv_positive_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply the full order-aware multiplier only to positive "
+            "factor-local advantages. Negative triplet residuals use "
+            "--adj_order_adv_negative_coef instead. This lets SDDFG promote "
+            "reward-positive triplets without making the credit gate react "
+            "mostly to artificially amplified negative triplet noise."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order_adv_negative_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Order-aware multiplier coefficient for negative factor-local "
+            "advantages when --adj_order_adv_positive_only is enabled. Zero "
+            "keeps negative triplet suppression at the pair scale."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order_adv_require_positive_graph_adv",
+        action="store_true",
+        default=False,
+        help=(
+            "When positive-only order credit is enabled, promote a triplet "
+            "only if its local residual is positive and the whole sampled "
+            "graph has positive advantage. This prevents locally good "
+            "triplets inside low-return graphs from being reinforced."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order_adv_graph_gate_mode",
+        type=str,
+        default="binary",
+        help=(
+            "Graph-advantage gate used with "
+            "--adj_order_adv_require_positive_graph_adv. 'binary' uses a "
+            "hard graph_advantage > 0 filter. 'soft' uses a continuous "
+            "positive-graph-advantage weight, which reduces noisy promotion "
+            "jumps without reinforcing triplets from negative-return graphs."
+        ),
+    )
+    parser.add_argument(
+        "--adj_order_adv_graph_gate_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale multiplier for the soft graph-advantage promotion gate. "
+            "The denominator is the batch mean absolute graph advantage times "
+            "this value."
+        ),
+    )
+    parser.add_argument(
         "--adj_exploration_mix",
         type=float,
         default=0.0,
@@ -172,6 +638,184 @@ def get_config():
             "Fixed uniform-mixture probability for constrained SDDFG graph "
             "sampling. Zero keeps behavior and PPO target distributions "
             "identical while categorical sampling still explores."
+        ),
+    )
+    parser.add_argument(
+        "--adj_train_epochs",
+        type=int,
+        default=10,
+        help=(
+            "Number of full adjacency-buffer PPO epochs per graph update. "
+            "Use a smaller value when train_adj_episode is small and replay "
+            "windows overlap heavily."
+        ),
+    )
+    parser.add_argument(
+        "--adj_ppo_clip_stop_ratio",
+        type=float,
+        default=0.35,
+        help=(
+            "If positive, stop the current adjacency PPO update early once "
+            "the mean clamp_ratio exceeds this value after at least one full "
+            "epoch. This prevents graph-policy drift when behavior and target "
+            "topologies diverge. The default is enabled because SDDFG's "
+            "overlapping adjacency replay windows otherwise silently produced "
+            "run35/run36 clamp ratios above 0.7."
+        ),
+    )
+    parser.add_argument(
+        "--adj_ppo_factor_clip_stop_ratio",
+        type=float,
+        default=0.35,
+        help=(
+            "If positive, stop the current adjacency PPO update early once "
+            "the mean factor_clamp_ratio exceeds this value. This catches "
+            "factor-local credit drift that can remain high even when the "
+            "graph-level ratio looks acceptable. The default mirrors "
+            "adj_ppo_clip_stop_ratio so direct train_wolfpack.py invocations "
+            "do not disable the guard by omission."
+        ),
+    )
+    parser.add_argument(
+        "--adj_ppo_min_epochs",
+        type=int,
+        default=1,
+        help=(
+            "Minimum adjacency PPO epochs before high-clamp early stopping "
+            "can trigger."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_dynamic_recent_window",
+        action="store_true",
+        default=False,
+        help=(
+            "Adapt the adjacency PPO recent replay window downward when the "
+            "previous update still has high graph/factor stale ratios. This "
+            "keeps graph PPO closer to on-policy than a fixed recent window."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_episode_window_min",
+        type=int,
+        default=1,
+        help=(
+            "Minimum recent episode window used by dynamic adjacency replay. "
+            "Ignored unless --use_adj_dynamic_recent_window is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_stale_threshold",
+        type=float,
+        default=0.35,
+        help=(
+            "Graph stale-ratio threshold that shrinks the adaptive recent "
+            "episode window on the next adjacency PPO update."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_factor_stale_threshold",
+        type=float,
+        default=0.30,
+        help=(
+            "Factor stale-ratio threshold that shrinks the adaptive recent "
+            "episode window on the next adjacency PPO update."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_shrink_patience",
+        type=int,
+        default=1,
+        help=(
+            "Number of consecutive high-stale adjacency PPO updates required "
+            "before shrinking the adaptive recent episode window."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_recover_patience",
+        type=int,
+        default=2,
+        help=(
+            "Number of consecutive low-stale adjacency PPO updates required "
+            "before recovering the adaptive recent episode window toward the "
+            "configured value."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_recover_stale_threshold",
+        type=float,
+        default=-1.0,
+        help=(
+            "Graph stale-ratio threshold used to recover the adaptive recent "
+            "episode window. Negative values use 80 percent of the shrink "
+            "threshold."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_recover_factor_stale_threshold",
+        type=float,
+        default=-1.0,
+        help=(
+            "Factor stale-ratio threshold used to recover the adaptive recent "
+            "episode window. Negative values use 80 percent of the factor "
+            "shrink threshold."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_severe_margin",
+        type=float,
+        default=0.15,
+        help=(
+            "Extra stale-ratio margin above the shrink threshold that sends "
+            "the adaptive recent episode window directly to its minimum."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_ppo_stale_trust",
+        action="store_true",
+        help=(
+            "Down-weight adjacency PPO graph/factor samples whose behavior "
+            "and target probabilities are already far outside the trust region "
+            "on the first epoch. This addresses stale topology replay that "
+            "high-clamp early stopping alone cannot fix."
+        ),
+    )
+    parser.add_argument(
+        "--adj_ppo_stale_trust_clip",
+        type=float,
+        default=0.2,
+        help=(
+            "Absolute importance-ratio deviation from 1.0 that starts stale "
+            "sample down-weighting when use_adj_ppo_stale_trust is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--adj_ppo_stale_trust_scale",
+        type=float,
+        default=0.25,
+        help=(
+            "Exponential decay scale for stale adjacency PPO sample weights "
+            "after adj_ppo_stale_trust_clip is exceeded."
+        ),
+    )
+    parser.add_argument(
+        "--adj_ppo_stale_trust_min_weight",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum graph/factor trust weight for stale adjacency PPO samples. "
+            "Keeps learning from rare positive outcomes while preventing "
+            "out-of-distribution topology replay from dominating the loss."
+        ),
+    )
+    parser.add_argument(
+        "--require_connected_adj",
+        action="store_true",
+        default=False,
+        help=(
+            "Require every sampled SDDFG factor graph to be connected over "
+            "the currently active agents. Coverage alone permits isolated "
+            "coordination components."
         ),
     )
     parser.add_argument("--min_adj_begin_step", type=int, default=5000,
@@ -205,8 +849,44 @@ def get_config():
                         help="entropy term coefficient (default: 0.2)")
     parser.add_argument("--use_linear_lr_decay", action='store_true',
                         default=False, help='use a linear schedule on the learning rate')
+    parser.add_argument(
+        "--policy_lr_anneal_steps",
+        type=int,
+        default=0,
+        help=(
+            "Explicit environment-step horizon for policy/critic LR decay. "
+            "Zero preserves the legacy behavior of using num_env_steps."
+        ),
+    )
     parser.add_argument("--entropy_coef", type=float, default=0.001,
-                        help='entropy term coefficient (default: 0.01)')
+                        help='entropy term coefficient (default: 0.001)')
+    parser.add_argument(
+        "--adj_entropy_coef",
+        type=float,
+        default=-1.0,
+        help=(
+            "Initial SDDFG graph entropy coefficient. A negative value "
+            "falls back to --entropy_coef for backward compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--adj_entropy_coef_final",
+        type=float,
+        default=-1.0,
+        help=(
+            "Final SDDFG graph entropy coefficient. A negative value keeps "
+            "the legacy constant --entropy_coef behavior."
+        ),
+    )
+    parser.add_argument(
+        "--adj_entropy_anneal_steps",
+        type=int,
+        default=0,
+        help=(
+            "Environment steps over which the SDDFG graph entropy "
+            "coefficient is annealed. Zero disables annealing."
+        ),
+    )
     parser.add_argument("--use_valuenorm", action='store_true', default=False, help="by default True, use running mean and std to normalize rewards.")
     parser.add_argument("--use_vfunction", action='store_true', default=False)
     parser.add_argument("--use_epsilon_greedy", action='store_true', default=False)
@@ -268,6 +948,16 @@ def get_config():
     parser.add_argument("--use_adj_linear_lr_decay",action="store_true",default=False,help="Whether to apply linear lr decay to adj/GAT optimizer. "
              "If False, adj lr will keep a floor value or stay constant.")
     parser.add_argument( "--adj_lr_decay_floor",type=float,default=2e-5, help="Minimum lr for adj/GAT optimizer when linear lr decay is used.")
+    parser.add_argument(
+        "--adj_lr_anneal_steps",
+        type=int,
+        default=500000,
+        help=(
+            "Environment steps used to anneal only the adj/GAT learning "
+            "rate. Set the same value across budgets for prefix comparisons, "
+            "or set it to the run budget for full-run annealing."
+        ),
+    )
     parser.add_argument( "--policy_lr_decay_floor", type=float, default=1e-5, help="Minimum lr for policy optimizer when linear lr decay is used.")
     parser.add_argument( "--critic_lr_decay_floor",type=float,default=1e-5,help="Minimum lr for critic optimizers when linear lr decay is used.")
 

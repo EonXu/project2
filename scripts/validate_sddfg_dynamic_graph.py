@@ -59,7 +59,7 @@ def validate_adj_buffer():
             use_avail_acts=False,
             gamma=0.97,
             adj_return_adv_coef=1.0,
-            adj_factor_adv_coef=0.0,
+            adj_factor_adv_coef=0.25,
             seed=11,
         )
         buffer.filled_i = num_episodes
@@ -93,6 +93,14 @@ def validate_adj_buffer():
                         factor_slot,
                     ] = 1
                     factor_slot += 1
+                # Exercise factor-local credit even when the single-episode
+                # return control variate is zero.
+                buffer.f_q[
+                    step,
+                    episode_idx,
+                    :factor_slot,
+                    0,
+                ] = np.arange(factor_slot, dtype=np.float32)
             buffer.dones_env[-1, episode_idx, 0] = 1.0
 
         buffer.compute_advantage(np.arange(num_episodes))
@@ -104,8 +112,19 @@ def validate_adj_buffer():
             1,
         )
         assert np.isfinite(computed).all()
-        if num_episodes > 1:
-            assert np.abs(computed).sum() > 0.0
+        assert np.abs(computed).sum() > 0.0
+        recent_samples = list(
+            buffer.sample_inds(
+                data_chunk_length=4,
+                num_mini_batch=1,
+                recent_episode_window=2,
+            )
+        )
+        assert len(recent_samples) == 1
+        expected_recent = min(num_episodes, 2)
+        assert buffer.last_sample_episode_count == expected_recent
+        assert buffer.last_sample_episode_indices.size == expected_recent
+        assert recent_samples[0][0].shape[0] >= 1
 
 
 def validate_scatter_gradient():
@@ -123,19 +142,26 @@ def validate_scatter_gradient():
 
 
 def validate_deterministic_cuda_scatter():
-    """Exercise the non-atomic fallback used by strict CUDA training."""
-    if (
-        not torch.cuda.is_available()
-        or not hasattr(torch, "use_deterministic_algorithms")
-        or not hasattr(torch, "are_deterministic_algorithms_enabled")
-    ):
+    """Exercise the non-atomic fallback used by deterministic CUDA training."""
+    if not torch.cuda.is_available():
         return False
 
-    was_enabled = bool(
-        torch.are_deterministic_algorithms_enabled()
+    has_strict_api = (
+        hasattr(torch, "use_deterministic_algorithms")
+        and hasattr(torch, "are_deterministic_algorithms_enabled")
     )
+    was_enabled = (
+        bool(torch.are_deterministic_algorithms_enabled())
+        if has_strict_api else False
+    )
+    was_cudnn_deterministic = bool(torch.backends.cudnn.deterministic)
     try:
-        torch.use_deterministic_algorithms(True)
+        # Old server PyTorch has no strict API.  rSDDFGPolicy deliberately
+        # treats this cuDNN flag as the compatibility signal for its
+        # deterministic scatter/gather implementations.
+        torch.backends.cudnn.deterministic = True
+        if has_strict_api:
+            torch.use_deterministic_algorithms(True)
         src = torch.randn(11, 5, device="cuda", requires_grad=True)
         index = torch.tensor(
             [0, 2, 1, 2, 0, 3, 1, 3, 2, 0, 3],
@@ -157,7 +183,9 @@ def validate_deterministic_cuda_scatter():
         assert src.grad is not None
         assert bool(torch.isfinite(src.grad).all().item())
     finally:
-        torch.use_deterministic_algorithms(was_enabled)
+        if has_strict_api:
+            torch.use_deterministic_algorithms(was_enabled)
+        torch.backends.cudnn.deterministic = was_cudnn_deterministic
     return True
 
 
@@ -226,8 +254,13 @@ def validate_trainer_without_critics():
         use_dyn_graph=True,
         num_factor=6,
         entropy_coef=0.01,
+        adj_entropy_coef=0.002,
         use_valuenorm=False,
         adj_max_grad_norm=0.5,
+        adj_lr_anneal_steps=200000,
+        adj_lr_decay_floor=2e-5,
+        adj_entropy_coef_final=0.0,
+        adj_entropy_anneal_steps=200000,
     )
     trainer = R_SDDFG(
         args=args,
@@ -240,6 +273,16 @@ def validate_trainer_without_critics():
     )
     assert trainer.critic_fv_optimizer is None
     assert trainer.critic_vtot_optimizer is None
+    initial_adj_lr = trainer.adj_optimizer.param_groups[0]["lr"]
+    midpoint_adj_lr = trainer.adj_lr_decay(100000)
+    midpoint_entropy_coef = trainer.adj_entropy_coef
+    final_adj_lr = trainer.adj_lr_decay(200000)
+    final_entropy_coef = trainer.adj_entropy_coef
+    assert abs(initial_adj_lr - 3e-4) < 1e-12
+    assert abs(midpoint_adj_lr - 1.5e-4) < 1e-12
+    assert abs(final_adj_lr - 2e-5) < 1e-12
+    assert abs(midpoint_entropy_coef - 0.001) < 1e-12
+    assert abs(final_entropy_coef) < 1e-12
 
 
 def validate_full_policy_gradient(device=None):
@@ -375,21 +418,27 @@ def validate_full_policy_gradient(device=None):
 
 
 def validate_deterministic_cuda_full_policy_gradient():
-    if (
-        not torch.cuda.is_available()
-        or not hasattr(torch, "use_deterministic_algorithms")
-        or not hasattr(torch, "are_deterministic_algorithms_enabled")
-    ):
+    if not torch.cuda.is_available():
         return False
 
-    was_enabled = bool(
-        torch.are_deterministic_algorithms_enabled()
+    has_strict_api = (
+        hasattr(torch, "use_deterministic_algorithms")
+        and hasattr(torch, "are_deterministic_algorithms_enabled")
     )
+    was_enabled = (
+        bool(torch.are_deterministic_algorithms_enabled())
+        if has_strict_api else False
+    )
+    was_cudnn_deterministic = bool(torch.backends.cudnn.deterministic)
     try:
-        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        if has_strict_api:
+            torch.use_deterministic_algorithms(True)
         validate_full_policy_gradient(torch.device("cuda"))
     finally:
-        torch.use_deterministic_algorithms(was_enabled)
+        if has_strict_api:
+            torch.use_deterministic_algorithms(was_enabled)
+        torch.backends.cudnn.deterministic = was_cudnn_deterministic
     return True
 
 
@@ -407,10 +456,72 @@ def main():
         gat_heads=4,
         gat_negative_slope=0.2,
         gat_hyperedge_hidden=64,
+        adj_order3_bonus=1.35,
+        adj_order3_bonus_start=1.0,
+        adj_order3_bonus_anneal_steps=100,
+        adj_sampling_temperature_start=1.0,
+        adj_sampling_temperature_final=0.35,
+        adj_sampling_temperature_anneal_steps=100,
+        adj_min_order3_ratio_start=0.5,
+        adj_min_order3_ratio_final=0.72,
+        adj_min_order3_ratio_anneal_steps=100,
+        adj_max_order3_ratio_start=0.82,
+        adj_max_order3_ratio_final=0.82,
+        adj_max_order3_ratio_anneal_steps=0,
+        adj_greedy_sample_prob_start=0.0,
+        adj_greedy_sample_prob_final=0.75,
+        adj_greedy_sample_prob_anneal_steps=100,
+        adj_greedy_sample_prob_cap=0.50,
+        adj_order3_quota_mode="soft",
+        adj_order3_soft_quota_coef=2.5,
+        adj_triplet_feature_mode="synergy",
+        adj_triplet_balance_coef=0.75,
+        use_adj_advantage_triplet_scorer=True,
+        adj_triplet_credit_ema_alpha=0.05,
+        adj_triplet_credit_score_coef=0.50,
+        adj_triplet_credit_score_scale=0.05,
+        use_adj_triplet_credit_direct_rank=True,
+        adj_triplet_credit_rank_coef=1.25,
+        adj_triplet_credit_min_multiplier=0.70,
+        adj_triplet_credit_max_multiplier=2.50,
+        adj_triplet_credit_negative_rank_scale=0.25,
+        adj_triplet_credit_min_positive_fraction=0.45,
+        adj_triplet_negative_graph_penalty=0.50,
+        adj_order3_quota_score_floor=0.45,
+        adj_min_pair_ratio=0.20,
+        adj_order_adv_coef=0.75,
+        adj_order_adv_positive_only=True,
+        adj_order_adv_negative_coef=0.20,
+        adj_order_adv_require_positive_graph_adv=True,
+        use_adj_order3_credit_gate=True,
+        use_adj_order3_relative_credit_gate=True,
+        adj_order3_credit_gate_loss_scale=0.004,
+        adj_order3_credit_gate_margin=0.0,
+        adj_order3_credit_gate_min_scale=0.70,
+        adj_order3_credit_gate_ema_alpha=0.10,
+        adj_order3_credit_gate_max_delta=0.05,
+        adj_ppo_clip_stop_ratio=0.35,
+        adj_ppo_factor_clip_stop_ratio=0.35,
+        adj_ppo_min_epochs=1,
+        use_adj_ppo_stale_trust=True,
+        adj_ppo_stale_trust_clip=0.20,
+        adj_ppo_stale_trust_scale=0.25,
+        adj_ppo_stale_trust_min_weight=0.25,
+        adj_recent_episode_window=4,
+        use_adj_dynamic_recent_window=True,
+        adj_recent_episode_window_min=3,
+        adj_recent_window_stale_threshold=0.35,
+        adj_recent_window_factor_stale_threshold=0.30,
+        adj_recent_window_shrink_patience=3,
+        adj_recent_window_recover_patience=2,
+        adj_recent_window_recover_stale_threshold=0.28,
+        adj_recent_window_recover_factor_stale_threshold=0.24,
+        adj_recent_window_severe_margin=0.20,
         adj_hidden_dim=64,
         epsilon_start=1.0,
         epsilon_finish=0.05,
         adj_anneal_time=500000,
+        require_connected_adj=True,
     )
     device = torch.device("cpu")
     graph = Adj_Generator(
@@ -447,6 +558,15 @@ def main():
         explore=True,
         t_env=500000,
     )
+    assert abs(graph.current_order3_bonus - 1.35) < 1e-12
+    assert abs(graph.current_sampling_temperature - 0.35) < 1e-12
+    assert abs(graph.current_min_order3_ratio - 0.72) < 1e-12
+    assert abs(graph.current_max_order3_ratio - 0.82) < 1e-12
+    assert abs(
+        graph.current_greedy_sample_prob
+        - args.adj_greedy_sample_prob_cap
+    ) < 1e-12
+    assert abs(graph.current_order3_credit_gate - 1.0) < 1e-12
     target_prob, target_entropy = graph.evaluate_prob(
         obs=None,
         rnn_obs=rnn_obs,
@@ -477,6 +597,26 @@ def main():
         degree = selected.long().sum(dim=1)
         assert bool((degree[active] > 0).all().item())
 
+        # Coverage alone is insufficient for global message passing. Verify
+        # that all active nodes belong to one factor-graph component.
+        co_membership = (
+            selected.float()
+            @ selected.float().transpose(0, 1)
+        ) > 0.0
+        reachability = co_membership.clone()
+        reachability = reachability | torch.eye(
+            args.max_player_num,
+            dtype=torch.bool,
+        )
+        for _ in range(args.max_player_num):
+            reachability = reachability | (
+                reachability.float() @ reachability.float() > 0.0
+            )
+        active_idx = torch.where(active)[0]
+        assert bool(
+            reachability[active_idx][:, active_idx].all().item()
+        )
+
         orders = selected.long().sum(dim=0)
         valid_orders = orders[orders > 0]
         assert bool(
@@ -486,7 +626,83 @@ def main():
             order_counts[order] += int(
                 (valid_orders == order).long().sum().item()
             )
+        if active_count >= 3:
+            expected_triplets = int(
+                np.ceil(
+                    graph.current_min_order3_ratio
+                    * float(valid_orders.numel())
+                    - 1e-8
+                )
+            )
+            # The lower band cannot require more triplets than exist for the
+            # active roster (e.g. only one unique triplet exists for 3 agents).
+            max_feasible_triplets = 0
+            if active_count >= 3:
+                max_feasible_triplets = int(
+                    active_count
+                    * (active_count - 1)
+                    * (active_count - 2)
+                    // 6
+                )
+            expected_triplets = min(
+                expected_triplets,
+                max_feasible_triplets,
+            )
+            max_triplets = int(
+                np.floor(
+                    graph.current_max_order3_ratio
+                    * float(valid_orders.numel())
+                    + 1e-8
+                )
+            )
+            max_triplets = max(expected_triplets, max_triplets)
+            actual_triplets = int(
+                (valid_orders == 3).long().sum().item()
+            )
+            if graph.order3_quota_mode == "hard":
+                assert actual_triplets >= expected_triplets
+            assert actual_triplets <= max_triplets
         assert bool((target_prob[batch_idx][selected] > 0.0).all().item())
+
+    factor_mask_for_credit = (
+        adj.float().sum(dim=1) > 1.5
+    ).float()
+    synthetic_local_credit = torch.linspace(
+        -0.2,
+        0.2,
+        steps=batch_size * args.num_factor,
+        device=device,
+    ).reshape(batch_size, args.num_factor)
+    synthetic_graph_credit = torch.ones(
+        batch_size,
+        1,
+        device=device,
+    )
+    credit_info = graph.update_factor_credit_memory(
+        adj.float(),
+        synthetic_local_credit,
+        synthetic_graph_credit,
+        factor_mask_for_credit,
+    )
+    assert credit_info["adv_triplet_credit_triplet_updates"] > 0
+    assert credit_info["adv_triplet_credit_seen_ratio"] > 0.0
+    assert "adv_triplet_marginal_positive_fraction" in credit_info
+    graph.sample(
+        obs=None,
+        rnn_obs=rnn_obs,
+        use_adj_init=True,
+        dones=dones,
+        explore=True,
+        t_env=500000,
+    )
+    assert np.isfinite(graph.last_adv_triplet_score_multiplier_mean)
+    assert graph.last_adv_triplet_score_multiplier_mean > 0.0
+    assert np.isfinite(graph.last_adv_triplet_score_multiplier_min)
+    assert np.isfinite(graph.last_adv_triplet_score_multiplier_max)
+    assert graph.last_adv_triplet_score_multiplier_min > 0.0
+    assert graph.last_adv_triplet_score_multiplier_max > 0.0
+    assert np.isfinite(graph.last_adv_triplet_score_positive_fraction)
+    assert np.isfinite(graph.last_adv_triplet_negative_scaled_fraction)
 
     selected_float = adj.float()
     loss = -(
@@ -501,6 +717,21 @@ def main():
         assert bool(torch.isfinite(parameter.grad).all().item())
         finite_grad_count += 1
     assert finite_grad_count > 0
+    gate_after_bad_credit = graph.update_order3_credit_gate(
+        0.004,
+        0.0,
+    )
+    assert gate_after_bad_credit < 1.0
+    graph.sample(
+        obs=None,
+        rnn_obs=rnn_obs,
+        use_adj_init=True,
+        dones=dones,
+        explore=True,
+        t_env=500000,
+    )
+    assert graph.current_min_order3_ratio < 0.72
+    assert graph.current_greedy_sample_prob < 0.75
 
     validate_adj_buffer()
     validate_scatter_gradient()
@@ -516,6 +747,227 @@ def main():
     print("active_counts={}".format(active_counts))
     print("order2_factors={}".format(order_counts[2]))
     print("order3_factors={}".format(order_counts[3]))
+    print(
+        "current_min_order3_ratio={}".format(
+            graph.current_min_order3_ratio
+        )
+    )
+    print(
+        "current_max_order3_ratio={}".format(
+            graph.current_max_order3_ratio
+        )
+    )
+    print(
+        "current_greedy_sample_prob={}".format(
+            graph.current_greedy_sample_prob
+        )
+    )
+    print(
+        "greedy_sample_prob_cap={}".format(
+            graph.greedy_sample_prob_cap
+        )
+    )
+    print("order3_quota_mode={}".format(graph.order3_quota_mode))
+    print(
+        "order3_soft_quota_coef={}".format(
+            graph.order3_soft_quota_coef
+        )
+    )
+    print(
+        "triplet_balance_coef={}".format(
+            graph.triplet_balance_coef
+        )
+    )
+    print("triplet_feature_mode={}".format(graph.triplet_feature_mode))
+    print(
+        "use_advantage_triplet_scorer={}".format(
+            graph.use_advantage_triplet_scorer
+        )
+    )
+    print(
+        "triplet_credit_score_coef={}".format(
+            graph.triplet_credit_score_coef
+        )
+    )
+    print(
+        "triplet_credit_score_scale={}".format(
+            graph.triplet_credit_score_scale
+        )
+    )
+    print(
+        "use_triplet_credit_direct_rank={}".format(
+            graph.use_triplet_credit_direct_rank
+        )
+    )
+    print(
+        "triplet_credit_rank_coef={}".format(
+            graph.triplet_credit_rank_coef
+        )
+    )
+    print(
+        "triplet_credit_multiplier_bounds=[{},{}]".format(
+            graph.triplet_credit_min_multiplier,
+            graph.triplet_credit_max_multiplier,
+        )
+    )
+    print(
+        "triplet_credit_negative_rank_scale={}".format(
+            graph.triplet_credit_negative_rank_scale
+        )
+    )
+    print(
+        "triplet_credit_min_positive_fraction={}".format(
+            graph.triplet_credit_min_positive_fraction
+        )
+    )
+    print(
+        "adv_triplet_credit_seen_ratio={}".format(
+            credit_info["adv_triplet_credit_seen_ratio"]
+        )
+    )
+    print(
+        "adv_triplet_marginal_positive_fraction={}".format(
+            credit_info["adv_triplet_marginal_positive_fraction"]
+        )
+    )
+    print(
+        "adv_triplet_score_multiplier_mean={}".format(
+            graph.last_adv_triplet_score_multiplier_mean
+        )
+    )
+    print(
+        "adv_triplet_score_multiplier_min={}".format(
+            graph.last_adv_triplet_score_multiplier_min
+        )
+    )
+    print(
+        "adv_triplet_score_multiplier_max={}".format(
+            graph.last_adv_triplet_score_multiplier_max
+        )
+    )
+    print(
+        "adv_triplet_score_positive_fraction={}".format(
+            graph.last_adv_triplet_score_positive_fraction
+        )
+    )
+    print(
+        "adv_triplet_negative_scaled_fraction={}".format(
+            graph.last_adv_triplet_negative_scaled_fraction
+        )
+    )
+    print(
+        "adj_order_adv_positive_only={}".format(
+            args.adj_order_adv_positive_only
+        )
+    )
+    print(
+        "adj_order_adv_negative_coef={}".format(
+            args.adj_order_adv_negative_coef
+        )
+    )
+    print(
+        "adj_order_adv_require_positive_graph_adv={}".format(
+            args.adj_order_adv_require_positive_graph_adv
+        )
+    )
+    print(
+        "current_order3_credit_gate={}".format(
+            graph.current_order3_credit_gate
+        )
+    )
+    print(
+        "order3_credit_loss_ema={}".format(
+            graph.order3_credit_loss_ema
+        )
+    )
+    print(
+        "order3_credit_margin_ema={}".format(
+            graph.order3_credit_margin_ema
+        )
+    )
+    print(
+        "relative_order3_credit_gate={}".format(
+            graph.use_relative_order3_credit_gate
+        )
+    )
+    print(
+        "order3_credit_gate_max_delta={}".format(
+            graph.order3_credit_gate_max_delta
+        )
+    )
+    print("adj_ppo_clip_stop_ratio={}".format(args.adj_ppo_clip_stop_ratio))
+    print(
+        "adj_ppo_factor_clip_stop_ratio={}".format(
+            args.adj_ppo_factor_clip_stop_ratio
+        )
+    )
+    print("adj_ppo_min_epochs={}".format(args.adj_ppo_min_epochs))
+    print("use_adj_ppo_stale_trust={}".format(args.use_adj_ppo_stale_trust))
+    print(
+        "adj_ppo_stale_trust_clip={}".format(
+            args.adj_ppo_stale_trust_clip
+        )
+    )
+    print(
+        "adj_ppo_stale_trust_scale={}".format(
+            args.adj_ppo_stale_trust_scale
+        )
+    )
+    print(
+        "adj_ppo_stale_trust_min_weight={}".format(
+            args.adj_ppo_stale_trust_min_weight
+        )
+    )
+    print(
+        "adj_recent_episode_window={}".format(
+            args.adj_recent_episode_window
+        )
+    )
+    print(
+        "use_adj_dynamic_recent_window={}".format(
+            args.use_adj_dynamic_recent_window
+        )
+    )
+    print(
+        "adj_recent_episode_window_min={}".format(
+            args.adj_recent_episode_window_min
+        )
+    )
+    print(
+        "adj_recent_window_stale_threshold={}".format(
+            args.adj_recent_window_stale_threshold
+        )
+    )
+    print(
+        "adj_recent_window_factor_stale_threshold={}".format(
+            args.adj_recent_window_factor_stale_threshold
+        )
+    )
+    print(
+        "adj_recent_window_shrink_patience={}".format(
+            args.adj_recent_window_shrink_patience
+        )
+    )
+    print(
+        "adj_recent_window_recover_patience={}".format(
+            args.adj_recent_window_recover_patience
+        )
+    )
+    print(
+        "adj_recent_window_recover_stale_threshold={}".format(
+            args.adj_recent_window_recover_stale_threshold
+        )
+    )
+    print(
+        "adj_recent_window_recover_factor_stale_threshold={}".format(
+            args.adj_recent_window_recover_factor_stale_threshold
+        )
+    )
+    print(
+        "adj_recent_window_severe_margin={}".format(
+            args.adj_recent_window_severe_margin
+        )
+    )
     print("finite_grad_tensors={}".format(finite_grad_count))
     print("adj_buffer_axis_and_return_test=passed")
     print("scatter_gradient_test=passed")

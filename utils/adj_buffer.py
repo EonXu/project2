@@ -335,16 +335,25 @@ class AdjPolicyBuffer(object):
                     axis=1,
                 )[..., 0]
             )
-            valid_count = np.maximum(
-                valid_factor.sum(axis=-1, keepdims=True),
-                1,
-            ).astype(np.float32)
-            local_mean = (
-                local_adv * valid_factor.astype(np.float32)
-            ).sum(axis=-1, keepdims=True) / valid_count
-            local_adv = (
-                local_adv - local_mean
-            ) * valid_factor.astype(np.float32)
+            # Factor critics are order-specific networks.  Comparing a pair
+            # factor directly with a triplet factor mixes critic scales and in
+            # run22 biased the learned graph toward low-order pairs.  Keep the
+            # auxiliary credit local to alternatives of the same factor order.
+            centered_local_adv = np.zeros_like(local_adv, dtype=np.float32)
+            for order in np.unique(factor_size[valid_factor]):
+                order_mask = valid_factor & (factor_size == order)
+                valid_count = np.maximum(
+                    order_mask.sum(axis=-1, keepdims=True),
+                    1,
+                ).astype(np.float32)
+                order_mean = (
+                    local_adv * order_mask.astype(np.float32)
+                ).sum(axis=-1, keepdims=True) / valid_count
+                centered_local_adv += (
+                    (local_adv - order_mean)
+                    * order_mask.astype(np.float32)
+                )
+            local_adv = centered_local_adv
         else:
             local_adv = np.zeros_like(valid_factor, dtype=np.float32)
 
@@ -358,6 +367,16 @@ class AdjPolicyBuffer(object):
                 std = 1.0
             standardized = (values - mean) / (std + 1e-5)
             standardized[~mask] = 0.0
+            return standardized.astype(np.float32)
+
+        def _standardize_valid_by_order(values, mask, orders):
+            standardized = np.zeros_like(values, dtype=np.float32)
+            if not mask.any():
+                return standardized
+            for order in np.unique(orders[mask]):
+                order_mask = mask & (orders == order)
+                order_standardized = _standardize_valid(values, order_mask)
+                standardized[order_mask] = order_standardized[order_mask]
             return standardized.astype(np.float32)
 
         # A graph is one structured action per transition. Normalize its
@@ -375,7 +394,11 @@ class AdjPolicyBuffer(object):
             axis=2,
         ) * valid_factor.astype(np.float32)
         if self.adj_factor_adv_coef != 0.0:
-            local_adv = _standardize_valid(local_adv, valid_factor)
+            local_adv = _standardize_valid_by_order(
+                local_adv,
+                valid_factor,
+                factor_size,
+            )
         else:
             local_adv = np.zeros_like(local_adv, dtype=np.float32)
 
@@ -547,13 +570,42 @@ class AdjPolicyBuffer(object):
     #         rnn_obs_batch = np.stack(rnn_obs_batch,axis=0)
     #
     #         yield obs_batch, share_obs_batch, dones_batch, dones_env_batch, adj_batch, prob_adj_batch, advantages_batch, f_advts_batch, rnn_obs_batch
-    def sample_inds(self, data_chunk_length, num_mini_batch):
+    def _recent_episode_indices(self, recent_episode_window=0):
+        valid_episodes = int(self.filled_i)
+        if valid_episodes <= 0:
+            raise RuntimeError(
+                "AdjPolicyBuffer.sample_inds called before any episode is inserted."
+            )
+        recent_episode_window = int(recent_episode_window or 0)
+        if recent_episode_window <= 0 or recent_episode_window >= valid_episodes:
+            return np.arange(valid_episodes, dtype=np.int64)
+
+        end = int(self.current_i) % int(self.buffer_size)
+        start = (end - recent_episode_window) % int(self.buffer_size)
+        return (
+            np.arange(
+                start,
+                start + recent_episode_window,
+                dtype=np.int64,
+            )
+            % int(self.buffer_size)
+        )
+
+    def sample_inds(
+            self,
+            data_chunk_length,
+            num_mini_batch,
+            recent_episode_window=0):
         """
         只从 filled_i 范围内采样，避免未填充 episode 污染邻接训练。
         """
-        valid_episodes = int(self.filled_i)
-        if valid_episodes <= 0:
-            raise RuntimeError("AdjPolicyBuffer.sample_inds called before any episode is inserted.")
+        episode_indices = self._recent_episode_indices(
+            recent_episode_window
+        )
+        valid_episodes = int(episode_indices.size)
+        self.last_sample_episode_count = valid_episodes
+        self.last_sample_recent_window = int(recent_episode_window or 0)
+        self.last_sample_episode_indices = episode_indices.copy()
 
         batch_size = self.episode_length * valid_episodes
         data_chunk_length = min(int(data_chunk_length), batch_size)
@@ -568,7 +620,7 @@ class AdjPolicyBuffer(object):
             for i in range(num_mini_batch)
         ]
 
-        obs_seq = self.obs[:-1, :valid_episodes]
+        obs_seq = np.take(self.obs[:-1], episode_indices, axis=1)
         obs = obs_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
 
         # Intra-episode dynamic fix:
@@ -581,24 +633,36 @@ class AdjPolicyBuffer(object):
 
         # Keep environment termination semantics from the original shifted
         # dones_env path; only per-slot activity is reconstructed from obs.
+        dones_env_seq = np.take(
+            self.dones_env[:-1],
+            episode_indices,
+            axis=1,
+        )
         dones_env = np.concatenate((
             np.zeros((1, valid_episodes, 1), dtype=np.float32),
-            self.dones_env[:-1, :valid_episodes]
+            dones_env_seq,
         ))
 
-        adj = self.adj[:-1, :valid_episodes].transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
-        prob_adj = self.prob_adj[:-1, :valid_episodes].transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
-        rnn_obs = self.rnn_obs[:-1, :valid_episodes].transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
+        adj_seq_full = np.take(self.adj[:-1], episode_indices, axis=1)
+        prob_adj_seq = np.take(
+            self.prob_adj[:-1],
+            episode_indices,
+            axis=1,
+        )
+        rnn_obs_seq = np.take(self.rnn_obs[:-1], episode_indices, axis=1)
+        adj = adj_seq_full.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
+        prob_adj = prob_adj_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
+        rnn_obs = rnn_obs_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
 
-        advantage = self.advantage[:, :valid_episodes]
+        advantage = np.take(self.advantage, episode_indices, axis=1)
         advantages = advantage.transpose(1, 0, 2).reshape(batch_size, -1)
 
-        f_advt = self.f_advt[:, :valid_episodes]
+        f_advt = np.take(self.f_advt, episode_indices, axis=1)
 
         # Identify valid selected factors. Advantages were already normalized
         # once per structured graph action in compute_advantage().
         active_seq = ~np.all(obs_seq <= -0.999, axis=-1)
-        adj_seq = self.adj[:-1, :valid_episodes, :, :self.num_factor]
+        adj_seq = adj_seq_full[:, :, :, :self.num_factor]
         factor_size = adj_seq.sum(axis=2)
         factor_alive_count = (
             adj_seq * active_seq[:, :, :, None]
@@ -623,10 +687,20 @@ class AdjPolicyBuffer(object):
         dones_env = dones_env.transpose(1, 0, 2).reshape(batch_size, -1)
 
         if self.use_same_share_obs:
-            share_obs = self.share_obs[:-1, :valid_episodes].transpose(1, 0, 2).reshape(batch_size, -1)
+            share_obs_seq = np.take(
+                self.share_obs[:-1],
+                episode_indices,
+                axis=1,
+            )
+            share_obs = share_obs_seq.transpose(1, 0, 2).reshape(batch_size, -1)
         else:
-            share_obs = self.share_obs[:-1, :valid_episodes].transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents,
-                                                                                           -1)
+            share_obs_seq = np.take(
+                self.share_obs[:-1],
+                episode_indices,
+                axis=1,
+            )
+            share_obs = share_obs_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents,
+                                                                    -1)
 
         for indices in sampler:
             obs_batch = []

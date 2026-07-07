@@ -79,6 +79,22 @@ class RecRunner(object):
                     f"hidden_size={self.hidden_size} must be divisible by gat_heads={self.args.gat_heads} "
                     "to avoid silent GAT head dimension truncation."
                 )
+            if bool(getattr(self.args, "require_connected_adj", False)):
+                max_agents = int(getattr(self.args, "max_player_num", 1))
+                max_order = max(2, int(getattr(self.args, "highest_orders", 2)))
+                min_connected_factors = (
+                    max_agents - 1 + max_order - 2
+                ) // (max_order - 1)
+                if int(getattr(self.args, "num_factor", 0)) < min_connected_factors:
+                    raise ValueError(
+                        "require_connected_adj needs at least {} factors for "
+                        "max_player_num={} and highest_orders={}, got {}.".format(
+                            min_connected_factors,
+                            max_agents,
+                            max_order,
+                            getattr(self.args, "num_factor", 0),
+                        )
+                    )
 
         min_adj_begin_step = int(getattr(self.args, "min_adj_begin_step", 5000))
         adj_begin_step = int(getattr(self.args, "adj_begin_step", 0))
@@ -165,9 +181,18 @@ class RecRunner(object):
         self.use_save = self.args.use_save  # 是否将模型保存到磁盘
         self.pretrain_adj = self.args.pretrain_adj  # 是否预加载（预训练）邻接网络
         self.num_mini_batch = self.args.num_mini_batch  # 用于邻接训练时的 minibatch 数目
+        self.adj_train_epochs = max(
+            1,
+            int(getattr(self.args, "adj_train_epochs", 10)),
+        )
+        self.use_adj_linear_lr_decay = bool(
+            getattr(self.args, "use_adj_linear_lr_decay", False)
+        )
+        self._adj_lr_decay_warning_emitted = False
         self.adj_begin_step = self.args.adj_begin_step  # 在多少 step 之后开始训练动态邻接
         self.use_adj_init = self.args.use_adj_init  # 是否在训练开始时使用邻接的初始值
         self._validate_dynamic_graph_args() #检查sddfg参数
+        self._lr_decay_warning_emitted = False
 
         # config 中有些字段不是必须的，使用 contains 检查并设置默认值
         if config.__contains__("take_turn"):
@@ -397,6 +422,29 @@ class RecRunner(object):
 
         # train：如果满足训练触发条件（收集足够的 episode）则进行一次训练
         if ((self.num_episodes_collected - self.last_train_episode - self.batch_size) / self.train_interval_episode) >= 1:
+            # LR scheduling must follow the policy-update clock.  Its former
+            # placement inside adjacency updates decayed SDDFG while value
+            # baselines silently kept their initial learning rate.
+            if self.use_linear_lr_decay:
+                lr_decay = getattr(self.trainer, "lr_decay", None)
+                if callable(lr_decay):
+                    policy_lr_anneal_steps = int(
+                        getattr(self.args, "policy_lr_anneal_steps", 0)
+                    )
+                    if policy_lr_anneal_steps <= 0:
+                        policy_lr_anneal_steps = self.num_env_steps
+                    lr_decay(
+                        self.total_env_steps,
+                        policy_lr_anneal_steps,
+                    )
+                elif not self._lr_decay_warning_emitted:
+                    print(
+                        "[WARN] --use_linear_lr_decay has no effect for "
+                        "trainer {} because it has no lr_decay() method.".format(
+                            type(self.trainer).__name__
+                        )
+                    )
+                    self._lr_decay_warning_emitted = True
             self.train()
             self.total_train_steps += 1
             self.last_train_episode = self.num_episodes_collected - self.batch_size
@@ -404,10 +452,23 @@ class RecRunner(object):
         # 如果使用动态邻接图且满足训练邻接的条件，则训练邻接网络
         if self.use_dyn_graph and self.total_env_steps >= self.adj_begin_step and (
                 (self.num_adj_episodes_collected - self.last_train_adj_episode) / self.train_adj_episode) >= 1:
-            if self.use_linear_lr_decay:
-                # 学习率线性衰减（用于邻接训练阶段）
-                self.trainer.lr_decay(self.total_env_steps - self.adj_begin_step, self.num_env_steps - self.adj_begin_step)
             if not self.pretrain_adj:
+                # Keep graph scheduling independent from policy LR decay.
+                # Previously the adjacency flag had no effect unless the
+                # unrelated global policy decay flag was also enabled.
+                if self.use_adj_linear_lr_decay:
+                    adj_lr_decay = getattr(self.trainer, "adj_lr_decay", None)
+                    if callable(adj_lr_decay):
+                        adj_lr_decay(self.total_env_steps)
+                    elif not self._adj_lr_decay_warning_emitted:
+                        print(
+                            "[WARN] --use_adj_linear_lr_decay has no effect "
+                            "for trainer {} because it has no "
+                            "adj_lr_decay() method.".format(
+                                type(self.trainer).__name__
+                            )
+                        )
+                        self._adj_lr_decay_warning_emitted = True
                 # 训练邻接网络的具体实现由 batch_train_adj 完成
                 self.train_adj()
                 self.log_train_adj(self.train_adj_infos)
@@ -550,20 +611,292 @@ class RecRunner(object):
 
         data_chunk_length = 10  # 每次从轨迹中取多少步的连续片段来训练邻接（小BPTT段）
 
-        # 这里循环10次，表示进行若干轮邻接训练（可视为一个大步里包含的多个小更新）
-        for _ in range(10):
+        # The 16-episode window overlaps across graph updates.  run35 showed
+        # that continuing to replay stale graph decisions after clamp_ratio
+        # has already exceeded 0.7 makes the graph PPO target drift instead of
+        # improving reward.  Stop the current adj update early when either the
+        # graph-level or factor-level PPO clamp fraction is too high.
+        graph_clip_stop_ratio = float(
+            getattr(self.args, "adj_ppo_clip_stop_ratio", 0.0)
+        )
+        factor_clip_stop_ratio = float(
+            getattr(self.args, "adj_ppo_factor_clip_stop_ratio", 0.0)
+        )
+        min_ppo_epochs = max(
+            1,
+            int(getattr(self.args, "adj_ppo_min_epochs", 1)),
+        )
+        configured_recent_episode_window = max(
+            0,
+            int(getattr(self.args, "adj_recent_episode_window", 0)),
+        )
+        recent_episode_window = configured_recent_episode_window
+        dynamic_recent_enabled = bool(
+            getattr(self.args, "use_adj_dynamic_recent_window", False)
+        )
+        recent_window_shrunk = 0.0
+        recent_window_recovered = 0.0
+        recent_window_high_stale_count = 0.0
+        recent_window_low_stale_count = 0.0
+        if dynamic_recent_enabled and configured_recent_episode_window > 0:
+            min_recent_window = max(
+                1,
+                min(
+                    configured_recent_episode_window,
+                    int(getattr(self.args, "adj_recent_episode_window_min", 1)),
+                ),
+            )
+            graph_stale_threshold = float(
+                getattr(self.args, "adj_recent_window_stale_threshold", 0.35)
+            )
+            factor_stale_threshold = float(
+                getattr(
+                    self.args,
+                    "adj_recent_window_factor_stale_threshold",
+                    graph_stale_threshold,
+                )
+            )
+            recover_graph_threshold = float(
+                getattr(
+                    self.args,
+                    "adj_recent_window_recover_stale_threshold",
+                    -1.0,
+                )
+            )
+            if recover_graph_threshold < 0.0:
+                recover_graph_threshold = 0.8 * graph_stale_threshold
+            recover_factor_threshold = float(
+                getattr(
+                    self.args,
+                    "adj_recent_window_recover_factor_stale_threshold",
+                    -1.0,
+                )
+            )
+            if recover_factor_threshold < 0.0:
+                recover_factor_threshold = 0.8 * factor_stale_threshold
+            shrink_patience = max(
+                1,
+                int(getattr(self.args, "adj_recent_window_shrink_patience", 1)),
+            )
+            recover_patience = max(
+                1,
+                int(getattr(self.args, "adj_recent_window_recover_patience", 2)),
+            )
+            severe_margin = max(
+                0.0,
+                float(getattr(self.args, "adj_recent_window_severe_margin", 0.15)),
+            )
+            prev_graph_stale = float(
+                getattr(self, "_last_adj_graph_stale_ratio", np.nan)
+            )
+            prev_factor_stale = float(
+                getattr(self, "_last_adj_factor_stale_ratio", np.nan)
+            )
+            adaptive_recent_window = int(
+                getattr(
+                    self,
+                    "_adj_dynamic_recent_episode_window",
+                    configured_recent_episode_window,
+                )
+            )
+            adaptive_recent_window = max(
+                min_recent_window,
+                min(configured_recent_episode_window, adaptive_recent_window),
+            )
+            graph_too_stale = (
+                np.isfinite(prev_graph_stale)
+                and prev_graph_stale >= graph_stale_threshold
+            )
+            factor_too_stale = (
+                np.isfinite(prev_factor_stale)
+                and prev_factor_stale >= factor_stale_threshold
+            )
+            graph_fresh_enough = (
+                np.isfinite(prev_graph_stale)
+                and prev_graph_stale <= recover_graph_threshold
+            )
+            factor_fresh_enough = (
+                np.isfinite(prev_factor_stale)
+                and prev_factor_stale <= recover_factor_threshold
+            )
+            high_count = int(
+                getattr(self, "_adj_recent_window_high_stale_count", 0)
+            )
+            low_count = int(
+                getattr(self, "_adj_recent_window_low_stale_count", 0)
+            )
+            if graph_too_stale or factor_too_stale:
+                high_count += 1
+                low_count = 0
+            elif graph_fresh_enough and factor_fresh_enough:
+                low_count += 1
+                high_count = 0
+            else:
+                high_count = 0
+                low_count = 0
+
+            if high_count >= shrink_patience:
+                severe_graph_stale = (
+                    np.isfinite(prev_graph_stale)
+                    and prev_graph_stale >= graph_stale_threshold + severe_margin
+                )
+                severe_factor_stale = (
+                    np.isfinite(prev_factor_stale)
+                    and prev_factor_stale >= factor_stale_threshold + severe_margin
+                )
+                if severe_graph_stale or severe_factor_stale:
+                    adaptive_recent_window = min_recent_window
+                else:
+                    adaptive_recent_window = max(
+                        min_recent_window,
+                        adaptive_recent_window - 1,
+                    )
+                high_count = 0
+            elif (
+                low_count >= recover_patience
+                and adaptive_recent_window < configured_recent_episode_window
+            ):
+                adaptive_recent_window = min(
+                    configured_recent_episode_window,
+                    adaptive_recent_window + 1,
+                )
+                low_count = 0
+                recent_window_recovered = 1.0
+
+            recent_episode_window = adaptive_recent_window
+            recent_window_shrunk = float(
+                recent_episode_window < configured_recent_episode_window
+            )
+            recent_window_high_stale_count = float(high_count)
+            recent_window_low_stale_count = float(low_count)
+            self._adj_dynamic_recent_episode_window = adaptive_recent_window
+            self._adj_recent_window_high_stale_count = high_count
+            self._adj_recent_window_low_stale_count = low_count
+        early_stop_triggered = 0.0
+        last_epoch_clip_ratio = np.nan
+        last_epoch_factor_clip_ratio = np.nan
+        epochs_ran = 0
+        sample_episode_count = np.nan
+        sample_recent_fraction = np.nan
+
+        for epoch_idx in range(self.adj_train_epochs):
+            epoch_clip_ratios = []
+            epoch_factor_clip_ratios = []
             for p_id in self.policy_info.keys():
                 # 从该policy对应的邻接缓冲中，按“连续片段+mini-batch”方式迭代采样
                 data_generator = self.adj_buffer.policy_buffers[p_id].sample_inds(data_chunk_length,
-                                                                                  self.num_mini_batch)
+                                                                                  self.num_mini_batch,
+                                                                                  recent_episode_window=recent_episode_window)
                 for sample in data_generator:
                     # 调用trainer的邻接训练：内部是PPO剪切 + 熵正则
                     train_adj_info, new_priorities, idxes = self.trainer.train_adj_on_batch(sample, self.use_adj_init)
                     # 聚合指标
                     for k, v in train_adj_info.items():
                         self.train_adj_infos.setdefault(k, []).append(v)
+                    if "clamp_ratio" in train_adj_info:
+                        epoch_clip_ratios.append(train_adj_info["clamp_ratio"])
+                    if "factor_clamp_ratio" in train_adj_info:
+                        epoch_factor_clip_ratios.append(
+                            train_adj_info["factor_clamp_ratio"]
+                        )
+                policy_buffer = self.adj_buffer.policy_buffers[p_id]
+                sample_episode_count = float(
+                    getattr(policy_buffer, "last_sample_episode_count", np.nan)
+                )
+                filled_episode_count = float(
+                    max(1, getattr(policy_buffer, "filled_i", 1))
+                )
+                if np.isfinite(sample_episode_count):
+                    sample_recent_fraction = (
+                        sample_episode_count / filled_episode_count
+                    )
             # 首轮训练之后就不再使用“弱化初始化”分支
             self.use_adj_init = False
+            epochs_ran = epoch_idx + 1
+            if len(epoch_clip_ratios) > 0:
+                last_epoch_clip_ratio = float(np.mean(epoch_clip_ratios))
+            if len(epoch_factor_clip_ratios) > 0:
+                last_epoch_factor_clip_ratio = float(
+                    np.mean(epoch_factor_clip_ratios)
+                )
+            graph_stop = (
+                graph_clip_stop_ratio > 0.0
+                and np.isfinite(last_epoch_clip_ratio)
+                and last_epoch_clip_ratio >= graph_clip_stop_ratio
+            )
+            factor_stop = (
+                factor_clip_stop_ratio > 0.0
+                and np.isfinite(last_epoch_factor_clip_ratio)
+                and last_epoch_factor_clip_ratio >= factor_clip_stop_ratio
+            )
+            if epochs_ran >= min_ppo_epochs and (graph_stop or factor_stop):
+                early_stop_triggered = 1.0
+                break
+
+        self.train_adj_infos.setdefault("adj_ppo_epochs_ran", []).append(
+            float(epochs_ran)
+        )
+        self.train_adj_infos.setdefault(
+            "adj_ppo_early_stop_triggered", []
+        ).append(float(early_stop_triggered))
+        self.train_adj_infos.setdefault(
+            "adj_ppo_last_epoch_clip_ratio", []
+        ).append(float(last_epoch_clip_ratio))
+        self.train_adj_infos.setdefault(
+            "adj_ppo_last_epoch_factor_clip_ratio", []
+        ).append(float(last_epoch_factor_clip_ratio))
+        self.train_adj_infos.setdefault(
+            "adj_ppo_clip_stop_ratio", []
+        ).append(float(graph_clip_stop_ratio))
+        self.train_adj_infos.setdefault(
+            "adj_ppo_factor_clip_stop_ratio", []
+        ).append(float(factor_clip_stop_ratio))
+        self.train_adj_infos.setdefault("adj_ppo_min_epochs", []).append(
+            float(min_ppo_epochs)
+        )
+        self.train_adj_infos.setdefault(
+            "adj_recent_episode_window", []
+        ).append(float(recent_episode_window))
+        self.train_adj_infos.setdefault(
+            "adj_recent_episode_window_config", []
+        ).append(float(configured_recent_episode_window))
+        self.train_adj_infos.setdefault(
+            "adj_dynamic_recent_window_enabled", []
+        ).append(float(dynamic_recent_enabled))
+        self.train_adj_infos.setdefault(
+            "adj_recent_window_shrunk", []
+        ).append(float(recent_window_shrunk))
+        self.train_adj_infos.setdefault(
+            "adj_recent_window_recovered", []
+        ).append(float(recent_window_recovered))
+        self.train_adj_infos.setdefault(
+            "adj_recent_window_high_stale_count", []
+        ).append(float(recent_window_high_stale_count))
+        self.train_adj_infos.setdefault(
+            "adj_recent_window_low_stale_count", []
+        ).append(float(recent_window_low_stale_count))
+        self.train_adj_infos.setdefault(
+            "adj_sample_episode_count", []
+        ).append(float(sample_episode_count))
+        self.train_adj_infos.setdefault(
+            "adj_sample_recent_fraction", []
+        ).append(float(sample_recent_fraction))
+        graph_stale_values = self.train_adj_infos.get(
+            "adj_graph_stale_ratio",
+            [],
+        )
+        factor_stale_values = self.train_adj_infos.get(
+            "adj_factor_stale_ratio",
+            [],
+        )
+        if len(graph_stale_values) > 0:
+            self._last_adj_graph_stale_ratio = float(
+                np.nanmean(graph_stale_values)
+            )
+        if len(factor_stale_values) > 0:
+            self._last_adj_factor_stale_ratio = float(
+                np.nanmean(factor_stale_values)
+            )
 
     """（非Q类）保存所有策略的actor/critic权重到 save_dir。"""
 
