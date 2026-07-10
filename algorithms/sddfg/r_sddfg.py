@@ -125,6 +125,177 @@ class R_SDDFG:
             1e-6,
             float(getattr(self.args, "adj_order_adv_graph_gate_scale", 1.0)),
         )
+        self.use_adj_triplet_graph_return_credit = bool(
+            getattr(self.args, "use_adj_triplet_graph_return_credit", False)
+        )
+        self.adj_triplet_graph_return_credit_coef = max(
+            0.0,
+            float(
+                getattr(
+                    self.args,
+                    "adj_triplet_graph_return_credit_coef",
+                    0.0,
+                )
+            ),
+        )
+        self.adj_triplet_graph_return_credit_cap = max(
+            0.0,
+            float(
+                getattr(
+                    self.args,
+                    "adj_triplet_graph_return_credit_cap",
+                    0.0,
+                )
+            ),
+        )
+        self.adj_triplet_graph_return_credit_min_graph_adv = float(
+            getattr(
+                self.args,
+                "adj_triplet_graph_return_credit_min_graph_adv",
+                0.0,
+            )
+        )
+        self.adj_triplet_graph_return_credit_raw_gate_scale = max(
+            0.0,
+            float(
+                getattr(
+                    self.args,
+                    "adj_triplet_graph_return_credit_raw_gate_scale",
+                    0.0,
+                )
+            ),
+        )
+        self.adj_triplet_graph_return_credit_require_delayed_gate = bool(
+            getattr(
+                self.args,
+                "adj_triplet_graph_return_credit_require_delayed_gate",
+                False,
+            )
+        )
+        self.use_adj_delayed_triplet_credit = bool(
+            getattr(self.args, "use_adj_delayed_triplet_credit", False)
+        )
+        self.adj_delayed_triplet_credit_coef = max(
+            0.0,
+            float(getattr(self.args, "adj_delayed_triplet_credit_coef", 0.0)),
+        )
+        self.adj_delayed_triplet_credit_window = max(
+            0,
+            int(getattr(self.args, "adj_delayed_triplet_credit_window", 0)),
+        )
+        self.adj_delayed_triplet_credit_cap = max(
+            0.0,
+            float(getattr(self.args, "adj_delayed_triplet_credit_cap", 0.0)),
+        )
+        self.adj_delayed_triplet_credit_min_reward = float(
+            getattr(self.args, "adj_delayed_triplet_credit_min_reward", 0.0)
+        )
+        self.adj_delayed_triplet_credit_positive_only = bool(
+            getattr(
+                self.args,
+                "adj_delayed_triplet_credit_positive_only",
+                False,
+            )
+        )
+        self.adj_delayed_triplet_credit_min_adv = max(
+            0.0,
+            float(getattr(self.args, "adj_delayed_triplet_credit_min_adv", 0.0)),
+        )
+        self.adj_delayed_triplet_credit_require_future_match = bool(
+            getattr(
+                self.args,
+                "adj_delayed_triplet_credit_require_future_match",
+                False,
+            )
+        )
+        self.use_adj_delayed_triplet_success_gate = bool(
+            getattr(self.args, "use_adj_delayed_triplet_success_gate", False)
+        )
+        self.adj_delayed_triplet_success_gate_min_adv = float(
+            getattr(
+                self.args,
+                "adj_delayed_triplet_success_gate_min_adv",
+                0.0,
+            )
+        )
+        self.adj_delayed_triplet_success_gate_scale = max(
+            1e-6,
+            float(
+                getattr(
+                    self.args,
+                    "adj_delayed_triplet_success_gate_scale",
+                    1.0,
+                )
+            ),
+        )
+        self.adj_delayed_triplet_success_gate_floor = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    getattr(
+                        self.args,
+                        "adj_delayed_triplet_success_gate_floor",
+                        0.0,
+                    )
+                ),
+            ),
+        )
+        self.adj_delayed_triplet_future_overlap_min_nodes = min(
+            3,
+            max(
+                1,
+                int(
+                    getattr(
+                        self.args,
+                        "adj_delayed_triplet_future_overlap_min_nodes",
+                        3,
+                    )
+                ),
+            ),
+        )
+        self.adj_delayed_triplet_partial_match_weight = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    getattr(
+                        self.args,
+                        "adj_delayed_triplet_partial_match_weight",
+                        0.5,
+                    )
+                ),
+            ),
+        )
+        self.use_adj_capture_to_win_credit = bool(
+            getattr(self.args, "use_adj_capture_to_win_credit", False)
+        )
+        self.adj_capture_to_win_credit_coef = max(
+            0.0,
+            float(getattr(self.args, "adj_capture_to_win_credit_coef", 0.0)),
+        )
+        self.adj_capture_to_win_credit_min_outcome_adv = float(
+            getattr(
+                self.args,
+                "adj_capture_to_win_credit_min_outcome_adv",
+                0.5,
+            )
+        )
+        self.adj_capture_to_win_credit_scale = max(
+            1e-6,
+            float(getattr(self.args, "adj_capture_to_win_credit_scale", 0.75)),
+        )
+        self.adj_capture_to_win_credit_cap = max(
+            0.0,
+            float(getattr(self.args, "adj_capture_to_win_credit_cap", 0.35)),
+        )
+        self.adj_capture_to_win_credit_require_future_match = bool(
+            getattr(
+                self.args,
+                "adj_capture_to_win_credit_require_future_match",
+                False,
+            )
+        )
         self.use_adj_ppo_stale_trust = bool(
             getattr(self.args, "use_adj_ppo_stale_trust", False)
         )
@@ -610,9 +781,64 @@ class R_SDDFG:
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):
         """See parent class."""
 
-        obs_batch, _share_obs_batch, dones_batch, \
-            dones_env_batch, adj_batch, prob_adj_batch, \
-            _advantages_batch, f_advts_batch, rnn_obs_batch = batch
+        if len(batch) >= 16:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, \
+                delayed_triplet_credit_batch, \
+                delayed_triplet_success_gate_batch, \
+                delayed_triplet_future_match_batch, \
+                delayed_triplet_future_exact_batch, \
+                delayed_triplet_future_partial_batch, \
+                capture_to_win_triplet_credit_batch, \
+                capture_to_win_quality_gate_batch, \
+                rnn_obs_batch = batch[:16]
+        elif len(batch) >= 14:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, \
+                delayed_triplet_credit_batch, \
+                delayed_triplet_success_gate_batch, \
+                delayed_triplet_future_match_batch, \
+                delayed_triplet_future_exact_batch, \
+                delayed_triplet_future_partial_batch, \
+                rnn_obs_batch = batch[:14]
+            capture_to_win_triplet_credit_batch = None
+            capture_to_win_quality_gate_batch = None
+        elif len(batch) >= 11:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, \
+                delayed_triplet_credit_batch, \
+                delayed_triplet_success_gate_batch, \
+                rnn_obs_batch = batch[:11]
+            delayed_triplet_future_match_batch = None
+            delayed_triplet_future_exact_batch = None
+            delayed_triplet_future_partial_batch = None
+            capture_to_win_triplet_credit_batch = None
+            capture_to_win_quality_gate_batch = None
+        elif len(batch) >= 10:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, \
+                delayed_triplet_credit_batch, rnn_obs_batch = batch[:10]
+            delayed_triplet_success_gate_batch = None
+            delayed_triplet_future_match_batch = None
+            delayed_triplet_future_exact_batch = None
+            delayed_triplet_future_partial_batch = None
+            capture_to_win_triplet_credit_batch = None
+            capture_to_win_quality_gate_batch = None
+        else:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, rnn_obs_batch = batch
+            delayed_triplet_credit_batch = None
+            delayed_triplet_success_gate_batch = None
+            delayed_triplet_future_match_batch = None
+            delayed_triplet_future_exact_batch = None
+            delayed_triplet_future_partial_batch = None
+            capture_to_win_triplet_credit_batch = None
+            capture_to_win_quality_gate_batch = None
         tarprob_adj = []
         adj_entropy = []
         adj = to_torch(adj_batch)  # [batch_size,step,num_agent,-1]
@@ -622,6 +848,62 @@ class R_SDDFG:
         dones_env = to_torch(dones_env_batch).reshape(batch_size, -1).to(**self.tpdv)
         prob_adj = to_torch(prob_adj_batch).reshape(batch_size, self.num_agents, -1).to(**self.tpdv)
         f_advts = to_torch(f_advts_batch).reshape(batch_size, self.num_factor, -1).to(**self.tpdv)
+        if delayed_triplet_credit_batch is None:
+            delayed_triplet_credit = torch.zeros_like(f_advts)
+        else:
+            delayed_triplet_credit = (
+                to_torch(delayed_triplet_credit_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if delayed_triplet_success_gate_batch is None:
+            delayed_triplet_success_gate = torch.zeros_like(f_advts)
+        else:
+            delayed_triplet_success_gate = (
+                to_torch(delayed_triplet_success_gate_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if delayed_triplet_future_match_batch is None:
+            delayed_triplet_future_match = torch.zeros_like(f_advts)
+        else:
+            delayed_triplet_future_match = (
+                to_torch(delayed_triplet_future_match_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if delayed_triplet_future_exact_batch is None:
+            delayed_triplet_future_exact = torch.zeros_like(f_advts)
+        else:
+            delayed_triplet_future_exact = (
+                to_torch(delayed_triplet_future_exact_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if delayed_triplet_future_partial_batch is None:
+            delayed_triplet_future_partial = torch.zeros_like(f_advts)
+        else:
+            delayed_triplet_future_partial = (
+                to_torch(delayed_triplet_future_partial_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if capture_to_win_triplet_credit_batch is None:
+            capture_to_win_triplet_credit = torch.zeros_like(f_advts)
+        else:
+            capture_to_win_triplet_credit = (
+                to_torch(capture_to_win_triplet_credit_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if capture_to_win_quality_gate_batch is None:
+            capture_to_win_quality_gate = torch.zeros_like(f_advts)
+        else:
+            capture_to_win_quality_gate = (
+                to_torch(capture_to_win_quality_gate_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
         rnn_obs = to_torch(rnn_obs_batch).reshape(batch_size, self.num_agents, -1).to(
             **self.tpdv)  # [batch_size,step-1,1]
         obs = to_torch(obs_batch).reshape(batch_size, self.num_agents, -1).to(**self.tpdv)
@@ -783,7 +1065,98 @@ class R_SDDFG:
             1.0 + self.adj_order_adv_coef * order_extra
         )
         triplet_order_mask = order_extra > 0.0
-        positive_residual_mask = raw_local_factor_advantage > 0.0
+        triplet_graph_return_credit = torch.zeros_like(
+            raw_local_factor_advantage
+        )
+        triplet_graph_return_credit_gate = torch.ones_like(
+            raw_local_factor_advantage
+        )
+        graph_return_credit_strength = torch.zeros_like(graph_advantage)
+        credit_local_factor_advantage = raw_local_factor_advantage
+        triplet_success_selective_gate = (
+            delayed_triplet_success_gate.squeeze(-1).clamp(0.0, 1.0)
+        )
+        if self.use_adj_delayed_triplet_success_gate:
+            gate_floor = float(self.adj_delayed_triplet_success_gate_floor)
+            if 0.0 < gate_floor < 1.0:
+                triplet_success_selective_gate = (
+                    (triplet_success_selective_gate - gate_floor)
+                    / (1.0 - gate_floor)
+                ).clamp(0.0, 1.0)
+            elif gate_floor >= 1.0:
+                triplet_success_selective_gate = torch.zeros_like(
+                    triplet_success_selective_gate
+                )
+        triplet_graph_return_success_gate = torch.ones_like(
+            raw_local_factor_advantage
+        )
+        if self.adj_triplet_graph_return_credit_require_delayed_gate:
+            triplet_graph_return_success_gate = triplet_success_selective_gate
+        if (
+            self.use_adj_triplet_graph_return_credit
+            and self.adj_triplet_graph_return_credit_coef > 0.0
+        ):
+            # run42 reached high capture counts but its triplet marginal EMA
+            # became increasingly negative.  The local factor residual alone
+            # misses delayed graph-level payoff, so selected triplets in
+            # positive-return graphs receive a bounded supplemental credit.
+            graph_return_credit = torch.clamp(
+                graph_advantage
+                - float(self.adj_triplet_graph_return_credit_min_graph_adv),
+                min=0.0,
+            )
+            graph_return_credit = graph_return_credit * transition_mask
+            graph_return_abs_scale = (
+                (graph_advantage.abs() * transition_mask).sum()
+                / transition_mask.sum().clamp_min(1.0)
+            ).clamp_min(1e-6)
+            graph_return_credit = (
+                graph_return_credit
+                * float(self.adj_triplet_graph_return_credit_coef)
+            )
+            if self.adj_triplet_graph_return_credit_cap > 0.0:
+                graph_return_credit_cap = (
+                    graph_return_abs_scale
+                    * float(self.adj_triplet_graph_return_credit_cap)
+                )
+                graph_return_credit_cap = (
+                    torch.ones_like(graph_return_credit)
+                    * graph_return_credit_cap
+                )
+                graph_return_credit = torch.where(
+                    graph_return_credit > graph_return_credit_cap,
+                    graph_return_credit_cap,
+                    graph_return_credit,
+                )
+            graph_return_credit_strength = (
+                graph_return_credit / graph_return_abs_scale
+            ).clamp(0.0, 1.0)
+            if self.adj_triplet_graph_return_credit_raw_gate_scale > 0.0:
+                gate_scale = (
+                    graph_return_abs_scale
+                    * float(
+                        self.adj_triplet_graph_return_credit_raw_gate_scale
+                    )
+                ).clamp_min(1e-6)
+                triplet_graph_return_credit_gate = (
+                    (
+                        raw_local_factor_advantage
+                        + gate_scale
+                    )
+                    / gate_scale
+                ).clamp(0.0, 1.0)
+            triplet_graph_return_credit = (
+                graph_return_credit
+                * triplet_order_mask.to(graph_return_credit.dtype)
+                * triplet_graph_return_credit_gate
+                * triplet_graph_return_success_gate
+                * factor_training_mask
+            )
+            credit_local_factor_advantage = (
+                raw_local_factor_advantage
+                + triplet_graph_return_credit
+            )
+        positive_residual_mask = credit_local_factor_advantage > 0.0
         graph_promotion_strength = torch.ones_like(graph_advantage)
         if self.adj_order_adv_require_positive_graph_adv:
             # A triplet that is locally better than the average factor inside
@@ -862,7 +1235,7 @@ class R_SDDFG:
             torch.ones_like(order_credit_weight),
         )
         local_factor_advantage = (
-            raw_local_factor_advantage
+            credit_local_factor_advantage
             * order_credit_weight
         )
         factor_diff_log = (
@@ -913,6 +1286,16 @@ class R_SDDFG:
         raw_factor_min_surr = torch.min(
             raw_factor_surr1,
             raw_factor_surr2,
+        )
+        credit_factor_surr1 = (
+            factor_imp_weights * credit_local_factor_advantage
+        )
+        credit_factor_surr2 = (
+            clipped_factor_imp_weights * credit_local_factor_advantage
+        )
+        credit_factor_min_surr = torch.min(
+            credit_factor_surr1,
+            credit_factor_surr2,
         )
         factor_rl_loss = -(
             factor_min_surr
@@ -1057,6 +1440,201 @@ class R_SDDFG:
                 (local_factor_advantage.abs() * order3_factor_mask).sum()
                 / order3_factor_count.clamp_min(1.0)
             )
+            credit_order2_factor_advantage_abs_mean = (
+                (
+                    credit_local_factor_advantage.abs()
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            credit_order3_factor_advantage_abs_mean = (
+                (
+                    credit_local_factor_advantage.abs()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            triplet_graph_return_credit_sum = (
+                triplet_graph_return_credit
+                * order3_factor_mask
+            ).sum()
+            triplet_graph_return_credit_mean = (
+                triplet_graph_return_credit_sum
+                / order3_factor_count.clamp_min(1.0)
+            )
+            triplet_graph_return_credit_active_fraction = (
+                (
+                    (triplet_graph_return_credit > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            triplet_graph_return_credit_gate_mean = (
+                (
+                    triplet_graph_return_credit_gate
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_credit_2d = delayed_triplet_credit.squeeze(-1)
+            delayed_triplet_credit_mean = (
+                (
+                    delayed_triplet_credit_2d
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_credit_active_fraction = (
+                (
+                    (delayed_triplet_credit_2d.abs() > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_credit_positive_fraction = (
+                (
+                    (delayed_triplet_credit_2d > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_credit_negative_fraction = (
+                (
+                    (delayed_triplet_credit_2d < 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_success_gate_2d = (
+                delayed_triplet_success_gate.squeeze(-1)
+            )
+            delayed_triplet_success_gate_mean = (
+                (
+                    delayed_triplet_success_gate_2d
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_success_gate_active_fraction = (
+                (
+                    (delayed_triplet_success_gate_2d > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_success_gate_selective_2d = (
+                triplet_success_selective_gate
+            )
+            delayed_triplet_success_gate_selective_mean = (
+                (
+                    delayed_triplet_success_gate_selective_2d
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_success_gate_selective_fraction = (
+                (
+                    (
+                        delayed_triplet_success_gate_selective_2d > 0.0
+                    ).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            triplet_graph_return_success_gate_2d = (
+                triplet_graph_return_success_gate
+            )
+            triplet_graph_return_success_gate_mean = (
+                (
+                    triplet_graph_return_success_gate_2d
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            triplet_graph_return_success_gate_active_fraction = (
+                (
+                    (triplet_graph_return_success_gate_2d > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_future_match_2d = (
+                delayed_triplet_future_match.squeeze(-1)
+            )
+            delayed_triplet_future_exact_2d = (
+                delayed_triplet_future_exact.squeeze(-1)
+            )
+            delayed_triplet_future_partial_2d = (
+                delayed_triplet_future_partial.squeeze(-1)
+            )
+            delayed_triplet_future_match_weight_mean = (
+                (
+                    delayed_triplet_future_match_2d
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_future_matched_fraction = (
+                (
+                    (delayed_triplet_future_match_2d > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_future_exact_fraction = (
+                (
+                    (delayed_triplet_future_exact_2d > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            delayed_triplet_future_partial_fraction = (
+                (
+                    (delayed_triplet_future_partial_2d > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            capture_to_win_triplet_credit_2d = (
+                capture_to_win_triplet_credit.squeeze(-1)
+            )
+            capture_to_win_quality_gate_2d = (
+                capture_to_win_quality_gate.squeeze(-1)
+            )
+            capture_to_win_triplet_credit_mean = (
+                (
+                    capture_to_win_triplet_credit_2d
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            capture_to_win_triplet_credit_active_fraction = (
+                (
+                    (
+                        capture_to_win_triplet_credit_2d.abs() > 0.0
+                    ).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_mean = (
+                (
+                    capture_to_win_quality_gate_2d
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_active_fraction = (
+                (
+                    (capture_to_win_quality_gate_2d > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            graph_return_credit_strength_mean = (
+                (graph_return_credit_strength * transition_mask).sum()
+                / transition_mask.sum().clamp_min(1.0)
+            )
             order2_factor_loss_mask = order2_factor_mask * factor_trust_weights
             order3_factor_loss_mask = order3_factor_mask * factor_trust_weights
             order2_factor_loss_count = order2_factor_loss_mask.sum()
@@ -1073,6 +1651,12 @@ class R_SDDFG:
             raw_order3_factor_rl_loss = -(
                 raw_factor_min_surr * order3_factor_loss_mask
             ).sum() / order3_factor_loss_count.clamp_min(1.0)
+            credit_order2_factor_rl_loss = -(
+                credit_factor_min_surr * order2_factor_loss_mask
+            ).sum() / order2_factor_loss_count.clamp_min(1.0)
+            credit_order3_factor_rl_loss = -(
+                credit_factor_min_surr * order3_factor_loss_mask
+            ).sum() / order3_factor_loss_count.clamp_min(1.0)
             order2_positive_adv_fraction = (
                 (
                     (raw_local_factor_advantage > 0.0).float()
@@ -1083,6 +1667,20 @@ class R_SDDFG:
             order3_positive_adv_fraction = (
                 (
                     (raw_local_factor_advantage > 0.0).float()
+                    * order3_factor_mask
+                ).sum()
+                / order3_factor_count.clamp_min(1.0)
+            )
+            credit_order2_positive_adv_fraction = (
+                (
+                    (credit_local_factor_advantage > 0.0).float()
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            credit_order3_positive_adv_fraction = (
+                (
+                    (credit_local_factor_advantage > 0.0).float()
                     * order3_factor_mask
                 ).sum()
                 / order3_factor_count.clamp_min(1.0)
@@ -1128,7 +1726,7 @@ class R_SDDFG:
                 advantage_triplet_credit_info = (
                     self.adj_network.update_factor_credit_memory(
                         valid_adj.detach(),
-                        raw_local_factor_advantage.detach(),
+                        credit_local_factor_advantage.detach(),
                         graph_advantage.detach(),
                         factor_training_mask.detach(),
                     )
@@ -1268,6 +1866,78 @@ class R_SDDFG:
         train_info['weighted_order3_factor_advantage_abs_mean'] = _to_float(
             weighted_order3_factor_advantage_abs_mean
         )
+        train_info['credit_order2_factor_advantage_abs_mean'] = _to_float(
+            credit_order2_factor_advantage_abs_mean
+        )
+        train_info['credit_order3_factor_advantage_abs_mean'] = _to_float(
+            credit_order3_factor_advantage_abs_mean
+        )
+        train_info['triplet_graph_return_credit_mean'] = _to_float(
+            triplet_graph_return_credit_mean
+        )
+        train_info['triplet_graph_return_credit_active_fraction'] = _to_float(
+            triplet_graph_return_credit_active_fraction
+        )
+        train_info['triplet_graph_return_credit_gate_mean'] = _to_float(
+            triplet_graph_return_credit_gate_mean
+        )
+        train_info['delayed_triplet_credit_mean'] = _to_float(
+            delayed_triplet_credit_mean
+        )
+        train_info['delayed_triplet_credit_active_fraction'] = _to_float(
+            delayed_triplet_credit_active_fraction
+        )
+        train_info['delayed_triplet_credit_positive_fraction'] = _to_float(
+            delayed_triplet_credit_positive_fraction
+        )
+        train_info['delayed_triplet_credit_negative_fraction'] = _to_float(
+            delayed_triplet_credit_negative_fraction
+        )
+        train_info['delayed_triplet_success_gate_mean'] = _to_float(
+            delayed_triplet_success_gate_mean
+        )
+        train_info['delayed_triplet_success_gate_active_fraction'] = _to_float(
+            delayed_triplet_success_gate_active_fraction
+        )
+        train_info['delayed_triplet_success_gate_selective_mean'] = _to_float(
+            delayed_triplet_success_gate_selective_mean
+        )
+        train_info[
+            'delayed_triplet_success_gate_selective_fraction'
+        ] = _to_float(delayed_triplet_success_gate_selective_fraction)
+        train_info['triplet_graph_return_success_gate_mean'] = _to_float(
+            triplet_graph_return_success_gate_mean
+        )
+        train_info[
+            'triplet_graph_return_success_gate_active_fraction'
+        ] = _to_float(triplet_graph_return_success_gate_active_fraction)
+        train_info['delayed_triplet_future_match_weight_mean'] = _to_float(
+            delayed_triplet_future_match_weight_mean
+        )
+        train_info['delayed_triplet_future_matched_fraction'] = _to_float(
+            delayed_triplet_future_matched_fraction
+        )
+        train_info['delayed_triplet_future_exact_fraction'] = _to_float(
+            delayed_triplet_future_exact_fraction
+        )
+        train_info['delayed_triplet_future_partial_fraction'] = _to_float(
+            delayed_triplet_future_partial_fraction
+        )
+        train_info['capture_to_win_triplet_credit_mean'] = _to_float(
+            capture_to_win_triplet_credit_mean
+        )
+        train_info['capture_to_win_triplet_credit_active_fraction'] = _to_float(
+            capture_to_win_triplet_credit_active_fraction
+        )
+        train_info['capture_to_win_quality_gate_mean'] = _to_float(
+            capture_to_win_quality_gate_mean
+        )
+        train_info['capture_to_win_quality_gate_active_fraction'] = _to_float(
+            capture_to_win_quality_gate_active_fraction
+        )
+        train_info['graph_return_credit_strength_mean'] = _to_float(
+            graph_return_credit_strength_mean
+        )
         train_info['order2_factor_rl_loss'] = _to_float(
             order2_factor_rl_loss
         )
@@ -1283,11 +1953,26 @@ class R_SDDFG:
         train_info['raw_o3_minus_o2_factor_rl_loss'] = _to_float(
             raw_order3_factor_rl_loss - raw_order2_factor_rl_loss
         )
+        train_info['credit_order2_factor_rl_loss'] = _to_float(
+            credit_order2_factor_rl_loss
+        )
+        train_info['credit_order3_factor_rl_loss'] = _to_float(
+            credit_order3_factor_rl_loss
+        )
+        train_info['credit_o3_minus_o2_factor_rl_loss'] = _to_float(
+            credit_order3_factor_rl_loss - credit_order2_factor_rl_loss
+        )
         train_info['order2_positive_adv_fraction'] = _to_float(
             order2_positive_adv_fraction
         )
         train_info['order3_positive_adv_fraction'] = _to_float(
             order3_positive_adv_fraction
+        )
+        train_info['credit_order2_positive_adv_fraction'] = _to_float(
+            credit_order2_positive_adv_fraction
+        )
+        train_info['credit_order3_positive_adv_fraction'] = _to_float(
+            credit_order3_positive_adv_fraction
         )
         train_info['order2_promoted_adv_fraction'] = _to_float(
             order2_promoted_adv_fraction
@@ -1319,6 +2004,86 @@ class R_SDDFG:
         )
         train_info['adj_order_adv_graph_gate_scale'] = float(
             self.adj_order_adv_graph_gate_scale
+        )
+        train_info['use_adj_triplet_graph_return_credit'] = float(
+            self.use_adj_triplet_graph_return_credit
+        )
+        train_info['adj_triplet_graph_return_credit_coef'] = float(
+            self.adj_triplet_graph_return_credit_coef
+        )
+        train_info['adj_triplet_graph_return_credit_cap'] = float(
+            self.adj_triplet_graph_return_credit_cap
+        )
+        train_info['adj_triplet_graph_return_credit_min_graph_adv'] = float(
+            self.adj_triplet_graph_return_credit_min_graph_adv
+        )
+        train_info['adj_triplet_graph_return_credit_raw_gate_scale'] = float(
+            self.adj_triplet_graph_return_credit_raw_gate_scale
+        )
+        train_info[
+            'adj_triplet_graph_return_credit_require_delayed_gate'
+        ] = float(
+            self.adj_triplet_graph_return_credit_require_delayed_gate
+        )
+        train_info['use_adj_delayed_triplet_credit'] = float(
+            self.use_adj_delayed_triplet_credit
+        )
+        train_info['adj_delayed_triplet_credit_coef'] = float(
+            self.adj_delayed_triplet_credit_coef
+        )
+        train_info['adj_delayed_triplet_credit_window'] = float(
+            self.adj_delayed_triplet_credit_window
+        )
+        train_info['adj_delayed_triplet_credit_cap'] = float(
+            self.adj_delayed_triplet_credit_cap
+        )
+        train_info['adj_delayed_triplet_credit_min_reward'] = float(
+            self.adj_delayed_triplet_credit_min_reward
+        )
+        train_info['adj_delayed_triplet_credit_positive_only'] = float(
+            self.adj_delayed_triplet_credit_positive_only
+        )
+        train_info['adj_delayed_triplet_credit_min_adv'] = float(
+            self.adj_delayed_triplet_credit_min_adv
+        )
+        train_info['adj_delayed_triplet_credit_require_future_match'] = float(
+            self.adj_delayed_triplet_credit_require_future_match
+        )
+        train_info['use_adj_delayed_triplet_success_gate'] = float(
+            self.use_adj_delayed_triplet_success_gate
+        )
+        train_info['adj_delayed_triplet_success_gate_min_adv'] = float(
+            self.adj_delayed_triplet_success_gate_min_adv
+        )
+        train_info['adj_delayed_triplet_success_gate_scale'] = float(
+            self.adj_delayed_triplet_success_gate_scale
+        )
+        train_info['adj_delayed_triplet_success_gate_floor'] = float(
+            self.adj_delayed_triplet_success_gate_floor
+        )
+        train_info['adj_delayed_triplet_future_overlap_min_nodes'] = float(
+            self.adj_delayed_triplet_future_overlap_min_nodes
+        )
+        train_info['adj_delayed_triplet_partial_match_weight'] = float(
+            self.adj_delayed_triplet_partial_match_weight
+        )
+        train_info['use_adj_capture_to_win_credit'] = float(
+            self.use_adj_capture_to_win_credit
+        )
+        train_info['adj_capture_to_win_credit_coef'] = float(
+            self.adj_capture_to_win_credit_coef
+        )
+        train_info['adj_capture_to_win_credit_min_outcome_adv'] = float(
+            self.adj_capture_to_win_credit_min_outcome_adv
+        )
+        train_info['adj_capture_to_win_credit_scale'] = float(
+            self.adj_capture_to_win_credit_scale
+        )
+        train_info['adj_capture_to_win_credit_cap'] = float(
+            self.adj_capture_to_win_credit_cap
+        )
+        train_info['adj_capture_to_win_credit_require_future_match'] = float(
+            self.adj_capture_to_win_credit_require_future_match
         )
         for credit_key, credit_value in advantage_triplet_credit_info.items():
             train_info[credit_key] = float(credit_value)

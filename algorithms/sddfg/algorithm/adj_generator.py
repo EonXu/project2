@@ -1203,9 +1203,9 @@ class Adj_Generator(nn.Module):
             # applied after the order3 band so the two constraints cannot
             # silently request more factors than the active budget allows.
             min_pair_quota = int(
-                np.floor(
+                np.ceil(
                     float(self.min_pair_ratio) * float(factor_budget)
-                    + 1e-8
+                    - 1e-8
                 )
             )
             min_pair_quota = max(0, min(int(factor_budget), min_pair_quota))

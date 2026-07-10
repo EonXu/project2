@@ -307,9 +307,39 @@ class R_DDFG:
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):
         """See parent class."""
 
-        obs_batch, share_obs_batch, dones_batch, \
-            dones_env_batch, adj_batch, prob_adj_batch, \
-            advantages_batch, f_advts_batch, rnn_obs_batch = batch
+        if len(batch) >= 16:
+            obs_batch, share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                advantages_batch, f_advts_batch, \
+                _delayed_triplet_credit_batch, \
+                _delayed_triplet_success_gate_batch, \
+                _delayed_triplet_future_match_batch, \
+                _delayed_triplet_future_exact_batch, \
+                _delayed_triplet_future_partial_batch, \
+                _capture_to_win_triplet_credit_batch, \
+                _capture_to_win_quality_gate_batch, \
+                rnn_obs_batch = batch[:16]
+        elif len(batch) >= 14:
+            obs_batch, share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                advantages_batch, f_advts_batch, \
+                _delayed_triplet_credit_batch, \
+                _delayed_triplet_success_gate_batch, \
+                _delayed_triplet_future_match_batch, \
+                _delayed_triplet_future_exact_batch, \
+                _delayed_triplet_future_partial_batch, \
+                rnn_obs_batch = batch[:14]
+        elif len(batch) >= 11:
+            obs_batch, share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                advantages_batch, f_advts_batch, \
+                _delayed_triplet_credit_batch, \
+                _delayed_triplet_success_gate_batch, \
+                rnn_obs_batch = batch[:11]
+        else:
+            obs_batch, share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                advantages_batch, f_advts_batch, rnn_obs_batch = batch
         # individual agent q values: each element is of shape (batch_size, 1)
         qs = []
         target_qs = []

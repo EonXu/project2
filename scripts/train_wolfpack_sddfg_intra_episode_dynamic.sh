@@ -4,7 +4,7 @@ set -euo pipefail
 # Usage:
 #   bash scripts/train_wolfpack_sddfg_intra_episode_dynamic.sh [seed] [gpu] [num_env_steps]
 # Environment overrides:
-#   PYTHON_BIN=python CUDA_DEVICE=0 USER_NAME=local
+#   PYTHON_BIN=python CUDA_DEVICE=0 USER_NAME=local NUM_ENV_STEPS=200000
 #   ANNEAL_STEPS=2000000  # shared policy/graph LR schedule horizon
 #   ADJ_ENTROPY_COEF=0.0002 ADJ_ENTROPY_ANNEAL_STEPS=500000
 #   ADJ_ORDER3_BONUS_START=1.0 ADJ_ORDER3_BONUS=1.35 ADJ_ORDER3_BONUS_ANNEAL_STEPS=120000
@@ -21,6 +21,15 @@ set -euo pipefail
 #   ADJ_MIN_PAIR_RATIO=0.20 ADJ_ORDER_ADV_COEF=0.75
 #   ADJ_ORDER_ADV_POSITIVE_ONLY=1 ADJ_ORDER_ADV_NEGATIVE_COEF=0.20
 #   ADJ_ORDER_ADV_REQUIRE_POSITIVE_GRAPH_ADV=1
+#   USE_ADJ_TRIPLET_GRAPH_RETURN_CREDIT=1 ADJ_TRIPLET_GRAPH_RETURN_CREDIT_COEF=0.25
+#   ADJ_TRIPLET_GRAPH_RETURN_CREDIT_CAP=0.35 ADJ_TRIPLET_GRAPH_RETURN_CREDIT_RAW_GATE_SCALE=0.75
+#   USE_ADJ_DELAYED_TRIPLET_CREDIT=1 ADJ_DELAYED_TRIPLET_CREDIT_WINDOW=20
+#   ADJ_DELAYED_TRIPLET_CREDIT_POSITIVE_ONLY=1 ADJ_DELAYED_TRIPLET_CREDIT_MIN_ADV=0.25
+#   ADJ_DELAYED_TRIPLET_CREDIT_REQUIRE_FUTURE_MATCH=1
+#   USE_ADJ_DELAYED_TRIPLET_SUCCESS_GATE=1 ADJ_DELAYED_TRIPLET_SUCCESS_GATE_MIN_ADV=0.50
+#   ADJ_DELAYED_TRIPLET_SUCCESS_GATE_SCALE=0.75
+#   ADJ_DELAYED_TRIPLET_SUCCESS_GATE_FLOOR=0.25
+#   ADJ_DELAYED_TRIPLET_FUTURE_OVERLAP_MIN_NODES=2 ADJ_DELAYED_TRIPLET_PARTIAL_MATCH_WEIGHT=0.50
 #   USE_ADJ_ORDER3_CREDIT_GATE=1 USE_ADJ_ORDER3_RELATIVE_CREDIT_GATE=1
 #   ADJ_ORDER3_CREDIT_GATE_LOSS_SCALE=0.004 ADJ_ORDER3_CREDIT_GATE_MARGIN=0.0
 #   ADJ_PPO_CLIP_STOP_RATIO=0.35 ADJ_PPO_FACTOR_CLIP_STOP_RATIO=0.35
@@ -32,7 +41,7 @@ set -euo pipefail
 
 seed="${1:-1}"
 gpu="${2:-${CUDA_DEVICE:-0}}"
-num_env_steps="${3:-2000000}"
+num_env_steps="${3:-${NUM_ENV_STEPS:-2000000}}"
 python_bin="${PYTHON_BIN:-python}"
 user_name="${USER_NAME:-sddfg_dynamic}"
 
@@ -91,6 +100,32 @@ adj_order_adv_coef="${ADJ_ORDER_ADV_COEF:-0.75}"
 adj_order_adv_positive_only="${ADJ_ORDER_ADV_POSITIVE_ONLY:-1}"
 adj_order_adv_negative_coef="${ADJ_ORDER_ADV_NEGATIVE_COEF:-0.20}"
 adj_order_adv_require_positive_graph_adv="${ADJ_ORDER_ADV_REQUIRE_POSITIVE_GRAPH_ADV:-1}"
+use_adj_triplet_graph_return_credit="${USE_ADJ_TRIPLET_GRAPH_RETURN_CREDIT:-1}"
+adj_triplet_graph_return_credit_coef="${ADJ_TRIPLET_GRAPH_RETURN_CREDIT_COEF:-0.25}"
+adj_triplet_graph_return_credit_cap="${ADJ_TRIPLET_GRAPH_RETURN_CREDIT_CAP:-0.35}"
+adj_triplet_graph_return_credit_min_graph_adv="${ADJ_TRIPLET_GRAPH_RETURN_CREDIT_MIN_GRAPH_ADV:-0.0}"
+adj_triplet_graph_return_credit_raw_gate_scale="${ADJ_TRIPLET_GRAPH_RETURN_CREDIT_RAW_GATE_SCALE:-0.75}"
+adj_triplet_graph_return_credit_require_delayed_gate="${ADJ_TRIPLET_GRAPH_RETURN_CREDIT_REQUIRE_DELAYED_GATE:-1}"
+use_adj_delayed_triplet_credit="${USE_ADJ_DELAYED_TRIPLET_CREDIT:-1}"
+adj_delayed_triplet_credit_coef="${ADJ_DELAYED_TRIPLET_CREDIT_COEF:-0.25}"
+adj_delayed_triplet_credit_window="${ADJ_DELAYED_TRIPLET_CREDIT_WINDOW:-20}"
+adj_delayed_triplet_credit_cap="${ADJ_DELAYED_TRIPLET_CREDIT_CAP:-0.75}"
+adj_delayed_triplet_credit_min_reward="${ADJ_DELAYED_TRIPLET_CREDIT_MIN_REWARD:-0.0}"
+adj_delayed_triplet_credit_positive_only="${ADJ_DELAYED_TRIPLET_CREDIT_POSITIVE_ONLY:-1}"
+adj_delayed_triplet_credit_min_adv="${ADJ_DELAYED_TRIPLET_CREDIT_MIN_ADV:-0.25}"
+adj_delayed_triplet_credit_require_future_match="${ADJ_DELAYED_TRIPLET_CREDIT_REQUIRE_FUTURE_MATCH:-1}"
+use_adj_delayed_triplet_success_gate="${USE_ADJ_DELAYED_TRIPLET_SUCCESS_GATE:-1}"
+adj_delayed_triplet_success_gate_min_adv="${ADJ_DELAYED_TRIPLET_SUCCESS_GATE_MIN_ADV:-0.50}"
+adj_delayed_triplet_success_gate_scale="${ADJ_DELAYED_TRIPLET_SUCCESS_GATE_SCALE:-0.75}"
+adj_delayed_triplet_success_gate_floor="${ADJ_DELAYED_TRIPLET_SUCCESS_GATE_FLOOR:-0.10}"
+adj_delayed_triplet_future_overlap_min_nodes="${ADJ_DELAYED_TRIPLET_FUTURE_OVERLAP_MIN_NODES:-2}"
+adj_delayed_triplet_partial_match_weight="${ADJ_DELAYED_TRIPLET_PARTIAL_MATCH_WEIGHT:-0.35}"
+use_adj_capture_to_win_credit="${USE_ADJ_CAPTURE_TO_WIN_CREDIT:-1}"
+adj_capture_to_win_credit_coef="${ADJ_CAPTURE_TO_WIN_CREDIT_COEF:-0.15}"
+adj_capture_to_win_credit_min_outcome_adv="${ADJ_CAPTURE_TO_WIN_CREDIT_MIN_OUTCOME_ADV:-0.50}"
+adj_capture_to_win_credit_scale="${ADJ_CAPTURE_TO_WIN_CREDIT_SCALE:-0.75}"
+adj_capture_to_win_credit_cap="${ADJ_CAPTURE_TO_WIN_CREDIT_CAP:-0.25}"
+adj_capture_to_win_credit_require_future_match="${ADJ_CAPTURE_TO_WIN_CREDIT_REQUIRE_FUTURE_MATCH:-1}"
 use_adj_order3_credit_gate="${USE_ADJ_ORDER3_CREDIT_GATE:-1}"
 use_adj_order3_relative_credit_gate="${USE_ADJ_ORDER3_RELATIVE_CREDIT_GATE:-1}"
 adj_order3_credit_gate_loss_scale="${ADJ_ORDER3_CREDIT_GATE_LOSS_SCALE:-0.004}"
@@ -107,14 +142,17 @@ adj_ppo_stale_trust_scale="${ADJ_PPO_STALE_TRUST_SCALE:-0.25}"
 adj_ppo_stale_trust_min_weight="${ADJ_PPO_STALE_TRUST_MIN_WEIGHT:-0.25}"
 adj_recent_episode_window="${ADJ_RECENT_EPISODE_WINDOW:-4}"
 use_adj_dynamic_recent_window="${USE_ADJ_DYNAMIC_RECENT_WINDOW:-1}"
-adj_recent_episode_window_min="${ADJ_RECENT_EPISODE_WINDOW_MIN:-3}"
+adj_recent_episode_window_min="${ADJ_RECENT_EPISODE_WINDOW_MIN:-1}"
 adj_recent_window_stale_threshold="${ADJ_RECENT_WINDOW_STALE_THRESHOLD:-0.35}"
 adj_recent_window_factor_stale_threshold="${ADJ_RECENT_WINDOW_FACTOR_STALE_THRESHOLD:-0.30}"
-adj_recent_window_shrink_patience="${ADJ_RECENT_WINDOW_SHRINK_PATIENCE:-3}"
+adj_recent_window_shrink_patience="${ADJ_RECENT_WINDOW_SHRINK_PATIENCE:-1}"
 adj_recent_window_recover_patience="${ADJ_RECENT_WINDOW_RECOVER_PATIENCE:-2}"
 adj_recent_window_recover_stale_threshold="${ADJ_RECENT_WINDOW_RECOVER_STALE_THRESHOLD:-0.28}"
 adj_recent_window_recover_factor_stale_threshold="${ADJ_RECENT_WINDOW_RECOVER_FACTOR_STALE_THRESHOLD:-0.24}"
 adj_recent_window_severe_margin="${ADJ_RECENT_WINDOW_SEVERE_MARGIN:-0.20}"
+adj_recent_episode_window_emergency="${ADJ_RECENT_EPISODE_WINDOW_EMERGENCY:-1}"
+adj_recent_window_emergency_stale_threshold="${ADJ_RECENT_WINDOW_EMERGENCY_STALE_THRESHOLD:-0.40}"
+adj_recent_window_emergency_factor_stale_threshold="${ADJ_RECENT_WINDOW_EMERGENCY_FACTOR_STALE_THRESHOLD:-0.25}"
 if ! [[ "${adj_order3_bonus_anneal_steps}" =~ ^[0-9]+$ ]]; then
   echo "ADJ_ORDER3_BONUS_ANNEAL_STEPS must be a non-negative integer, got: ${adj_order3_bonus_anneal_steps}" >&2
   exit 2
@@ -143,6 +181,22 @@ if ! [[ "${adj_recent_episode_window}" =~ ^[0-9]+$ ]]; then
   echo "ADJ_RECENT_EPISODE_WINDOW must be a non-negative integer, got: ${adj_recent_episode_window}" >&2
   exit 2
 fi
+if ! [[ "${adj_recent_episode_window_min}" =~ ^[0-9]+$ ]]; then
+  echo "ADJ_RECENT_EPISODE_WINDOW_MIN must be a non-negative integer, got: ${adj_recent_episode_window_min}" >&2
+  exit 2
+fi
+if ! [[ "${adj_recent_episode_window_emergency}" =~ ^[0-9]+$ ]]; then
+  echo "ADJ_RECENT_EPISODE_WINDOW_EMERGENCY must be a non-negative integer, got: ${adj_recent_episode_window_emergency}" >&2
+  exit 2
+fi
+if ! [[ "${adj_delayed_triplet_credit_window}" =~ ^[0-9]+$ ]]; then
+  echo "ADJ_DELAYED_TRIPLET_CREDIT_WINDOW must be a non-negative integer, got: ${adj_delayed_triplet_credit_window}" >&2
+  exit 2
+fi
+if ! [[ "${adj_delayed_triplet_future_overlap_min_nodes}" =~ ^[0-9]+$ ]]; then
+  echo "ADJ_DELAYED_TRIPLET_FUTURE_OVERLAP_MIN_NODES must be a non-negative integer, got: ${adj_delayed_triplet_future_overlap_min_nodes}" >&2
+  exit 2
+fi
 adj_order3_credit_gate_args=()
 if [[ "${use_adj_order3_credit_gate}" == "1" ]]; then
   adj_order3_credit_gate_args=(--use_adj_order3_credit_gate)
@@ -163,6 +217,33 @@ if [[ "${adj_order_adv_positive_only}" == "1" ]]; then
 fi
 if [[ "${adj_order_adv_require_positive_graph_adv}" == "1" ]]; then
   adj_order_adv_args+=(--adj_order_adv_require_positive_graph_adv)
+fi
+adj_triplet_graph_return_credit_args=()
+if [[ "${use_adj_triplet_graph_return_credit}" == "1" ]]; then
+  adj_triplet_graph_return_credit_args=(--use_adj_triplet_graph_return_credit)
+fi
+if [[ "${adj_triplet_graph_return_credit_require_delayed_gate}" == "1" ]]; then
+  adj_triplet_graph_return_credit_args+=(--adj_triplet_graph_return_credit_require_delayed_gate)
+fi
+adj_delayed_triplet_credit_args=()
+if [[ "${use_adj_delayed_triplet_credit}" == "1" ]]; then
+  adj_delayed_triplet_credit_args=(--use_adj_delayed_triplet_credit)
+fi
+if [[ "${adj_delayed_triplet_credit_positive_only}" == "1" ]]; then
+  adj_delayed_triplet_credit_args+=(--adj_delayed_triplet_credit_positive_only)
+fi
+if [[ "${adj_delayed_triplet_credit_require_future_match}" == "1" ]]; then
+  adj_delayed_triplet_credit_args+=(--adj_delayed_triplet_credit_require_future_match)
+fi
+if [[ "${use_adj_delayed_triplet_success_gate}" == "1" ]]; then
+  adj_delayed_triplet_credit_args+=(--use_adj_delayed_triplet_success_gate)
+fi
+adj_capture_to_win_credit_args=()
+if [[ "${use_adj_capture_to_win_credit}" == "1" ]]; then
+  adj_capture_to_win_credit_args=(--use_adj_capture_to_win_credit)
+fi
+if [[ "${adj_capture_to_win_credit_require_future_match}" == "1" ]]; then
+  adj_capture_to_win_credit_args+=(--adj_capture_to_win_credit_require_future_match)
 fi
 adj_ppo_stale_trust_args=()
 if [[ "${use_adj_ppo_stale_trust}" == "1" ]]; then
@@ -224,10 +305,11 @@ fi
   echo "Algorithm: ${algorithm}"
   echo "Seed: ${seed}; GPU: ${gpu}; num_env_steps: ${num_env_steps}"
   echo "Anneal steps: lr=${anneal_steps}; adj_entropy=${adj_entropy_anneal_steps}; adj_entropy_coef=${adj_entropy_coef}; adj_order3_bonus=${adj_order3_bonus_start}->${adj_order3_bonus}/${adj_order3_bonus_anneal_steps}; adj_sampling_temp=${adj_sampling_temp_start}->${adj_sampling_temp_final}/${adj_sampling_temp_anneal_steps}"
-  echo "Order-aware graph: min_order3_ratio=${adj_min_order3_ratio_start}->${adj_min_order3_ratio_final}/${adj_min_order3_ratio_anneal_steps}; max_order3_ratio=${adj_max_order3_ratio_start}->${adj_max_order3_ratio_final}/${adj_max_order3_ratio_anneal_steps}; greedy_sample_prob=${adj_greedy_sample_prob_start}->${adj_greedy_sample_prob_final}/${adj_greedy_sample_prob_anneal_steps}; greedy_cap=${adj_greedy_sample_prob_cap}; quota_mode=${adj_order3_quota_mode}; soft_quota_coef=${adj_order3_soft_quota_coef}; triplet_feature_mode=${adj_triplet_feature_mode}; triplet_balance_coef=${adj_triplet_balance_coef}; advantage_triplet_scorer=${use_adj_advantage_triplet_scorer}; credit_alpha=${adj_triplet_credit_ema_alpha}; credit_coef=${adj_triplet_credit_score_coef}; credit_scale=${adj_triplet_credit_score_scale}; direct_rank=${use_adj_triplet_credit_direct_rank}; rank_coef=${adj_triplet_credit_rank_coef}; rank_multiplier=[${adj_triplet_credit_min_multiplier},${adj_triplet_credit_max_multiplier}]; negative_rank_scale=${adj_triplet_credit_negative_rank_scale}; min_positive_fraction=${adj_triplet_credit_min_positive_fraction}; negative_graph_penalty=${adj_triplet_negative_graph_penalty}; quota_score_floor=${adj_order3_quota_score_floor}; min_pair_ratio=${adj_min_pair_ratio}; adj_order_adv_coef=${adj_order_adv_coef}; positive_only=${adj_order_adv_positive_only}; negative_coef=${adj_order_adv_negative_coef}; require_positive_graph_adv=${adj_order_adv_require_positive_graph_adv}"
+  echo "Order-aware graph: min_order3_ratio=${adj_min_order3_ratio_start}->${adj_min_order3_ratio_final}/${adj_min_order3_ratio_anneal_steps}; max_order3_ratio=${adj_max_order3_ratio_start}->${adj_max_order3_ratio_final}/${adj_max_order3_ratio_anneal_steps}; greedy_sample_prob=${adj_greedy_sample_prob_start}->${adj_greedy_sample_prob_final}/${adj_greedy_sample_prob_anneal_steps}; greedy_cap=${adj_greedy_sample_prob_cap}; quota_mode=${adj_order3_quota_mode}; soft_quota_coef=${adj_order3_soft_quota_coef}; triplet_feature_mode=${adj_triplet_feature_mode}; triplet_balance_coef=${adj_triplet_balance_coef}; advantage_triplet_scorer=${use_adj_advantage_triplet_scorer}; credit_alpha=${adj_triplet_credit_ema_alpha}; credit_coef=${adj_triplet_credit_score_coef}; credit_scale=${adj_triplet_credit_score_scale}; direct_rank=${use_adj_triplet_credit_direct_rank}; rank_coef=${adj_triplet_credit_rank_coef}; rank_multiplier=[${adj_triplet_credit_min_multiplier},${adj_triplet_credit_max_multiplier}]; negative_rank_scale=${adj_triplet_credit_negative_rank_scale}; min_positive_fraction=${adj_triplet_credit_min_positive_fraction}; negative_graph_penalty=${adj_triplet_negative_graph_penalty}; quota_score_floor=${adj_order3_quota_score_floor}; min_pair_ratio=${adj_min_pair_ratio}; adj_order_adv_coef=${adj_order_adv_coef}; positive_only=${adj_order_adv_positive_only}; negative_coef=${adj_order_adv_negative_coef}; require_positive_graph_adv=${adj_order_adv_require_positive_graph_adv}; triplet_graph_return_credit=${use_adj_triplet_graph_return_credit}; triplet_graph_return_credit_coef=${adj_triplet_graph_return_credit_coef}; triplet_graph_return_credit_cap=${adj_triplet_graph_return_credit_cap}; triplet_graph_return_credit_min_graph_adv=${adj_triplet_graph_return_credit_min_graph_adv}; triplet_graph_return_credit_raw_gate_scale=${adj_triplet_graph_return_credit_raw_gate_scale}; triplet_graph_return_credit_require_delayed_gate=${adj_triplet_graph_return_credit_require_delayed_gate}; delayed_triplet_credit=${use_adj_delayed_triplet_credit}; delayed_triplet_credit_coef=${adj_delayed_triplet_credit_coef}; delayed_triplet_credit_window=${adj_delayed_triplet_credit_window}; delayed_triplet_credit_cap=${adj_delayed_triplet_credit_cap}; delayed_triplet_credit_min_reward=${adj_delayed_triplet_credit_min_reward}; delayed_triplet_credit_positive_only=${adj_delayed_triplet_credit_positive_only}; delayed_triplet_credit_min_adv=${adj_delayed_triplet_credit_min_adv}; delayed_triplet_credit_require_future_match=${adj_delayed_triplet_credit_require_future_match}; delayed_triplet_success_gate=${use_adj_delayed_triplet_success_gate}; delayed_triplet_success_gate_min_adv=${adj_delayed_triplet_success_gate_min_adv}; delayed_triplet_success_gate_scale=${adj_delayed_triplet_success_gate_scale}; delayed_triplet_success_gate_floor=${adj_delayed_triplet_success_gate_floor}; delayed_triplet_future_overlap_min_nodes=${adj_delayed_triplet_future_overlap_min_nodes}; delayed_triplet_partial_match_weight=${adj_delayed_triplet_partial_match_weight}"
+  echo "Capture-to-win credit: enabled=${use_adj_capture_to_win_credit}; coef=${adj_capture_to_win_credit_coef}; min_outcome_adv=${adj_capture_to_win_credit_min_outcome_adv}; scale=${adj_capture_to_win_credit_scale}; cap=${adj_capture_to_win_credit_cap}; require_future_match=${adj_capture_to_win_credit_require_future_match}"
   echo "Order3 credit gate: enabled=${use_adj_order3_credit_gate}; relative=${use_adj_order3_relative_credit_gate}; loss_scale=${adj_order3_credit_gate_loss_scale}; margin=${adj_order3_credit_gate_margin}; min_scale=${adj_order3_credit_gate_min_scale}; ema_alpha=${adj_order3_credit_gate_ema_alpha}; max_delta=${adj_order3_credit_gate_max_delta}"
   echo "Adj PPO guard: clip_stop=${adj_ppo_clip_stop_ratio}; factor_clip_stop=${adj_ppo_factor_clip_stop_ratio}; min_epochs=${adj_ppo_min_epochs}"
-  echo "Adj PPO stale trust: enabled=${use_adj_ppo_stale_trust}; clip=${adj_ppo_stale_trust_clip}; scale=${adj_ppo_stale_trust_scale}; min_weight=${adj_ppo_stale_trust_min_weight}; recent_episode_window=${adj_recent_episode_window}; dynamic_recent=${use_adj_dynamic_recent_window}; min_recent=${adj_recent_episode_window_min}; stale_threshold=${adj_recent_window_stale_threshold}; factor_stale_threshold=${adj_recent_window_factor_stale_threshold}; shrink_patience=${adj_recent_window_shrink_patience}; recover_patience=${adj_recent_window_recover_patience}; recover_threshold=${adj_recent_window_recover_stale_threshold}; recover_factor_threshold=${adj_recent_window_recover_factor_stale_threshold}; severe_margin=${adj_recent_window_severe_margin}"
+  echo "Adj PPO stale trust: enabled=${use_adj_ppo_stale_trust}; clip=${adj_ppo_stale_trust_clip}; scale=${adj_ppo_stale_trust_scale}; min_weight=${adj_ppo_stale_trust_min_weight}; recent_episode_window=${adj_recent_episode_window}; dynamic_recent=${use_adj_dynamic_recent_window}; min_recent=${adj_recent_episode_window_min}; stale_threshold=${adj_recent_window_stale_threshold}; factor_stale_threshold=${adj_recent_window_factor_stale_threshold}; shrink_patience=${adj_recent_window_shrink_patience}; recover_patience=${adj_recent_window_recover_patience}; recover_threshold=${adj_recent_window_recover_stale_threshold}; recover_factor_threshold=${adj_recent_window_recover_factor_stale_threshold}; severe_margin=${adj_recent_window_severe_margin}; emergency_recent=${adj_recent_episode_window_emergency}; emergency_threshold=${adj_recent_window_emergency_stale_threshold}; emergency_factor_threshold=${adj_recent_window_emergency_factor_stale_threshold}"
   echo "Experiment: ${experiment_name}"
   echo "Git commit: ${git_commit}; tracked tree: ${git_tree_state}"
   echo "Console log: ${console_log}"
@@ -313,6 +395,27 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" "${script_dir}/train/train_wolfpac
   --adj_order_adv_coef "${adj_order_adv_coef}" \
   "${adj_order_adv_args[@]}" \
   --adj_order_adv_negative_coef "${adj_order_adv_negative_coef}" \
+  "${adj_triplet_graph_return_credit_args[@]}" \
+  --adj_triplet_graph_return_credit_coef "${adj_triplet_graph_return_credit_coef}" \
+  --adj_triplet_graph_return_credit_cap "${adj_triplet_graph_return_credit_cap}" \
+  --adj_triplet_graph_return_credit_min_graph_adv "${adj_triplet_graph_return_credit_min_graph_adv}" \
+  --adj_triplet_graph_return_credit_raw_gate_scale "${adj_triplet_graph_return_credit_raw_gate_scale}" \
+  "${adj_delayed_triplet_credit_args[@]}" \
+  --adj_delayed_triplet_credit_coef "${adj_delayed_triplet_credit_coef}" \
+  --adj_delayed_triplet_credit_window "${adj_delayed_triplet_credit_window}" \
+  --adj_delayed_triplet_credit_cap "${adj_delayed_triplet_credit_cap}" \
+  --adj_delayed_triplet_credit_min_reward "${adj_delayed_triplet_credit_min_reward}" \
+  --adj_delayed_triplet_credit_min_adv "${adj_delayed_triplet_credit_min_adv}" \
+  --adj_delayed_triplet_success_gate_min_adv "${adj_delayed_triplet_success_gate_min_adv}" \
+  --adj_delayed_triplet_success_gate_scale "${adj_delayed_triplet_success_gate_scale}" \
+  --adj_delayed_triplet_success_gate_floor "${adj_delayed_triplet_success_gate_floor}" \
+  --adj_delayed_triplet_future_overlap_min_nodes "${adj_delayed_triplet_future_overlap_min_nodes}" \
+  --adj_delayed_triplet_partial_match_weight "${adj_delayed_triplet_partial_match_weight}" \
+  "${adj_capture_to_win_credit_args[@]}" \
+  --adj_capture_to_win_credit_coef "${adj_capture_to_win_credit_coef}" \
+  --adj_capture_to_win_credit_min_outcome_adv "${adj_capture_to_win_credit_min_outcome_adv}" \
+  --adj_capture_to_win_credit_scale "${adj_capture_to_win_credit_scale}" \
+  --adj_capture_to_win_credit_cap "${adj_capture_to_win_credit_cap}" \
   "${adj_order3_credit_gate_args[@]}" \
   --adj_order3_credit_gate_loss_scale "${adj_order3_credit_gate_loss_scale}" \
   --adj_order3_credit_gate_margin "${adj_order3_credit_gate_margin}" \
@@ -340,6 +443,9 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" "${script_dir}/train/train_wolfpac
   --adj_recent_window_recover_stale_threshold "${adj_recent_window_recover_stale_threshold}" \
   --adj_recent_window_recover_factor_stale_threshold "${adj_recent_window_recover_factor_stale_threshold}" \
   --adj_recent_window_severe_margin "${adj_recent_window_severe_margin}" \
+  --adj_recent_episode_window_emergency "${adj_recent_episode_window_emergency}" \
+  --adj_recent_window_emergency_stale_threshold "${adj_recent_window_emergency_stale_threshold}" \
+  --adj_recent_window_emergency_factor_stale_threshold "${adj_recent_window_emergency_factor_stale_threshold}" \
   --num_mini_batch 2 \
   --clip_param 0.2 \
   --entropy_coef 0.001 \

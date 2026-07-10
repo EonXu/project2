@@ -371,6 +371,24 @@ def parse_args(args, parser):
         help="Extra stale margin that shrinks recent replay to the minimum.",
     )
     add_missing_option(
+        "--adj_recent_episode_window_emergency",
+        type=int,
+        default=1,
+        help="Near-on-policy recent replay window for emergency high-stale updates.",
+    )
+    add_missing_option(
+        "--adj_recent_window_emergency_stale_threshold",
+        type=float,
+        default=0.45,
+        help="Graph stale threshold for immediate emergency recent-window shrink.",
+    )
+    add_missing_option(
+        "--adj_recent_window_emergency_factor_stale_threshold",
+        type=float,
+        default=0.35,
+        help="Factor stale threshold for immediate emergency recent-window shrink.",
+    )
+    add_missing_option(
         "--use_adj_triplet_credit_direct_rank",
         action="store_true",
         default=False,
@@ -405,6 +423,93 @@ def parse_args(args, parser):
         type=float,
         default=0.0,
         help="Candidate positive-fraction floor before strong negative rank.",
+    )
+    add_missing_option(
+        "--adj_triplet_graph_return_credit_require_delayed_gate",
+        action="store_true",
+        default=False,
+        help="Require delayed success-window evidence for triplet graph-return credit.",
+    )
+    add_missing_option(
+        "--adj_delayed_triplet_credit_require_future_match",
+        action="store_true",
+        default=False,
+        help=(
+            "Credit delayed triplet rewards only when the same triplet node "
+            "set reappears inside the future credit window."
+        ),
+    )
+    add_missing_option(
+        "--use_adj_delayed_triplet_success_gate",
+        action="store_true",
+        default=False,
+        help="Gate delayed triplet credit by graph-level future-window reward advantage.",
+    )
+    add_missing_option(
+        "--adj_delayed_triplet_success_gate_min_adv",
+        type=float,
+        default=0.0,
+        help="Minimum graph-level future-window advantage for delayed triplet credit.",
+    )
+    add_missing_option(
+        "--adj_delayed_triplet_success_gate_scale",
+        type=float,
+        default=1.0,
+        help="Soft ramp scale for delayed triplet success gating.",
+    )
+    add_missing_option(
+        "--adj_delayed_triplet_success_gate_floor",
+        type=float,
+        default=0.0,
+        help="Minimum valid-transition success-gate weight.",
+    )
+    add_missing_option(
+        "--adj_delayed_triplet_future_overlap_min_nodes",
+        type=int,
+        default=3,
+        help="Minimum overlap for future triplet pursuit-group credit.",
+    )
+    add_missing_option(
+        "--adj_delayed_triplet_partial_match_weight",
+        type=float,
+        default=0.5,
+        help="Credit multiplier for partial future triplet matches.",
+    )
+    add_missing_option(
+        "--use_adj_capture_to_win_credit",
+        action="store_true",
+        default=False,
+        help="Add conservative triplet credit when capture evidence leads to winning episodes.",
+    )
+    add_missing_option(
+        "--adj_capture_to_win_credit_coef",
+        type=float,
+        default=0.0,
+        help="Coefficient for capture-to-win triplet credit.",
+    )
+    add_missing_option(
+        "--adj_capture_to_win_credit_min_outcome_adv",
+        type=float,
+        default=0.5,
+        help="Minimum episode outcome advantage for capture-to-win credit.",
+    )
+    add_missing_option(
+        "--adj_capture_to_win_credit_scale",
+        type=float,
+        default=0.75,
+        help="Soft ramp scale for capture-to-win credit.",
+    )
+    add_missing_option(
+        "--adj_capture_to_win_credit_cap",
+        type=float,
+        default=0.35,
+        help="Credit cap relative to graph-advantage scale for capture-to-win credit.",
+    )
+    add_missing_option(
+        "--adj_capture_to_win_credit_require_future_match",
+        action="store_true",
+        default=False,
+        help="Require future triplet match evidence for capture-to-win credit.",
     )
 
     all_args, unknown_args = parser.parse_known_args(args)

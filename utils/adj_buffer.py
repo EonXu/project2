@@ -11,7 +11,27 @@ def _cast(x):
 class AdjBuffer(object):
     def __init__(self, policy_info, policy_agents, num_factor, buffer_size, episode_length, use_same_share_obs,
                  use_avail_acts, use_reward_normalization=False, gamma=0.97, gae_lambda=0.95, hidden_size=64,
-                 adj_return_adv_coef=1.0, adj_factor_adv_coef=0.0, seed=0):
+                 adj_return_adv_coef=1.0, adj_factor_adv_coef=0.0, seed=0,
+                 use_adj_delayed_triplet_credit=False,
+                 adj_delayed_triplet_credit_coef=0.0,
+                 adj_delayed_triplet_credit_window=0,
+                 adj_delayed_triplet_credit_cap=0.0,
+                 adj_delayed_triplet_credit_min_reward=0.0,
+                 adj_delayed_triplet_credit_positive_only=False,
+                 adj_delayed_triplet_credit_min_adv=0.0,
+                 adj_delayed_triplet_credit_require_future_match=False,
+                 use_adj_delayed_triplet_success_gate=False,
+                 adj_delayed_triplet_success_gate_min_adv=0.0,
+                 adj_delayed_triplet_success_gate_scale=1.0,
+                 adj_delayed_triplet_success_gate_floor=0.0,
+                 adj_delayed_triplet_future_overlap_min_nodes=3,
+                 adj_delayed_triplet_partial_match_weight=0.5,
+                 use_adj_capture_to_win_credit=False,
+                 adj_capture_to_win_credit_coef=0.0,
+                 adj_capture_to_win_credit_min_outcome_adv=0.5,
+                 adj_capture_to_win_credit_scale=0.75,
+                 adj_capture_to_win_credit_cap=0.35,
+                 adj_capture_to_win_credit_require_future_match=False):
         """
         Replay buffer class for training RNN policies. Stores entire episodes rather than single transitions.
 
@@ -43,6 +63,26 @@ class AdjBuffer(object):
                 adj_return_adv_coef,
                 adj_factor_adv_coef,
                 seed=int(seed) + 1000 + i,
+                use_adj_delayed_triplet_credit=use_adj_delayed_triplet_credit,
+                adj_delayed_triplet_credit_coef=adj_delayed_triplet_credit_coef,
+                adj_delayed_triplet_credit_window=adj_delayed_triplet_credit_window,
+                adj_delayed_triplet_credit_cap=adj_delayed_triplet_credit_cap,
+                adj_delayed_triplet_credit_min_reward=adj_delayed_triplet_credit_min_reward,
+                adj_delayed_triplet_credit_positive_only=adj_delayed_triplet_credit_positive_only,
+                adj_delayed_triplet_credit_min_adv=adj_delayed_triplet_credit_min_adv,
+                adj_delayed_triplet_credit_require_future_match=adj_delayed_triplet_credit_require_future_match,
+                use_adj_delayed_triplet_success_gate=use_adj_delayed_triplet_success_gate,
+                adj_delayed_triplet_success_gate_min_adv=adj_delayed_triplet_success_gate_min_adv,
+                adj_delayed_triplet_success_gate_scale=adj_delayed_triplet_success_gate_scale,
+                adj_delayed_triplet_success_gate_floor=adj_delayed_triplet_success_gate_floor,
+                adj_delayed_triplet_future_overlap_min_nodes=adj_delayed_triplet_future_overlap_min_nodes,
+                adj_delayed_triplet_partial_match_weight=adj_delayed_triplet_partial_match_weight,
+                use_adj_capture_to_win_credit=use_adj_capture_to_win_credit,
+                adj_capture_to_win_credit_coef=adj_capture_to_win_credit_coef,
+                adj_capture_to_win_credit_min_outcome_adv=adj_capture_to_win_credit_min_outcome_adv,
+                adj_capture_to_win_credit_scale=adj_capture_to_win_credit_scale,
+                adj_capture_to_win_credit_cap=adj_capture_to_win_credit_cap,
+                adj_capture_to_win_credit_require_future_match=adj_capture_to_win_credit_require_future_match,
             )
             for i, p_id in enumerate(self.policy_info.keys())
         }
@@ -110,7 +150,27 @@ class AdjBuffer(object):
 class AdjPolicyBuffer(object):
     def __init__(self, buffer_size, episode_length, num_agents, num_factor, obs_space, share_obs_space, act_space,
                  use_same_share_obs, use_avail_acts, use_reward_normalization=False, gamma=0.97, gae_lambda=0.95,
-                 hidden_size=64, adj_return_adv_coef=1.0, adj_factor_adv_coef=0.0, seed=0):
+                 hidden_size=64, adj_return_adv_coef=1.0, adj_factor_adv_coef=0.0, seed=0,
+                 use_adj_delayed_triplet_credit=False,
+                 adj_delayed_triplet_credit_coef=0.0,
+                 adj_delayed_triplet_credit_window=0,
+                 adj_delayed_triplet_credit_cap=0.0,
+                 adj_delayed_triplet_credit_min_reward=0.0,
+                 adj_delayed_triplet_credit_positive_only=False,
+                 adj_delayed_triplet_credit_min_adv=0.0,
+                 adj_delayed_triplet_credit_require_future_match=False,
+                 use_adj_delayed_triplet_success_gate=False,
+                 adj_delayed_triplet_success_gate_min_adv=0.0,
+                 adj_delayed_triplet_success_gate_scale=1.0,
+                 adj_delayed_triplet_success_gate_floor=0.0,
+                 adj_delayed_triplet_future_overlap_min_nodes=3,
+                 adj_delayed_triplet_partial_match_weight=0.5,
+                 use_adj_capture_to_win_credit=False,
+                 adj_capture_to_win_credit_coef=0.0,
+                 adj_capture_to_win_credit_min_outcome_adv=0.5,
+                 adj_capture_to_win_credit_scale=0.75,
+                 adj_capture_to_win_credit_cap=0.35,
+                 adj_capture_to_win_credit_require_future_match=False):
         """
         Buffer class containing buffer data corresponding to a single policy.
 
@@ -138,6 +198,77 @@ class AdjPolicyBuffer(object):
         self.hidden_size = hidden_size
         self.adj_return_adv_coef = float(adj_return_adv_coef)
         self.adj_factor_adv_coef = float(adj_factor_adv_coef)
+        self.use_adj_delayed_triplet_credit = bool(
+            use_adj_delayed_triplet_credit
+        )
+        self.adj_delayed_triplet_credit_coef = max(
+            0.0,
+            float(adj_delayed_triplet_credit_coef),
+        )
+        self.adj_delayed_triplet_credit_window = max(
+            0,
+            int(adj_delayed_triplet_credit_window),
+        )
+        self.adj_delayed_triplet_credit_cap = max(
+            0.0,
+            float(adj_delayed_triplet_credit_cap),
+        )
+        self.adj_delayed_triplet_credit_min_reward = float(
+            adj_delayed_triplet_credit_min_reward
+        )
+        self.adj_delayed_triplet_credit_positive_only = bool(
+            adj_delayed_triplet_credit_positive_only
+        )
+        self.adj_delayed_triplet_credit_min_adv = max(
+            0.0,
+            float(adj_delayed_triplet_credit_min_adv),
+        )
+        self.adj_delayed_triplet_credit_require_future_match = bool(
+            adj_delayed_triplet_credit_require_future_match
+        )
+        self.use_adj_delayed_triplet_success_gate = bool(
+            use_adj_delayed_triplet_success_gate
+        )
+        self.adj_delayed_triplet_success_gate_min_adv = float(
+            adj_delayed_triplet_success_gate_min_adv
+        )
+        self.adj_delayed_triplet_success_gate_scale = max(
+            1e-6,
+            float(adj_delayed_triplet_success_gate_scale),
+        )
+        self.adj_delayed_triplet_success_gate_floor = min(
+            1.0,
+            max(0.0, float(adj_delayed_triplet_success_gate_floor)),
+        )
+        self.adj_delayed_triplet_future_overlap_min_nodes = min(
+            3,
+            max(1, int(adj_delayed_triplet_future_overlap_min_nodes)),
+        )
+        self.adj_delayed_triplet_partial_match_weight = min(
+            1.0,
+            max(0.0, float(adj_delayed_triplet_partial_match_weight)),
+        )
+        self.use_adj_capture_to_win_credit = bool(
+            use_adj_capture_to_win_credit
+        )
+        self.adj_capture_to_win_credit_coef = max(
+            0.0,
+            float(adj_capture_to_win_credit_coef),
+        )
+        self.adj_capture_to_win_credit_min_outcome_adv = float(
+            adj_capture_to_win_credit_min_outcome_adv
+        )
+        self.adj_capture_to_win_credit_scale = max(
+            1e-6,
+            float(adj_capture_to_win_credit_scale),
+        )
+        self.adj_capture_to_win_credit_cap = max(
+            0.0,
+            float(adj_capture_to_win_credit_cap),
+        )
+        self.adj_capture_to_win_credit_require_future_match = bool(
+            adj_capture_to_win_credit_require_future_match
+        )
 
         self.rng = np.random.RandomState(int(seed))
         # obs
@@ -184,6 +315,13 @@ class AdjPolicyBuffer(object):
         self.f_v = np.zeros((self.episode_length, self.buffer_size, self.num_factor + self.num_agents, 1),
                             dtype=np.float32)
         self.f_advt = np.zeros((self.episode_length, self.buffer_size, self.num_factor, 1), dtype=np.float32)
+        self.delayed_triplet_credit = np.zeros_like(self.f_advt)
+        self.delayed_triplet_success_gate = np.zeros_like(self.f_advt)
+        self.delayed_triplet_future_match = np.zeros_like(self.f_advt)
+        self.delayed_triplet_future_exact = np.zeros_like(self.f_advt)
+        self.delayed_triplet_future_partial = np.zeros_like(self.f_advt)
+        self.capture_to_win_triplet_credit = np.zeros_like(self.f_advt)
+        self.capture_to_win_quality_gate = np.zeros_like(self.f_advt)
         self.rnn_obs = np.zeros((self.episode_length + 1, self.buffer_size, self.num_agents, self.hidden_size),
                                 dtype=np.float32)
 
@@ -216,6 +354,13 @@ class AdjPolicyBuffer(object):
         reference_idx = np.arange(self.filled_i, dtype=np.int64)
         episode_idx = reference_idx
         self.f_advt[:, episode_idx] = 0.0
+        self.delayed_triplet_credit[:, episode_idx] = 0.0
+        self.delayed_triplet_success_gate[:, episode_idx] = 0.0
+        self.delayed_triplet_future_match[:, episode_idx] = 0.0
+        self.delayed_triplet_future_exact[:, episode_idx] = 0.0
+        self.delayed_triplet_future_partial[:, episode_idx] = 0.0
+        self.capture_to_win_triplet_credit[:, episode_idx] = 0.0
+        self.capture_to_win_quality_gate[:, episode_idx] = 0.0
         obs_ref = np.take(
             self.obs[:-1],
             reference_idx,
@@ -402,13 +547,460 @@ class AdjPolicyBuffer(object):
         else:
             local_adv = np.zeros_like(local_adv, dtype=np.float32)
 
+        delayed_triplet_credit = np.zeros_like(local_adv, dtype=np.float32)
+        delayed_triplet_success_gate = np.zeros_like(local_adv, dtype=np.float32)
+        delayed_triplet_future_match = np.zeros_like(local_adv, dtype=np.float32)
+        delayed_triplet_future_exact = np.zeros_like(local_adv, dtype=np.float32)
+        delayed_triplet_future_partial = np.zeros_like(local_adv, dtype=np.float32)
+        if (
+            self.use_adj_delayed_triplet_credit
+            and self.adj_delayed_triplet_credit_coef > 0.0
+            and self.adj_delayed_triplet_credit_window > 0
+        ):
+            reward_signal = (
+                team_rewards_ref
+                - float(self.adj_delayed_triplet_credit_min_reward)
+            ).astype(np.float32, copy=False)
+            reward_signal = np.maximum(reward_signal, 0.0)
+            window = int(self.adj_delayed_triplet_credit_window)
+            triplet_factor_mask = valid_factor & (factor_size == 3)
+            success_gate = np.ones_like(reward_signal, dtype=np.float32)
+            if self.use_adj_delayed_triplet_success_gate:
+                graph_delayed_signal = np.zeros_like(
+                    reward_signal,
+                    dtype=np.float32,
+                )
+                for step in range(self.episode_length):
+                    discount = 1.0
+                    alive = np.ones(reference_idx.size, dtype=np.float32)
+                    for offset in range(window):
+                        future_step = step + offset
+                        if future_step >= self.episode_length:
+                            break
+                        graph_delayed_signal[step] += (
+                            discount
+                            * alive
+                            * reward_signal[future_step]
+                        )
+                        alive *= (
+                            1.0
+                            - dones_env_ref[future_step].astype(np.float32)
+                        )
+                        discount *= float(self.gamma)
+
+                graph_delayed_adv = np.zeros_like(
+                    graph_delayed_signal,
+                    dtype=np.float32,
+                )
+                for step in range(self.episode_length):
+                    step_rosters = active_count_ref[step]
+                    for roster_size in np.unique(step_rosters):
+                        roster_mask = step_rosters == roster_size
+                        roster_values = graph_delayed_signal[
+                            step,
+                            roster_mask,
+                        ]
+                        if roster_values.size > 1:
+                            baseline = float(roster_values.mean())
+                        else:
+                            baseline = float(roster_values[0])
+                        graph_delayed_adv[step, roster_mask] = (
+                            roster_values - baseline
+                        )
+                graph_delayed_adv = _standardize_valid(
+                    graph_delayed_adv,
+                    valid_graph_transition,
+                )
+                success_gate = (
+                    (
+                        graph_delayed_adv
+                        - float(self.adj_delayed_triplet_success_gate_min_adv)
+                    )
+                    / float(self.adj_delayed_triplet_success_gate_scale)
+                )
+                success_gate = np.clip(success_gate, 0.0, 1.0).astype(
+                    np.float32,
+                    copy=False,
+                )
+                if self.adj_delayed_triplet_success_gate_floor > 0.0:
+                    gate_floor = float(
+                        self.adj_delayed_triplet_success_gate_floor
+                    )
+                    success_gate = (
+                        gate_floor
+                        + (1.0 - gate_floor) * success_gate
+                    ).astype(np.float32, copy=False)
+                success_gate[~valid_graph_transition] = 0.0
+            if self.adj_delayed_triplet_credit_require_future_match:
+                delayed_signal = np.zeros_like(local_adv, dtype=np.float32)
+                triplet_sets = []
+                for step in range(self.episode_length):
+                    step_sets = []
+                    for ep_pos in range(reference_idx.size):
+                        factor_sets = []
+                        for factor_idx in range(self.num_factor):
+                            if not triplet_factor_mask[
+                                step,
+                                ep_pos,
+                                factor_idx,
+                            ]:
+                                continue
+                            nodes = tuple(
+                                np.flatnonzero(
+                                    current_adj[
+                                        step,
+                                        ep_pos,
+                                        :,
+                                        factor_idx,
+                                    ] > 0
+                                ).tolist()
+                            )
+                            if len(nodes) == 3:
+                                factor_sets.append(nodes)
+                        step_sets.append(factor_sets)
+                    triplet_sets.append(step_sets)
+
+                min_overlap = int(
+                    self.adj_delayed_triplet_future_overlap_min_nodes
+                )
+                partial_match_weight = float(
+                    self.adj_delayed_triplet_partial_match_weight
+                )
+                for step in range(self.episode_length):
+                    for ep_pos in range(reference_idx.size):
+                        current_triplets = {}
+                        for factor_idx in range(self.num_factor):
+                            if not triplet_factor_mask[
+                                step,
+                                ep_pos,
+                                factor_idx,
+                            ]:
+                                continue
+                            nodes = tuple(
+                                np.flatnonzero(
+                                    current_adj[
+                                        step,
+                                        ep_pos,
+                                        :,
+                                        factor_idx,
+                                    ] > 0
+                                ).tolist()
+                            )
+                            if len(nodes) == 3:
+                                current_triplets[factor_idx] = nodes
+                        if not current_triplets:
+                            continue
+                        discount = 1.0
+                        for offset in range(window):
+                            future_step = step + offset
+                            if future_step >= self.episode_length:
+                                break
+                            future_reward = float(
+                                reward_signal[future_step, ep_pos]
+                            )
+                            if future_reward > 0.0:
+                                future_sets = triplet_sets[
+                                    future_step
+                                ][ep_pos]
+                                for factor_idx, nodes in (
+                                    current_triplets.items()
+                                ):
+                                    match_weight = 0.0
+                                    node_set = set(nodes)
+                                    for future_nodes in future_sets:
+                                        overlap = len(
+                                            node_set.intersection(future_nodes)
+                                        )
+                                        if overlap < min_overlap:
+                                            continue
+                                        if overlap >= 3:
+                                            match_weight = 1.0
+                                            break
+                                        match_weight = max(
+                                            match_weight,
+                                            partial_match_weight,
+                                        )
+                                    if match_weight > 0.0:
+                                        delayed_triplet_future_match[
+                                            step,
+                                            ep_pos,
+                                            factor_idx,
+                                        ] = max(
+                                            delayed_triplet_future_match[
+                                                step,
+                                                ep_pos,
+                                                factor_idx,
+                                            ],
+                                            match_weight,
+                                        )
+                                        if match_weight >= 1.0:
+                                            delayed_triplet_future_exact[
+                                                step,
+                                                ep_pos,
+                                                factor_idx,
+                                            ] = 1.0
+                                        else:
+                                            delayed_triplet_future_partial[
+                                                step,
+                                                ep_pos,
+                                                factor_idx,
+                                            ] = 1.0
+                                        delayed_signal[
+                                            step,
+                                            ep_pos,
+                                            factor_idx,
+                                        ] += (
+                                            discount
+                                            * future_reward
+                                            * match_weight
+                                        )
+                            if dones_env_ref[future_step, ep_pos] >= 0.5:
+                                break
+                            discount *= float(self.gamma)
+
+                delayed_adv = np.zeros_like(delayed_signal, dtype=np.float32)
+                for step in range(self.episode_length):
+                    step_rosters = active_count_ref[step]
+                    for roster_size in np.unique(step_rosters):
+                        roster_mask = step_rosters == roster_size
+                        factor_mask = (
+                            triplet_factor_mask[step]
+                            & roster_mask[:, None]
+                        )
+                        factor_values = delayed_signal[step][factor_mask]
+                        if factor_values.size == 0:
+                            continue
+                        if factor_values.size > 1:
+                            baseline = float(factor_values.mean())
+                        else:
+                            baseline = float(factor_values[0])
+                        delayed_adv[step][factor_mask] = (
+                            delayed_signal[step][factor_mask]
+                            - baseline
+                        )
+                delayed_adv = _standardize_valid(
+                    delayed_adv,
+                    triplet_factor_mask,
+                )
+            else:
+                delayed_signal = np.zeros_like(reward_signal, dtype=np.float32)
+                for step in range(self.episode_length):
+                    discount = 1.0
+                    alive = np.ones(reference_idx.size, dtype=np.float32)
+                    for offset in range(window):
+                        future_step = step + offset
+                        if future_step >= self.episode_length:
+                            break
+                        delayed_signal[step] += (
+                            discount
+                            * alive
+                            * reward_signal[future_step]
+                        )
+                        alive *= (
+                            1.0
+                            - dones_env_ref[future_step].astype(np.float32)
+                        )
+                        discount *= float(self.gamma)
+                delayed_adv = np.zeros_like(delayed_signal, dtype=np.float32)
+                for step in range(self.episode_length):
+                    step_rosters = active_count_ref[step]
+                    for roster_size in np.unique(step_rosters):
+                        roster_mask = step_rosters == roster_size
+                        roster_values = delayed_signal[step, roster_mask]
+                        if roster_values.size > 1:
+                            baseline = float(roster_values.mean())
+                        else:
+                            baseline = float(roster_values[0])
+                        delayed_adv[step, roster_mask] = (
+                            roster_values - baseline
+                        )
+                delayed_adv = _standardize_valid(
+                    delayed_adv,
+                    valid_graph_transition,
+                )
+            min_delayed_adv = float(self.adj_delayed_triplet_credit_min_adv)
+            if self.adj_delayed_triplet_credit_positive_only:
+                delayed_adv = np.maximum(
+                    delayed_adv - min_delayed_adv,
+                    0.0,
+                )
+            elif min_delayed_adv > 0.0:
+                delayed_adv = np.where(
+                    np.abs(delayed_adv) >= min_delayed_adv,
+                    delayed_adv,
+                    0.0,
+                )
+            delayed_triplet_credit = (
+                delayed_adv
+                if self.adj_delayed_triplet_credit_require_future_match
+                else delayed_adv[:, :, None]
+            )
+            delayed_triplet_success_gate = (
+                success_gate[:, :, None]
+                * triplet_factor_mask.astype(np.float32)
+            )
+            delayed_triplet_credit = (
+                delayed_triplet_credit
+                * delayed_triplet_success_gate
+            )
+            delayed_triplet_credit = (
+                delayed_triplet_credit
+                * triplet_factor_mask.astype(np.float32)
+                * float(self.adj_delayed_triplet_credit_coef)
+            )
+            if self.adj_delayed_triplet_credit_cap > 0.0:
+                delayed_triplet_credit = np.clip(
+                    delayed_triplet_credit,
+                    -float(self.adj_delayed_triplet_credit_cap),
+                    float(self.adj_delayed_triplet_credit_cap),
+                )
+
+        capture_to_win_triplet_credit = np.zeros_like(
+            local_adv,
+            dtype=np.float32,
+        )
+        capture_to_win_quality_gate = np.zeros_like(
+            local_adv,
+            dtype=np.float32,
+        )
+        if (
+            self.use_adj_capture_to_win_credit
+            and self.adj_capture_to_win_credit_coef > 0.0
+        ):
+            valid_episode = valid_graph_transition.any(axis=0)
+            episode_return = team_rewards_ref.sum(axis=0).astype(
+                np.float32,
+                copy=False,
+            )
+            episode_outcome_adv = np.zeros_like(
+                episode_return,
+                dtype=np.float32,
+            )
+            valid_returns = episode_return[valid_episode]
+            if valid_returns.size > 1:
+                outcome_mean = float(valid_returns.mean())
+                outcome_std = float(valid_returns.std())
+                if not np.isfinite(outcome_std) or outcome_std < 1e-5:
+                    outcome_std = 1.0
+                episode_outcome_adv[valid_episode] = (
+                    (valid_returns - outcome_mean)
+                    / (outcome_std + 1e-5)
+                )
+            outcome_gate = (
+                (
+                    episode_outcome_adv
+                    - float(self.adj_capture_to_win_credit_min_outcome_adv)
+                )
+                / float(self.adj_capture_to_win_credit_scale)
+            )
+            outcome_gate = np.clip(outcome_gate, 0.0, 1.0).astype(
+                np.float32,
+                copy=False,
+            )
+            outcome_gate[~valid_episode] = 0.0
+
+            selective_success_gate = delayed_triplet_success_gate.copy()
+            if self.use_adj_delayed_triplet_success_gate:
+                gate_floor = float(self.adj_delayed_triplet_success_gate_floor)
+                if 0.0 < gate_floor < 1.0:
+                    selective_success_gate = np.clip(
+                        (selective_success_gate - gate_floor)
+                        / (1.0 - gate_floor),
+                        0.0,
+                        1.0,
+                    )
+                elif gate_floor >= 1.0:
+                    selective_success_gate = np.zeros_like(
+                        selective_success_gate,
+                        dtype=np.float32,
+                    )
+
+            if self.adj_capture_to_win_credit_require_future_match:
+                future_match_gate = delayed_triplet_future_match
+            else:
+                future_match_gate = triplet_factor_mask.astype(np.float32)
+            capture_to_win_quality_gate = (
+                outcome_gate[None, :, None]
+                * selective_success_gate
+                * future_match_gate
+                * triplet_factor_mask.astype(np.float32)
+            ).astype(np.float32, copy=False)
+
+            graph_positive_credit = np.maximum(
+                graph_adv[:, :, None],
+                0.0,
+            ).astype(np.float32, copy=False)
+            capture_to_win_triplet_credit = (
+                capture_to_win_quality_gate
+                * graph_positive_credit
+                * float(self.adj_capture_to_win_credit_coef)
+            )
+            if self.adj_capture_to_win_credit_cap > 0.0:
+                valid_abs_graph = np.abs(graph_adv[valid_graph_transition])
+                graph_abs_scale = (
+                    float(valid_abs_graph.mean())
+                    if valid_abs_graph.size > 0
+                    else 1.0
+                )
+                if not np.isfinite(graph_abs_scale) or graph_abs_scale < 1e-6:
+                    graph_abs_scale = 1.0
+                credit_cap = (
+                    graph_abs_scale
+                    * float(self.adj_capture_to_win_credit_cap)
+                )
+                capture_to_win_triplet_credit = np.clip(
+                    capture_to_win_triplet_credit,
+                    0.0,
+                    credit_cap,
+                )
+
         combined_adv = (
             self.adj_return_adv_coef * graph_factor_adv
             + self.adj_factor_adv_coef * local_adv
+            + delayed_triplet_credit
+            + capture_to_win_triplet_credit
         )
         combined_adv[~valid_factor] = 0.0
         f_advt_values = self.f_advt[..., 0]
         f_advt_values[:, episode_idx, :] = combined_adv
+        delayed_triplet_values = self.delayed_triplet_credit[..., 0]
+        delayed_triplet_values[:, episode_idx, :] = delayed_triplet_credit
+        delayed_triplet_success_gate_values = (
+            self.delayed_triplet_success_gate[..., 0]
+        )
+        delayed_triplet_success_gate_values[:, episode_idx, :] = (
+            delayed_triplet_success_gate
+        )
+        delayed_triplet_future_match_values = (
+            self.delayed_triplet_future_match[..., 0]
+        )
+        delayed_triplet_future_match_values[:, episode_idx, :] = (
+            delayed_triplet_future_match
+        )
+        delayed_triplet_future_exact_values = (
+            self.delayed_triplet_future_exact[..., 0]
+        )
+        delayed_triplet_future_exact_values[:, episode_idx, :] = (
+            delayed_triplet_future_exact
+        )
+        delayed_triplet_future_partial_values = (
+            self.delayed_triplet_future_partial[..., 0]
+        )
+        delayed_triplet_future_partial_values[:, episode_idx, :] = (
+            delayed_triplet_future_partial
+        )
+        capture_to_win_credit_values = (
+            self.capture_to_win_triplet_credit[..., 0]
+        )
+        capture_to_win_credit_values[:, episode_idx, :] = (
+            capture_to_win_triplet_credit
+        )
+        capture_to_win_quality_gate_values = (
+            self.capture_to_win_quality_gate[..., 0]
+        )
+        capture_to_win_quality_gate_values[:, episode_idx, :] = (
+            capture_to_win_quality_gate
+        )
 
         return idx
 
@@ -658,6 +1250,41 @@ class AdjPolicyBuffer(object):
         advantages = advantage.transpose(1, 0, 2).reshape(batch_size, -1)
 
         f_advt = np.take(self.f_advt, episode_indices, axis=1)
+        delayed_triplet_credit = np.take(
+            self.delayed_triplet_credit,
+            episode_indices,
+            axis=1,
+        )
+        delayed_triplet_success_gate = np.take(
+            self.delayed_triplet_success_gate,
+            episode_indices,
+            axis=1,
+        )
+        delayed_triplet_future_match = np.take(
+            self.delayed_triplet_future_match,
+            episode_indices,
+            axis=1,
+        )
+        delayed_triplet_future_exact = np.take(
+            self.delayed_triplet_future_exact,
+            episode_indices,
+            axis=1,
+        )
+        delayed_triplet_future_partial = np.take(
+            self.delayed_triplet_future_partial,
+            episode_indices,
+            axis=1,
+        )
+        capture_to_win_triplet_credit = np.take(
+            self.capture_to_win_triplet_credit,
+            episode_indices,
+            axis=1,
+        )
+        capture_to_win_quality_gate = np.take(
+            self.capture_to_win_quality_gate,
+            episode_indices,
+            axis=1,
+        )
 
         # Identify valid selected factors. Advantages were already normalized
         # once per structured graph action in compute_advantage().
@@ -682,6 +1309,114 @@ class AdjPolicyBuffer(object):
         f_advt[~valid_factor[..., None]] = 0.0
         f_advt = np.clip(f_advt, -5.0, 5.0)
         f_advts = f_advt.transpose(1, 0, 2, 3).reshape(batch_size, self.num_factor, -1)
+        delayed_triplet_credit = np.where(
+            np.isfinite(delayed_triplet_credit),
+            delayed_triplet_credit,
+            0.0,
+        ).astype(np.float32, copy=False)
+        delayed_triplet_credit[~valid_factor[..., None]] = 0.0
+        delayed_triplet_credit = np.clip(delayed_triplet_credit, -5.0, 5.0)
+        delayed_triplet_credits = (
+            delayed_triplet_credit
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_factor, -1)
+        )
+        delayed_triplet_success_gate = np.where(
+            np.isfinite(delayed_triplet_success_gate),
+            delayed_triplet_success_gate,
+            0.0,
+        ).astype(np.float32, copy=False)
+        delayed_triplet_success_gate[~valid_factor[..., None]] = 0.0
+        delayed_triplet_success_gate = np.clip(
+            delayed_triplet_success_gate,
+            0.0,
+            1.0,
+        )
+        delayed_triplet_success_gates = (
+            delayed_triplet_success_gate
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_factor, -1)
+        )
+        delayed_triplet_future_match = np.where(
+            np.isfinite(delayed_triplet_future_match),
+            delayed_triplet_future_match,
+            0.0,
+        ).astype(np.float32, copy=False)
+        delayed_triplet_future_match[~valid_factor[..., None]] = 0.0
+        delayed_triplet_future_match = np.clip(
+            delayed_triplet_future_match,
+            0.0,
+            1.0,
+        )
+        delayed_triplet_future_matches = (
+            delayed_triplet_future_match
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_factor, -1)
+        )
+        delayed_triplet_future_exact = np.where(
+            np.isfinite(delayed_triplet_future_exact),
+            delayed_triplet_future_exact,
+            0.0,
+        ).astype(np.float32, copy=False)
+        delayed_triplet_future_exact[~valid_factor[..., None]] = 0.0
+        delayed_triplet_future_exact = np.clip(
+            delayed_triplet_future_exact,
+            0.0,
+            1.0,
+        )
+        delayed_triplet_future_exacts = (
+            delayed_triplet_future_exact
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_factor, -1)
+        )
+        delayed_triplet_future_partial = np.where(
+            np.isfinite(delayed_triplet_future_partial),
+            delayed_triplet_future_partial,
+            0.0,
+        ).astype(np.float32, copy=False)
+        delayed_triplet_future_partial[~valid_factor[..., None]] = 0.0
+        delayed_triplet_future_partial = np.clip(
+            delayed_triplet_future_partial,
+            0.0,
+            1.0,
+        )
+        delayed_triplet_future_partials = (
+            delayed_triplet_future_partial
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_factor, -1)
+        )
+        capture_to_win_triplet_credit = np.where(
+            np.isfinite(capture_to_win_triplet_credit),
+            capture_to_win_triplet_credit,
+            0.0,
+        ).astype(np.float32, copy=False)
+        capture_to_win_triplet_credit[~valid_factor[..., None]] = 0.0
+        capture_to_win_triplet_credit = np.clip(
+            capture_to_win_triplet_credit,
+            -5.0,
+            5.0,
+        )
+        capture_to_win_triplet_credits = (
+            capture_to_win_triplet_credit
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_factor, -1)
+        )
+        capture_to_win_quality_gate = np.where(
+            np.isfinite(capture_to_win_quality_gate),
+            capture_to_win_quality_gate,
+            0.0,
+        ).astype(np.float32, copy=False)
+        capture_to_win_quality_gate[~valid_factor[..., None]] = 0.0
+        capture_to_win_quality_gate = np.clip(
+            capture_to_win_quality_gate,
+            0.0,
+            1.0,
+        )
+        capture_to_win_quality_gates = (
+            capture_to_win_quality_gate
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_factor, -1)
+        )
 
         dones = dones.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
         dones_env = dones_env.transpose(1, 0, 2).reshape(batch_size, -1)
@@ -711,6 +1446,13 @@ class AdjPolicyBuffer(object):
             prob_adj_batch = []
             advantages_batch = []
             f_advts_batch = []
+            delayed_triplet_credit_batch = []
+            delayed_triplet_success_gate_batch = []
+            delayed_triplet_future_match_batch = []
+            delayed_triplet_future_exact_batch = []
+            delayed_triplet_future_partial_batch = []
+            capture_to_win_triplet_credit_batch = []
+            capture_to_win_quality_gate_batch = []
             rnn_obs_batch = []
 
             for i in indices:
@@ -723,6 +1465,27 @@ class AdjPolicyBuffer(object):
                 prob_adj_batch.append(prob_adj[ind:ind + data_chunk_length])
                 advantages_batch.append(advantages[ind:ind + data_chunk_length])
                 f_advts_batch.append(f_advts[ind:ind + data_chunk_length])
+                delayed_triplet_credit_batch.append(
+                    delayed_triplet_credits[ind:ind + data_chunk_length]
+                )
+                delayed_triplet_success_gate_batch.append(
+                    delayed_triplet_success_gates[ind:ind + data_chunk_length]
+                )
+                delayed_triplet_future_match_batch.append(
+                    delayed_triplet_future_matches[ind:ind + data_chunk_length]
+                )
+                delayed_triplet_future_exact_batch.append(
+                    delayed_triplet_future_exacts[ind:ind + data_chunk_length]
+                )
+                delayed_triplet_future_partial_batch.append(
+                    delayed_triplet_future_partials[ind:ind + data_chunk_length]
+                )
+                capture_to_win_triplet_credit_batch.append(
+                    capture_to_win_triplet_credits[ind:ind + data_chunk_length]
+                )
+                capture_to_win_quality_gate_batch.append(
+                    capture_to_win_quality_gates[ind:ind + data_chunk_length]
+                )
                 rnn_obs_batch.append(rnn_obs[ind:ind + data_chunk_length])
 
             yield (
@@ -734,5 +1497,12 @@ class AdjPolicyBuffer(object):
                 np.stack(prob_adj_batch, axis=0),
                 np.stack(advantages_batch, axis=0),
                 np.stack(f_advts_batch, axis=0),
+                np.stack(delayed_triplet_credit_batch, axis=0),
+                np.stack(delayed_triplet_success_gate_batch, axis=0),
+                np.stack(delayed_triplet_future_match_batch, axis=0),
+                np.stack(delayed_triplet_future_exact_batch, axis=0),
+                np.stack(delayed_triplet_future_partial_batch, axis=0),
+                np.stack(capture_to_win_triplet_credit_batch, axis=0),
+                np.stack(capture_to_win_quality_gate_batch, axis=0),
                 np.stack(rnn_obs_batch, axis=0),
             )

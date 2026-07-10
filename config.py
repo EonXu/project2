@@ -7,7 +7,7 @@ def get_config():
 
     # prepare parameters
     parser.add_argument("--algorithm_name", type=str, default="ddfg", choices=[
-                         "qtran","qplex","wqmix","qmix", "vdn","ddfg","sopcg","casec","sddfg"])
+        "qtran", "qplex", "wqmix", "qmix", "vdn", "ddfg", "sopcg", "casec", "sddfg"])
     parser.add_argument("--experiment_name", type=str, default="check")
     parser.add_argument("--seed", type=int, default=1,
                         help="Random seed for numpy/torch")
@@ -16,7 +16,7 @@ def get_config():
                         action='store_false', default=True)
     parser.add_argument('--n_training_threads', type=int,
                         default=1, help="Number of torch threads for training")
-    parser.add_argument('--n_eval_rollout_threads', type=int,  default=1,
+    parser.add_argument('--n_eval_rollout_threads', type=int, default=1,
                         help="Number of parallel envs for evaluating rollout")
     parser.add_argument('--num_env_steps', type=int,
                         default=2000000, help="Number of env steps to train for")
@@ -53,7 +53,7 @@ def get_config():
                         help="Whether to use popart to normalize the target loss")
     parser.add_argument('--popart_update_interval_step', type=int, default=2,
                         help="After how many train steps popart should be updated")
-                        
+
     # prioritized experience replay
     parser.add_argument('--use_per', action='store_true', default=False,
                         help="Whether to use prioritized experience replay")
@@ -66,7 +66,7 @@ def get_config():
     parser.add_argument('--per_beta_start', type=float, default=0.4,
                         help="Starting beta term for prioritized experience replay")
 
-    # network parameters  
+    # network parameters
     parser.add_argument("--use_centralized_Q", action='store_false',
                         default=True, help="Whether to use centralized Q function")
     parser.add_argument('--share_policy', action='store_false',
@@ -156,7 +156,8 @@ def get_config():
     # sddfg parameters
     parser.add_argument("--gat_heads", type=int, default=4, help="Number of multi-head attention for GAT")
     parser.add_argument("--gat_negative_slope", type=float, default=0.2, help="LeakyReLU negative slope in GAT")
-    parser.add_argument( "--gat_hyperedge_hidden",type=int,default=32,help="Hidden dimension of pair-to-hyperedge scorer for 3-order SDDFG")
+    parser.add_argument("--gat_hyperedge_hidden", type=int, default=32,
+                        help="Hidden dimension of pair-to-hyperedge scorer for 3-order SDDFG")
     parser.add_argument(
         "--adj_order3_bonus",
         type=float,
@@ -631,6 +632,259 @@ def get_config():
         ),
     )
     parser.add_argument(
+        "--use_adj_triplet_graph_return_credit",
+        action="store_true",
+        default=False,
+        help=(
+            "Route a bounded portion of positive graph-level return "
+            "advantage back to selected triplet factors before order-aware "
+            "weighting and triplet credit EMA updates. This keeps delayed "
+            "capture/win payoff from being erased when the local triplet "
+            "residual is negative."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_graph_return_credit_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Coefficient applied to positive graph advantage when "
+            "--use_adj_triplet_graph_return_credit is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_graph_return_credit_cap",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum supplemental triplet credit as a multiple of the batch "
+            "mean absolute graph advantage. Zero disables the cap."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_graph_return_credit_min_graph_adv",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum graph advantage that must be exceeded before routing "
+            "graph-return credit to selected triplet factors."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_graph_return_credit_raw_gate_scale",
+        type=float,
+        default=0.0,
+        help=(
+            "If positive, down-weight graph-return triplet credit for factors "
+            "whose raw local residual is negative. The gate reaches zero at "
+            "-scale times the batch mean absolute graph advantage and one at "
+            "zero residual."
+        ),
+    )
+    parser.add_argument(
+        "--adj_triplet_graph_return_credit_require_delayed_gate",
+        action="store_true",
+        default=False,
+        help=(
+            "Require delayed success-window evidence before graph-return "
+            "credit can promote a selected triplet. This prevents positive "
+            "graph returns from broadly rewarding triplets that did not "
+            "participate in the later success window."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_delayed_triplet_credit",
+        action="store_true",
+        default=False,
+        help=(
+            "Add a triplet-only adjacency credit component from positive "
+            "training rewards observed in a short future window. This spreads "
+            "capture/success payoff to preceding triplet topology decisions "
+            "without using evaluation-only information."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_credit_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Coefficient for the delayed positive-reward triplet credit "
+            "component."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_credit_window",
+        type=int,
+        default=0,
+        help=(
+            "Number of future environment steps used to spread positive "
+            "reward back to selected triplet factors."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_credit_cap",
+        type=float,
+        default=0.0,
+        help=(
+            "Absolute cap applied after scaling delayed triplet credit. Zero "
+            "leaves it uncapped."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_credit_min_reward",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-step team reward threshold subtracted before positive "
+            "future rewards are spread to triplet factors."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_credit_positive_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep only delayed triplet credit from future windows whose "
+            "baseline-normalized delayed reward is positive. This prevents "
+            "near-ubiquitous negative/zero-mean delayed noise from dominating "
+            "the triplet scorer."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_credit_min_adv",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum standardized delayed reward advantage required before "
+            "a future reward window contributes triplet credit."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_credit_require_future_match",
+        action="store_true",
+        default=False,
+        help=(
+            "Credit a selected triplet from delayed positive rewards only "
+            "when the same triplet node set appears again inside the future "
+            "credit window. This makes delayed triplet credit graph-conditioned "
+            "instead of broadcasting future reward to every selected triplet."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_delayed_triplet_success_gate",
+        action="store_true",
+        default=False,
+        help=(
+            "Gate delayed triplet credit by a graph-level future reward "
+            "window advantage. This keeps triplet delayed credit focused on "
+            "success-like high-return windows while using only training "
+            "rollout rewards."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_success_gate_min_adv",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum standardized graph-level future-window advantage before "
+            "delayed triplet credit passes the success gate."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_success_gate_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Soft ramp width for the delayed triplet success gate. The gate "
+            "is clipped to [0, 1] after subtracting the minimum advantage."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_success_gate_floor",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum nonzero success-gate weight for valid graph transitions "
+            "when success gating is enabled. This makes success-window "
+            "credit a soft weighting instead of a hard filter."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_future_overlap_min_nodes",
+        type=int,
+        default=3,
+        help=(
+            "Minimum node overlap between a current triplet and a future "
+            "triplet before future-window reward can be spread back. Use 3 "
+            "for exact future match, or 2 for connected pursuit-group credit."
+        ),
+    )
+    parser.add_argument(
+        "--adj_delayed_triplet_partial_match_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Credit multiplier used when delayed triplet future matching "
+            "passes by partial overlap rather than exact triplet identity."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_capture_to_win_credit",
+        action="store_true",
+        default=False,
+        help=(
+            "Add a conservative triplet credit term only when the whole "
+            "training episode has above-baseline return. This ties delayed "
+            "triplet promotion to capture-to-win quality rather than any "
+            "future positive reward in isolation."
+        ),
+    )
+    parser.add_argument(
+        "--adj_capture_to_win_credit_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Coefficient for capture-to-win triplet credit. Zero disables "
+            "the term even if --use_adj_capture_to_win_credit is present."
+        ),
+    )
+    parser.add_argument(
+        "--adj_capture_to_win_credit_min_outcome_adv",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum standardized episode return advantage before a triplet "
+            "can receive capture-to-win credit."
+        ),
+    )
+    parser.add_argument(
+        "--adj_capture_to_win_credit_scale",
+        type=float,
+        default=0.75,
+        help=(
+            "Soft ramp width for the episode-outcome quality gate used by "
+            "capture-to-win triplet credit."
+        ),
+    )
+    parser.add_argument(
+        "--adj_capture_to_win_credit_cap",
+        type=float,
+        default=0.35,
+        help=(
+            "Maximum capture-to-win credit as a multiple of batch mean "
+            "absolute graph advantage. Zero leaves the term uncapped."
+        ),
+    )
+    parser.add_argument(
+        "--adj_capture_to_win_credit_require_future_match",
+        action="store_true",
+        default=False,
+        help=(
+            "Require the current triplet to reappear or overlap in the "
+            "future success window before capture-to-win credit is applied."
+        ),
+    )
+    parser.add_argument(
         "--adj_exploration_mix",
         type=float,
         default=0.0,
@@ -771,6 +1025,34 @@ def get_config():
         ),
     )
     parser.add_argument(
+        "--adj_recent_episode_window_emergency",
+        type=int,
+        default=1,
+        help=(
+            "Near-on-policy recent episode window used immediately when "
+            "graph or factor stale ratios exceed the emergency thresholds. "
+            "Ignored unless --use_adj_dynamic_recent_window is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_emergency_stale_threshold",
+        type=float,
+        default=0.45,
+        help=(
+            "Graph stale-ratio threshold that immediately switches adjacency "
+            "PPO sampling to adj_recent_episode_window_emergency."
+        ),
+    )
+    parser.add_argument(
+        "--adj_recent_window_emergency_factor_stale_threshold",
+        type=float,
+        default=0.35,
+        help=(
+            "Factor stale-ratio threshold that immediately switches adjacency "
+            "PPO sampling to adj_recent_episode_window_emergency."
+        ),
+    )
+    parser.add_argument(
         "--use_adj_ppo_stale_trust",
         action="store_true",
         help=(
@@ -833,10 +1115,11 @@ def get_config():
     parser.add_argument("--msg_anytime", action='store_false',
                         default=True, help="Anytime extension of greedy action selection (Kok and Vlassis, 2006)")
     parser.add_argument("--msg_normalized", action='store_false',
-                        default=True, help="Message normalization during greedy action selection (Kok and Vlassis, 2006)")
-    parser.add_argument("--lamda", type=float, default=0, 
+                        default=True,
+                        help="Message normalization during greedy action selection (Kok and Vlassis, 2006)")
+    parser.add_argument("--lamda", type=float, default=0,
                         help="Damping factor for messaging")
-    parser.add_argument("--msg_iterations", type=int, default=8, 
+    parser.add_argument("--msg_iterations", type=int, default=8,
                         help="Number of cycles of factor graph message passing algorithm")
     #     adj network parameters
     parser.add_argument('--adj_hidden_dim', type=int, default=64,
@@ -887,7 +1170,8 @@ def get_config():
             "coefficient is annealed. Zero disables annealing."
         ),
     )
-    parser.add_argument("--use_valuenorm", action='store_true', default=False, help="by default True, use running mean and std to normalize rewards.")
+    parser.add_argument("--use_valuenorm", action='store_true', default=False,
+                        help="by default True, use running mean and std to normalize rewards.")
     parser.add_argument("--use_vfunction", action='store_true', default=False)
     parser.add_argument("--use_epsilon_greedy", action='store_true', default=False)
     parser.add_argument("--pretrain_adj", action='store_true', default=False)
@@ -928,26 +1212,36 @@ def get_config():
     # num_kernel 默认 10
     parser.add_argument("--num_kernel", type=int, default=10, help="Number of kernels in QPLEX attention mixer.")
     # adv_hypernet_embed 默认 64
-    parser.add_argument("--adv_hypernet_embed", type=int, default=64, help="Embedding dimension of QPLEX advantage hypernetwork.")
+    parser.add_argument("--adv_hypernet_embed", type=int, default=64,
+                        help="Embedding dimension of QPLEX advantage hypernetwork.")
     # weighted_head 默认启用（True）
-    parser.add_argument("--weighted_head", action="store_true", default=False, help="Whether to use weighted head in QPLEX.")
+    parser.add_argument("--weighted_head", action="store_true", default=False,
+                        help="Whether to use weighted head in QPLEX.")
     # is_minus_one 默认 True
-    parser.add_argument("--is_minus_one", action="store_true", default=False, help="Whether to use minus-one trick in QPLEX original implementation.")
+    parser.add_argument("--is_minus_one", action="store_true", default=False,
+                        help="Whether to use minus-one trick in QPLEX original implementation.")
     # adv_hypernet_layers 默认 3
-    parser.add_argument("--adv_hypernet_layers", type=int, default=3, help="Number of layers of QPLEX advantage hypernetwork.")
+    parser.add_argument("--adv_hypernet_layers", type=int, default=3,
+                        help="Number of layers of QPLEX advantage hypernetwork.")
     # qplex_qatten 的正则系数，默认 0.001
-    parser.add_argument("--attend_reg_coef", type=float, default=0.001, help="Attention regularization coefficient for QPLEX.")
+    parser.add_argument("--attend_reg_coef", type=float, default=0.001,
+                        help="Attention regularization coefficient for QPLEX.")
     # state_bias 默认启用（True）
-    parser.add_argument("--state_bias", action="store_true", default=False, help="Whether to use state bias in QPLEX mixer.")
+    parser.add_argument("--state_bias", action="store_true", default=False,
+                        help="Whether to use state bias in QPLEX mixer.")
     # mask_dead 默认不启用（False）
-    parser.add_argument("--mask_dead", action="store_true", default=False, help="Whether to mask dead agents in QPLEX original implementation.")
+    parser.add_argument("--mask_dead", action="store_true", default=False,
+                        help="Whether to mask dead agents in QPLEX original implementation.")
     # nonlinear 默认 False（不启用非线性）
-    parser.add_argument("--nonlinear", action="store_true", default=False, help="Whether to use nonlinear transformation in QPLEX.")
+    parser.add_argument("--nonlinear", action="store_true", default=False,
+                        help="Whether to use nonlinear transformation in QPLEX.")
 
     # ==================== 修改点：学习率衰减解耦参数 ====================
-    parser.add_argument("--use_adj_linear_lr_decay",action="store_true",default=False,help="Whether to apply linear lr decay to adj/GAT optimizer. "
-             "If False, adj lr will keep a floor value or stay constant.")
-    parser.add_argument( "--adj_lr_decay_floor",type=float,default=2e-5, help="Minimum lr for adj/GAT optimizer when linear lr decay is used.")
+    parser.add_argument("--use_adj_linear_lr_decay", action="store_true", default=False,
+                        help="Whether to apply linear lr decay to adj/GAT optimizer. "
+                             "If False, adj lr will keep a floor value or stay constant.")
+    parser.add_argument("--adj_lr_decay_floor", type=float, default=2e-5,
+                        help="Minimum lr for adj/GAT optimizer when linear lr decay is used.")
     parser.add_argument(
         "--adj_lr_anneal_steps",
         type=int,
@@ -958,10 +1252,11 @@ def get_config():
             "or set it to the run budget for full-run annealing."
         ),
     )
-    parser.add_argument( "--policy_lr_decay_floor", type=float, default=1e-5, help="Minimum lr for policy optimizer when linear lr decay is used.")
-    parser.add_argument( "--critic_lr_decay_floor",type=float,default=1e-5,help="Minimum lr for critic optimizers when linear lr decay is used.")
+    parser.add_argument("--policy_lr_decay_floor", type=float, default=1e-5,
+                        help="Minimum lr for policy optimizer when linear lr decay is used.")
+    parser.add_argument("--critic_lr_decay_floor", type=float, default=1e-5,
+                        help="Minimum lr for critic optimizers when linear lr decay is used.")
 
-    
     # exploration parameters
     parser.add_argument('--num_random_episodes', type=int, default=5,
                         help="Number of episodes to add to buffer with purely random actions")
@@ -995,7 +1290,7 @@ def get_config():
     # eval parameters
     parser.add_argument('--use_eval', action='store_false',
                         default=True, help="Whether to conduct the evaluation")
-    parser.add_argument('--eval_interval', type=int,  default=10000,
+    parser.add_argument('--eval_interval', type=int, default=10000,
                         help="After how many episodes the policy should be evaled")
     parser.add_argument('--num_eval_episodes', type=int, default=1,
                         help="How many episodes to collect for each eval")
@@ -1006,39 +1301,35 @@ def get_config():
     parser.add_argument('--use_save', action='store_false',
                         default=True, help="Whether to save the model")
 
-
     # log parameters
     parser.add_argument('--log_interval', type=int, default=1000,
                         help="After how many episodes of training the policy model should be saved")
 
     # pretained parameters
     parser.add_argument("--model_dir", type=str, default=None)
-    
+
     # aloha scenario
-    parser.add_argument("--max_list_length", type=int, default=5) 
-      
+    parser.add_argument("--max_list_length", type=int, default=5)
+
     # hallway scenario
-    parser.add_argument("--n_groups", type=int, default=5) 
-    parser.add_argument("--reward_win", type=int, default=1) 
-    
+    parser.add_argument("--n_groups", type=int, default=5)
+    parser.add_argument("--reward_win", type=int, default=1)
+
     # sensor scenario
-    parser.add_argument("--array_height", type=int, default=3) 
-    parser.add_argument("--array_width", type=int, default=5) 
-    parser.add_argument("--n_preys", type=int, default=3) 
-    parser.add_argument("--catch_reward", type=int, default=3) 
-    parser.add_argument("--scan_cost", type=int, default=1) 
-    
+    parser.add_argument("--array_height", type=int, default=3)
+    parser.add_argument("--array_width", type=int, default=5)
+    parser.add_argument("--n_preys", type=int, default=3)
+    parser.add_argument("--catch_reward", type=int, default=3)
+    parser.add_argument("--scan_cost", type=int, default=1)
+
     # gather scenario
-    parser.add_argument("--map_height", type=int, default=3) 
-    parser.add_argument("--map_width", type=int, default=5) 
-    parser.add_argument("--catch_fail_reward", type=int, default=-5) 
-    parser.add_argument("--target_reward", type=float, default=0.000) 
-    parser.add_argument("--other_reward", type=int, default=5) 
-    
+    parser.add_argument("--map_height", type=int, default=3)
+    parser.add_argument("--map_width", type=int, default=5)
+    parser.add_argument("--catch_fail_reward", type=int, default=-5)
+    parser.add_argument("--target_reward", type=float, default=0.000)
+    parser.add_argument("--other_reward", type=int, default=5)
+
     # disperse scenario
     parser.add_argument("--n_hospitals", type=int, default=4)
 
-
-
-    
     return parser

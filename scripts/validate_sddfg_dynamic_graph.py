@@ -60,6 +60,24 @@ def validate_adj_buffer():
             gamma=0.97,
             adj_return_adv_coef=1.0,
             adj_factor_adv_coef=0.25,
+            use_adj_delayed_triplet_credit=True,
+            adj_delayed_triplet_credit_coef=0.25,
+            adj_delayed_triplet_credit_window=3,
+            adj_delayed_triplet_credit_positive_only=True,
+            adj_delayed_triplet_credit_min_adv=0.25,
+            adj_delayed_triplet_credit_require_future_match=True,
+            use_adj_delayed_triplet_success_gate=True,
+            adj_delayed_triplet_success_gate_min_adv=0.50,
+            adj_delayed_triplet_success_gate_scale=0.75,
+            adj_delayed_triplet_success_gate_floor=0.25,
+            adj_delayed_triplet_future_overlap_min_nodes=2,
+            adj_delayed_triplet_partial_match_weight=0.50,
+            use_adj_capture_to_win_credit=True,
+            adj_capture_to_win_credit_coef=0.15,
+            adj_capture_to_win_credit_min_outcome_adv=0.50,
+            adj_capture_to_win_credit_scale=0.75,
+            adj_capture_to_win_credit_cap=0.25,
+            adj_capture_to_win_credit_require_future_match=True,
             seed=11,
         )
         buffer.filled_i = num_episodes
@@ -125,6 +143,9 @@ def validate_adj_buffer():
         assert buffer.last_sample_episode_count == expected_recent
         assert buffer.last_sample_episode_indices.size == expected_recent
         assert recent_samples[0][0].shape[0] >= 1
+        assert len(recent_samples[0]) >= 16
+        assert np.isfinite(recent_samples[0][13]).all()
+        assert np.isfinite(recent_samples[0][14]).all()
 
 
 def validate_scatter_gradient():
@@ -493,6 +514,32 @@ def main():
         adj_order_adv_positive_only=True,
         adj_order_adv_negative_coef=0.20,
         adj_order_adv_require_positive_graph_adv=True,
+        use_adj_triplet_graph_return_credit=True,
+        adj_triplet_graph_return_credit_coef=0.25,
+        adj_triplet_graph_return_credit_cap=0.35,
+        adj_triplet_graph_return_credit_min_graph_adv=0.0,
+        adj_triplet_graph_return_credit_raw_gate_scale=0.75,
+        adj_triplet_graph_return_credit_require_delayed_gate=True,
+        use_adj_delayed_triplet_credit=True,
+        adj_delayed_triplet_credit_coef=0.25,
+        adj_delayed_triplet_credit_window=20,
+        adj_delayed_triplet_credit_cap=0.75,
+        adj_delayed_triplet_credit_min_reward=0.0,
+        adj_delayed_triplet_credit_positive_only=True,
+        adj_delayed_triplet_credit_min_adv=0.25,
+        adj_delayed_triplet_credit_require_future_match=True,
+        use_adj_delayed_triplet_success_gate=True,
+        adj_delayed_triplet_success_gate_min_adv=0.50,
+        adj_delayed_triplet_success_gate_scale=0.75,
+        adj_delayed_triplet_success_gate_floor=0.10,
+        adj_delayed_triplet_future_overlap_min_nodes=2,
+        adj_delayed_triplet_partial_match_weight=0.35,
+        use_adj_capture_to_win_credit=True,
+        adj_capture_to_win_credit_coef=0.15,
+        adj_capture_to_win_credit_min_outcome_adv=0.50,
+        adj_capture_to_win_credit_scale=0.75,
+        adj_capture_to_win_credit_cap=0.25,
+        adj_capture_to_win_credit_require_future_match=True,
         use_adj_order3_credit_gate=True,
         use_adj_order3_relative_credit_gate=True,
         adj_order3_credit_gate_loss_scale=0.004,
@@ -509,14 +556,17 @@ def main():
         adj_ppo_stale_trust_min_weight=0.25,
         adj_recent_episode_window=4,
         use_adj_dynamic_recent_window=True,
-        adj_recent_episode_window_min=3,
+        adj_recent_episode_window_min=1,
         adj_recent_window_stale_threshold=0.35,
         adj_recent_window_factor_stale_threshold=0.30,
-        adj_recent_window_shrink_patience=3,
+        adj_recent_window_shrink_patience=1,
         adj_recent_window_recover_patience=2,
         adj_recent_window_recover_stale_threshold=0.28,
         adj_recent_window_recover_factor_stale_threshold=0.24,
         adj_recent_window_severe_margin=0.20,
+        adj_recent_episode_window_emergency=1,
+        adj_recent_window_emergency_stale_threshold=0.40,
+        adj_recent_window_emergency_factor_stale_threshold=0.25,
         adj_hidden_dim=64,
         epsilon_start=1.0,
         epsilon_finish=0.05,
@@ -703,6 +753,33 @@ def main():
     assert graph.last_adv_triplet_score_multiplier_max > 0.0
     assert np.isfinite(graph.last_adv_triplet_score_positive_fraction)
     assert np.isfinite(graph.last_adv_triplet_negative_scaled_fraction)
+    assert bool(args.use_adj_triplet_graph_return_credit)
+    assert args.adj_triplet_graph_return_credit_coef > 0.0
+    assert args.adj_triplet_graph_return_credit_cap > 0.0
+    assert args.adj_triplet_graph_return_credit_raw_gate_scale > 0.0
+    assert bool(args.adj_triplet_graph_return_credit_require_delayed_gate)
+    assert bool(args.use_adj_delayed_triplet_credit)
+    assert args.adj_delayed_triplet_credit_coef > 0.0
+    assert args.adj_delayed_triplet_credit_window > 0
+    assert bool(args.adj_delayed_triplet_credit_positive_only)
+    assert args.adj_delayed_triplet_credit_min_adv > 0.0
+    assert bool(args.adj_delayed_triplet_credit_require_future_match)
+    assert bool(args.use_adj_delayed_triplet_success_gate)
+    assert args.adj_delayed_triplet_success_gate_min_adv > 0.0
+    assert args.adj_delayed_triplet_success_gate_scale > 0.0
+    assert args.adj_delayed_triplet_success_gate_floor > 0.0
+    assert args.adj_delayed_triplet_future_overlap_min_nodes == 2
+    assert args.adj_delayed_triplet_partial_match_weight > 0.0
+    assert bool(args.use_adj_capture_to_win_credit)
+    assert args.adj_capture_to_win_credit_coef > 0.0
+    assert args.adj_capture_to_win_credit_min_outcome_adv > 0.0
+    assert args.adj_capture_to_win_credit_scale > 0.0
+    assert args.adj_capture_to_win_credit_cap > 0.0
+    assert bool(args.adj_capture_to_win_credit_require_future_match)
+    assert args.adj_recent_episode_window_min == 1
+    assert args.adj_recent_episode_window_emergency == 1
+    assert args.adj_recent_window_emergency_stale_threshold > 0.0
+    assert args.adj_recent_window_emergency_factor_stale_threshold > 0.0
 
     selected_float = adj.float()
     loss = -(
@@ -871,6 +948,136 @@ def main():
         )
     )
     print(
+        "use_adj_triplet_graph_return_credit={}".format(
+            args.use_adj_triplet_graph_return_credit
+        )
+    )
+    print(
+        "adj_triplet_graph_return_credit_coef={}".format(
+            args.adj_triplet_graph_return_credit_coef
+        )
+    )
+    print(
+        "adj_triplet_graph_return_credit_cap={}".format(
+            args.adj_triplet_graph_return_credit_cap
+        )
+    )
+    print(
+        "adj_triplet_graph_return_credit_min_graph_adv={}".format(
+            args.adj_triplet_graph_return_credit_min_graph_adv
+        )
+    )
+    print(
+        "adj_triplet_graph_return_credit_raw_gate_scale={}".format(
+            args.adj_triplet_graph_return_credit_raw_gate_scale
+        )
+    )
+    print(
+        "adj_triplet_graph_return_credit_require_delayed_gate={}".format(
+            args.adj_triplet_graph_return_credit_require_delayed_gate
+        )
+    )
+    print(
+        "use_adj_delayed_triplet_credit={}".format(
+            args.use_adj_delayed_triplet_credit
+        )
+    )
+    print(
+        "adj_delayed_triplet_credit_coef={}".format(
+            args.adj_delayed_triplet_credit_coef
+        )
+    )
+    print(
+        "adj_delayed_triplet_credit_window={}".format(
+            args.adj_delayed_triplet_credit_window
+        )
+    )
+    print(
+        "adj_delayed_triplet_credit_cap={}".format(
+            args.adj_delayed_triplet_credit_cap
+        )
+    )
+    print(
+        "adj_delayed_triplet_credit_min_reward={}".format(
+            args.adj_delayed_triplet_credit_min_reward
+        )
+    )
+    print(
+        "adj_delayed_triplet_credit_positive_only={}".format(
+            args.adj_delayed_triplet_credit_positive_only
+        )
+    )
+    print(
+        "adj_delayed_triplet_credit_min_adv={}".format(
+            args.adj_delayed_triplet_credit_min_adv
+        )
+    )
+    print(
+        "adj_delayed_triplet_credit_require_future_match={}".format(
+            args.adj_delayed_triplet_credit_require_future_match
+        )
+    )
+    print(
+        "use_adj_delayed_triplet_success_gate={}".format(
+            args.use_adj_delayed_triplet_success_gate
+        )
+    )
+    print(
+        "adj_delayed_triplet_success_gate_min_adv={}".format(
+            args.adj_delayed_triplet_success_gate_min_adv
+        )
+    )
+    print(
+        "adj_delayed_triplet_success_gate_scale={}".format(
+            args.adj_delayed_triplet_success_gate_scale
+        )
+    )
+    print(
+        "adj_delayed_triplet_success_gate_floor={}".format(
+            args.adj_delayed_triplet_success_gate_floor
+        )
+    )
+    print(
+        "adj_delayed_triplet_future_overlap_min_nodes={}".format(
+            args.adj_delayed_triplet_future_overlap_min_nodes
+        )
+    )
+    print(
+        "adj_delayed_triplet_partial_match_weight={}".format(
+            args.adj_delayed_triplet_partial_match_weight
+        )
+    )
+    print(
+        "use_adj_capture_to_win_credit={}".format(
+            args.use_adj_capture_to_win_credit
+        )
+    )
+    print(
+        "adj_capture_to_win_credit_coef={}".format(
+            args.adj_capture_to_win_credit_coef
+        )
+    )
+    print(
+        "adj_capture_to_win_credit_min_outcome_adv={}".format(
+            args.adj_capture_to_win_credit_min_outcome_adv
+        )
+    )
+    print(
+        "adj_capture_to_win_credit_scale={}".format(
+            args.adj_capture_to_win_credit_scale
+        )
+    )
+    print(
+        "adj_capture_to_win_credit_cap={}".format(
+            args.adj_capture_to_win_credit_cap
+        )
+    )
+    print(
+        "adj_capture_to_win_credit_require_future_match={}".format(
+            args.adj_capture_to_win_credit_require_future_match
+        )
+    )
+    print(
         "current_order3_credit_gate={}".format(
             graph.current_order3_credit_gate
         )
@@ -966,6 +1173,21 @@ def main():
     print(
         "adj_recent_window_severe_margin={}".format(
             args.adj_recent_window_severe_margin
+        )
+    )
+    print(
+        "adj_recent_episode_window_emergency={}".format(
+            args.adj_recent_episode_window_emergency
+        )
+    )
+    print(
+        "adj_recent_window_emergency_stale_threshold={}".format(
+            args.adj_recent_window_emergency_stale_threshold
+        )
+    )
+    print(
+        "adj_recent_window_emergency_factor_stale_threshold={}".format(
+            args.adj_recent_window_emergency_factor_stale_threshold
         )
     )
     print("finite_grad_tensors={}".format(finite_grad_count))

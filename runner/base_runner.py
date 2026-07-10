@@ -407,6 +407,146 @@ class RecRunner(object):
                                         )
                                     ),
                                     seed=int(self.args.seed) + 420000,
+                                    use_adj_delayed_triplet_credit=bool(
+                                        getattr(
+                                            self.args,
+                                            "use_adj_delayed_triplet_credit",
+                                            False,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_credit_coef=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_credit_coef",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_credit_window=int(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_credit_window",
+                                            0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_credit_cap=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_credit_cap",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_credit_min_reward=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_credit_min_reward",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_credit_positive_only=bool(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_credit_positive_only",
+                                            False,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_credit_min_adv=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_credit_min_adv",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_credit_require_future_match=bool(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_credit_require_future_match",
+                                            False,
+                                        )
+                                    ),
+                                    use_adj_delayed_triplet_success_gate=bool(
+                                        getattr(
+                                            self.args,
+                                            "use_adj_delayed_triplet_success_gate",
+                                            False,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_success_gate_min_adv=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_success_gate_min_adv",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_success_gate_scale=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_success_gate_scale",
+                                            1.0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_success_gate_floor=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_success_gate_floor",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_future_overlap_min_nodes=int(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_future_overlap_min_nodes",
+                                            3,
+                                        )
+                                    ),
+                                    adj_delayed_triplet_partial_match_weight=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_delayed_triplet_partial_match_weight",
+                                            0.5,
+                                        )
+                                    ),
+                                    use_adj_capture_to_win_credit=bool(
+                                        getattr(
+                                            self.args,
+                                            "use_adj_capture_to_win_credit",
+                                            False,
+                                        )
+                                    ),
+                                    adj_capture_to_win_credit_coef=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_capture_to_win_credit_coef",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_capture_to_win_credit_min_outcome_adv=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_capture_to_win_credit_min_outcome_adv",
+                                            0.5,
+                                        )
+                                    ),
+                                    adj_capture_to_win_credit_scale=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_capture_to_win_credit_scale",
+                                            0.75,
+                                        )
+                                    ),
+                                    adj_capture_to_win_credit_cap=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_capture_to_win_credit_cap",
+                                            0.35,
+                                        )
+                                    ),
+                                    adj_capture_to_win_credit_require_future_match=bool(
+                                        getattr(
+                                            self.args,
+                                            "adj_capture_to_win_credit_require_future_match",
+                                            False,
+                                        )
+                                    ),
                                     )
 
     def run(self):
@@ -636,6 +776,7 @@ class RecRunner(object):
         )
         recent_window_shrunk = 0.0
         recent_window_recovered = 0.0
+        recent_window_emergency_shrunk = 0.0
         recent_window_high_stale_count = 0.0
         recent_window_low_stale_count = 0.0
         if dynamic_recent_enabled and configured_recent_episode_window > 0:
@@ -686,6 +827,33 @@ class RecRunner(object):
                 0.0,
                 float(getattr(self.args, "adj_recent_window_severe_margin", 0.15)),
             )
+            emergency_recent_window = max(
+                1,
+                min(
+                    configured_recent_episode_window,
+                    int(
+                        getattr(
+                            self.args,
+                            "adj_recent_episode_window_emergency",
+                            1,
+                        )
+                    ),
+                ),
+            )
+            emergency_graph_threshold = float(
+                getattr(
+                    self.args,
+                    "adj_recent_window_emergency_stale_threshold",
+                    graph_stale_threshold + severe_margin,
+                )
+            )
+            emergency_factor_threshold = float(
+                getattr(
+                    self.args,
+                    "adj_recent_window_emergency_factor_stale_threshold",
+                    factor_stale_threshold + severe_margin,
+                )
+            )
             prev_graph_stale = float(
                 getattr(self, "_last_adj_graph_stale_ratio", np.nan)
             )
@@ -735,7 +903,20 @@ class RecRunner(object):
                 high_count = 0
                 low_count = 0
 
-            if high_count >= shrink_patience:
+            emergency_graph_stale = (
+                np.isfinite(prev_graph_stale)
+                and prev_graph_stale >= emergency_graph_threshold
+            )
+            emergency_factor_stale = (
+                np.isfinite(prev_factor_stale)
+                and prev_factor_stale >= emergency_factor_threshold
+            )
+            if emergency_graph_stale or emergency_factor_stale:
+                adaptive_recent_window = emergency_recent_window
+                recent_window_emergency_shrunk = 1.0
+                high_count = 0
+                low_count = 0
+            elif high_count >= shrink_patience:
                 severe_graph_stale = (
                     np.isfinite(prev_graph_stale)
                     and prev_graph_stale >= graph_stale_threshold + severe_margin
@@ -870,6 +1051,9 @@ class RecRunner(object):
             "adj_recent_window_recovered", []
         ).append(float(recent_window_recovered))
         self.train_adj_infos.setdefault(
+            "adj_recent_window_emergency_shrunk", []
+        ).append(float(recent_window_emergency_shrunk))
+        self.train_adj_infos.setdefault(
             "adj_recent_window_high_stale_count", []
         ).append(float(recent_window_high_stale_count))
         self.train_adj_infos.setdefault(
@@ -881,6 +1065,31 @@ class RecRunner(object):
         self.train_adj_infos.setdefault(
             "adj_sample_recent_fraction", []
         ).append(float(sample_recent_fraction))
+        self.train_adj_infos.setdefault(
+            "adj_recent_episode_window_emergency", []
+        ).append(float(getattr(self.args, "adj_recent_episode_window_emergency", 1)))
+        self.train_adj_infos.setdefault(
+            "adj_recent_window_emergency_stale_threshold", []
+        ).append(
+            float(
+                getattr(
+                    self.args,
+                    "adj_recent_window_emergency_stale_threshold",
+                    np.nan,
+                )
+            )
+        )
+        self.train_adj_infos.setdefault(
+            "adj_recent_window_emergency_factor_stale_threshold", []
+        ).append(
+            float(
+                getattr(
+                    self.args,
+                    "adj_recent_window_emergency_factor_stale_threshold",
+                    np.nan,
+                )
+            )
+        )
         graph_stale_values = self.train_adj_infos.get(
             "adj_graph_stale_ratio",
             [],
