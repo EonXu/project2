@@ -3,6 +3,11 @@ import torch
 import time
 from typing import Any, Dict, List, Optional
 from runner.base_runner import RecRunner
+from utils.graph_sampling import resolve_graph_sampling_mode
+from utils.pair_credit import (
+    build_capture_identity_factor_weights,
+    canonical_capture_factor_catalog,
+)
 import os
 import pandas as pd
 
@@ -501,6 +506,48 @@ class WolfpackRunner(RecRunner):
                 "recovered_count": int(event.get("recovered_count", 0)),
                 "pending_recovery_count": int(event.get("pending_recovery_count", 0)),
                 "capture_count": int(event.get("capture_count", 0)),
+                "capture_event_ids": ";".join(
+                    str(item.get("event_id"))
+                    for item in event.get("capture_events", [])
+                ),
+                "capture_target_ids": ";".join(
+                    str(item.get("target_id"))
+                    for item in event.get("capture_events", [])
+                ),
+                "capture_participant_slots": ";".join(
+                    "|".join(map(str, item.get("participant_slots", [])))
+                    for item in event.get("capture_events", [])
+                ),
+                "capture_identity_matched_event_count": int(
+                    event.get("capture_identity_matched_event_count", 0)
+                ),
+                "capture_identity_unmatched_event_count": int(
+                    event.get("capture_identity_unmatched_event_count", 0)
+                ),
+                "capture_identity_candidate_factor_count": int(
+                    event.get("capture_identity_candidate_factor_count", 0)
+                ),
+                "capture_identity_raw_candidate_factor_count": int(
+                    event.get("capture_identity_raw_candidate_factor_count", 0)
+                ),
+                "capture_identity_duplicate_factor_count": int(
+                    event.get("capture_identity_duplicate_factor_count", 0)
+                ),
+                "capture_identity_candidate_only_event_count": int(
+                    event.get("capture_identity_candidate_only_event_count", 0)
+                ),
+                "capture_identity_participant_count": int(
+                    event.get("capture_identity_participant_count", 0)
+                ),
+                "capture_identity_matched_factor_order_sum": int(
+                    event.get("capture_identity_matched_factor_order_sum", 0)
+                ),
+                "capture_identity_matched_event_weight_sum": float(
+                    event.get("capture_identity_matched_event_weight_sum", 0.0)
+                ),
+                "capture_identity_event_mass_error": float(
+                    event.get("capture_identity_event_mass_error", 0.0)
+                ),
                 "success_now": int(bool(event.get("success_now", False))),
                 "left_slots": ",".join(map(str, event.get("left_slots", []))),
                 "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
@@ -587,6 +634,48 @@ class WolfpackRunner(RecRunner):
                 "recovered_count": int(event.get("recovered_count", 0)),
                 "pending_recovery_count": int(event.get("pending_recovery_count", 0)),
                 "capture_count": int(event.get("capture_count", 0)),
+                "capture_event_ids": ";".join(
+                    str(item.get("event_id"))
+                    for item in event.get("capture_events", [])
+                ),
+                "capture_target_ids": ";".join(
+                    str(item.get("target_id"))
+                    for item in event.get("capture_events", [])
+                ),
+                "capture_participant_slots": ";".join(
+                    "|".join(map(str, item.get("participant_slots", [])))
+                    for item in event.get("capture_events", [])
+                ),
+                "capture_identity_matched_event_count": int(
+                    event.get("capture_identity_matched_event_count", 0)
+                ),
+                "capture_identity_unmatched_event_count": int(
+                    event.get("capture_identity_unmatched_event_count", 0)
+                ),
+                "capture_identity_candidate_factor_count": int(
+                    event.get("capture_identity_candidate_factor_count", 0)
+                ),
+                "capture_identity_raw_candidate_factor_count": int(
+                    event.get("capture_identity_raw_candidate_factor_count", 0)
+                ),
+                "capture_identity_duplicate_factor_count": int(
+                    event.get("capture_identity_duplicate_factor_count", 0)
+                ),
+                "capture_identity_candidate_only_event_count": int(
+                    event.get("capture_identity_candidate_only_event_count", 0)
+                ),
+                "capture_identity_participant_count": int(
+                    event.get("capture_identity_participant_count", 0)
+                ),
+                "capture_identity_matched_factor_order_sum": int(
+                    event.get("capture_identity_matched_factor_order_sum", 0)
+                ),
+                "capture_identity_matched_event_weight_sum": float(
+                    event.get("capture_identity_matched_event_weight_sum", 0.0)
+                ),
+                "capture_identity_event_mass_error": float(
+                    event.get("capture_identity_event_mass_error", 0.0)
+                ),
                 "success_now": int(bool(event.get("success_now", False))),
                 "left_slots": ",".join(map(str, event.get("left_slots", []))),
                 "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
@@ -712,6 +801,9 @@ class WolfpackRunner(RecRunner):
             "adj_selected_prob_mean": [],
             "adj_selected_prob_min": [],
             "adj_factor_retention_ratio": [],
+            "graph_explore_enabled": [],
+            "graph_eval_rng_enabled": [],
+            "topology_persistence_enabled": [],
         }
 
         for ep_i in range(self.args.num_eval_episodes):
@@ -768,6 +860,25 @@ class WolfpackRunner(RecRunner):
         policy = self.policies[p_id]
 
         env = self.env if training_episode or warmup else self.eval_env
+        graph_explore, graph_use_eval_rng = resolve_graph_sampling_mode(
+            action_explore=explore,
+            training_episode=training_episode,
+            warmup=warmup,
+            use_train_consistent_eval_graph=getattr(
+                self.args,
+                "use_train_consistent_eval_graph",
+                False,
+            ) and self.algorithm_name == "sddfg",
+        )
+        graph_sample_kwargs = {
+            "explore": graph_explore,
+            "t_env": self.total_env_steps,
+        }
+        if (
+            hasattr(self, "adj_network")
+            and hasattr(self.adj_network, "eval_rng")
+        ):
+            graph_sample_kwargs["use_eval_rng"] = graph_use_eval_rng
 
         obs, share_obs, avail_acts = env.reset()
 
@@ -910,6 +1021,7 @@ class WolfpackRunner(RecRunner):
         topology_change_steps = 0
         pending_recovery_final = 0
         capture_event_count = 0
+        capture_event_field_seen = False
         first_success_step = -1
         # Number of 0->1 slot activations whose recurrent state and previous
         # action were reset. This covers both new joins and recoveries.
@@ -980,6 +1092,56 @@ class WolfpackRunner(RecRunner):
                            dtype=np.float32)
             for p_id in self.policy_ids
         }
+        # Real environment events used by AdjBuffer credit. These are kept
+        # separate from rewards so distance shaping can never masquerade as a
+        # capture event.
+        episode_capture_counts = np.zeros(
+            (self.episode_length, self.num_envs, 1),
+            dtype=np.float32,
+        )
+        episode_success_now = np.zeros_like(
+            episode_capture_counts,
+            dtype=np.float32,
+        )
+        episode_capture_factor_matches = np.zeros(
+            (
+                self.episode_length,
+                self.num_envs,
+                self.num_factor,
+            ),
+            dtype=np.float32,
+        )
+        episode_capture_candidate_only_matches = np.zeros(
+            (
+                self.episode_length,
+                self.num_envs,
+                len(canonical_capture_factor_catalog(self.num_agents, 3)),
+            ),
+            dtype=np.float32,
+        )
+        # Canonical candidate replay metadata channels are:
+        # [behavior_score, canonical_rank, valid_mask, graph_policy_version].
+        episode_capture_candidate_behavior = np.zeros(
+            (
+                self.episode_length,
+                self.num_envs,
+                len(canonical_capture_factor_catalog(self.num_agents, 3)),
+                4,
+            ),
+            dtype=np.float32,
+        )
+        episode_capture_identity_matched = np.zeros_like(
+            episode_capture_counts,
+            dtype=np.float32,
+        )
+        episode_capture_identity_unmatched = np.zeros_like(
+            episode_capture_counts,
+            dtype=np.float32,
+        )
+        episode_capture_identity_candidates = np.zeros_like(
+            episode_capture_counts,
+            dtype=np.float32,
+        )
 
         active_masks = self._infer_active_masks_from_obs(obs)
         dones = (active_masks == 0)  # bool：空槽位一开始就视为 done
@@ -1008,14 +1170,45 @@ class WolfpackRunner(RecRunner):
                 rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
 
                 if self.use_dyn_graph:
+                    step_graph_sample_kwargs = dict(graph_sample_kwargs)
+                    if hasattr(self.adj_network, "use_topology_persistence"):
+                        step_graph_sample_kwargs["previous_adj"] = (
+                            prev_adj_for_metrics
+                        )
                     prob_adj, adj, _ = self.adj_network.sample(
                         obs_batch[None, :],
                         rnn_states_batch.unsqueeze(0),
                         self.use_adj_init,
                         dones,
-                        explore,
-                        self.total_env_steps
+                        **step_graph_sample_kwargs
                     )
+                    candidate_behavior = getattr(
+                        self.adj_network,
+                        "last_candidate_behavior_metadata",
+                        None,
+                    )
+                    if candidate_behavior is None:
+                        raise RuntimeError(
+                            "dynamic graph sampling did not expose canonical "
+                            "candidate behavior metadata"
+                        )
+                    candidate_behavior = (
+                        candidate_behavior.detach().cpu().numpy()
+                    )
+                    expected_candidate_behavior_shape = (
+                        self.num_envs,
+                        episode_capture_candidate_behavior.shape[2],
+                        4,
+                    )
+                    if candidate_behavior.shape != expected_candidate_behavior_shape:
+                        raise RuntimeError(
+                            "candidate behavior metadata must have shape {}, "
+                            "got {}".format(
+                                expected_candidate_behavior_shape,
+                                candidate_behavior.shape,
+                            )
+                        )
+                    episode_capture_candidate_behavior[t] = candidate_behavior
 
                     prob_adj, adj = self._mask_adj_by_dones(
                         adj=adj,
@@ -1164,7 +1357,27 @@ class WolfpackRunner(RecRunner):
             dones = next_dones
 
             # ========== 解析 wolfpack env 返回的 infos，并记录逐步轨迹 ==========
-            info_dict = self._extract_first_info_dict(infos, env_i=0)
+            step_info_dicts = [
+                self._extract_first_info_dict(infos, env_i=env_i)
+                for env_i in range(self.num_envs)
+            ]
+            for env_i, step_info in enumerate(step_info_dicts):
+                if not isinstance(step_info, dict):
+                    continue
+                if "capture_count" in step_info:
+                    capture_event_field_seen = True
+                try:
+                    episode_capture_counts[t, env_i, 0] = max(
+                        0.0,
+                        float(step_info.get("capture_count", 0.0)),
+                    )
+                except (TypeError, ValueError):
+                    episode_capture_counts[t, env_i, 0] = 0.0
+                episode_success_now[t, env_i, 0] = float(
+                    bool(step_info.get("success_now", False))
+                )
+
+            info_dict = step_info_dicts[0] if step_info_dicts else {}
             has_fresh_info = isinstance(info_dict, dict) and bool(info_dict)
 
             if has_fresh_info:
@@ -1258,6 +1471,16 @@ class WolfpackRunner(RecRunner):
                     "recovered_count": recovered_count,
                     "pending_recovery_count": pending_recovery_final,
                     "capture_count": int(info_dict.get("capture_count", 0)),
+                    "capture_events": [
+                        {
+                            "event_id": int(event["event_id"]),
+                            "target_id": int(event["target_id"]),
+                            "participant_slots": list(
+                                event.get("participant_slots", [])
+                            ),
+                        }
+                        for event in info_dict.get("capture_events", [])
+                    ],
                     "success_now": bool(info_dict.get("success_now", False)),
                     "left_slots": list(info_dict.get("left_slots", [])),
                     "joined_slots": list(info_dict.get("joined_slots", [])),
@@ -1297,6 +1520,90 @@ class WolfpackRunner(RecRunner):
                 )
                 episode_adj[p_id][t] = env_adj
                 episode_prob_adj[p_id][t] = env_prob_adj
+
+                if bool(getattr(
+                        self.args,
+                        "use_adj_capture_to_win_credit",
+                        False,
+                )):
+                    capture_events_by_env = []
+                    expected_capture_counts = []
+                    for env_i, step_info in enumerate(step_info_dicts):
+                        if "capture_events" not in step_info:
+                            raise RuntimeError(
+                                "capture-to-win identity credit requires "
+                                "environment info field 'capture_events'"
+                            )
+                        capture_events_by_env.append(
+                            step_info.get("capture_events")
+                        )
+                        expected_capture_counts.append(
+                            episode_capture_counts[t, env_i, 0]
+                        )
+                    identity_match = build_capture_identity_factor_weights(
+                        current_adj=episode_adj[p_id][t],
+                        capture_events_by_episode=capture_events_by_env,
+                        expected_capture_counts=np.asarray(
+                            expected_capture_counts,
+                            dtype=np.float32,
+                        ),
+                    )
+                    episode_capture_factor_matches[t] = identity_match[
+                        "factor_weights"
+                    ]
+                    episode_capture_candidate_only_matches[t] = (
+                        identity_match["candidate_only_factor_weights"]
+                    )
+                    episode_capture_identity_matched[t, :, 0] = (
+                        identity_match["matched_event_count"]
+                    )
+                    episode_capture_identity_unmatched[t, :, 0] = (
+                        identity_match["unmatched_event_count"]
+                    )
+                    episode_capture_identity_candidates[t, :, 0] = (
+                        identity_match["candidate_factor_count"]
+                    )
+                    if topology_events_traj:
+                        topology_events_traj[-1][
+                            "capture_identity_matched_event_count"
+                        ] = int(identity_match["matched_event_count"][0])
+                        topology_events_traj[-1][
+                            "capture_identity_unmatched_event_count"
+                        ] = int(identity_match["unmatched_event_count"][0])
+                        topology_events_traj[-1][
+                            "capture_identity_candidate_factor_count"
+                        ] = int(identity_match["candidate_factor_count"][0])
+                        topology_events_traj[-1][
+                            "capture_identity_raw_candidate_factor_count"
+                        ] = int(identity_match[
+                            "raw_candidate_factor_count"
+                        ][0])
+                        topology_events_traj[-1][
+                            "capture_identity_duplicate_factor_count"
+                        ] = int(identity_match[
+                            "duplicate_candidate_factor_count"
+                        ][0])
+                        topology_events_traj[-1][
+                            "capture_identity_candidate_only_event_count"
+                        ] = int(identity_match[
+                            "candidate_only_event_count"
+                        ][0])
+                        topology_events_traj[-1][
+                            "capture_identity_participant_count"
+                        ] = int(identity_match["participant_count"][0])
+                        topology_events_traj[-1][
+                            "capture_identity_matched_factor_order_sum"
+                        ] = int(identity_match[
+                            "matched_factor_order_sum"
+                        ][0])
+                        topology_events_traj[-1][
+                            "capture_identity_matched_event_weight_sum"
+                        ] = float(identity_match[
+                            "matched_event_weight_sum"
+                        ][0])
+                        topology_events_traj[-1][
+                            "capture_identity_event_mass_error"
+                        ] = float(identity_match["event_mass_error"][0])
 
                 # ===== 日志新增：记录每步邻接图结构质量，兼容 DDFG 与 SDDFG/GAT =====
                 try:
@@ -1366,13 +1673,17 @@ class WolfpackRunner(RecRunner):
             rnn_states_batch = self._mask_rnn_states_by_dones(rnn_states_batch, dones)
 
             if self.use_dyn_graph:
+                step_graph_sample_kwargs = dict(graph_sample_kwargs)
+                if hasattr(self.adj_network, "use_topology_persistence"):
+                    step_graph_sample_kwargs["previous_adj"] = (
+                        prev_adj_for_metrics
+                    )
                 prob_adj, adj, _ = self.adj_network.sample(
                     obs_batch[None, :],
                     rnn_states_batch.unsqueeze(0),
                     self.use_adj_init,
                     dones,
-                    explore,
-                    self.total_env_steps
+                    **step_graph_sample_kwargs
                 )
 
                 prob_adj, adj = self._mask_adj_by_dones(
@@ -1435,6 +1746,18 @@ class WolfpackRunner(RecRunner):
                 and self.total_env_steps >= self.adj_begin_step
                 and not warmup
             ):
+                if (
+                    bool(getattr(
+                        self.args,
+                        "use_adj_pair_triplet_complementary_credit",
+                        False,
+                    ))
+                    and not capture_event_field_seen
+                ):
+                    raise RuntimeError(
+                        "capture-anchored pair credit requires the Wolfpack "
+                        "environment info field 'capture_count'"
+                    )
                 self.num_adj_episodes_collected += self.num_envs
 
                 idx = self.adj_buffer.insert(self.num_envs,
@@ -1456,7 +1779,21 @@ class WolfpackRunner(RecRunner):
                                              episode_qtot,
                                              episode_f_v,
                                              episode_f_q,
-                                             episode_rnn_states)
+                                             episode_rnn_states,
+                                             capture_counts=episode_capture_counts,
+                                             success_now=episode_success_now,
+                                             capture_factor_matches=(
+                                                 episode_capture_factor_matches
+                                             ),
+                                             capture_candidate_only_matches=(
+                                                 episode_capture_candidate_only_matches
+                                             ),
+                                             capture_candidate_behavior=(
+                                                 episode_capture_candidate_behavior
+                                             ),
+                                             capture_identity_candidates=(
+                                                 episode_capture_identity_candidates
+                                             ))
                 self.adj_buffer.compute_advantage(idx)
 
         # ========== 将逐步 infos 轨迹缓存起来（供 eval() 导出）==========
@@ -1559,6 +1896,18 @@ class WolfpackRunner(RecRunner):
         env_info.setdefault("active_ratio_min", 0.0)
         env_info.setdefault("active_ratio_max", 0.0)
         env_info.setdefault("episode_real_length", int(t))
+        env_info["graph_explore_enabled"] = float(graph_explore)
+        env_info["graph_eval_rng_enabled"] = float(graph_use_eval_rng)
+        env_info["topology_persistence_enabled"] = float(
+            bool(
+                hasattr(self, "adj_network")
+                and getattr(
+                    self.adj_network,
+                    "use_topology_persistence",
+                    False,
+                )
+            )
+        )
 
         env_info['average_episode_rewards'] = np.sum(episode_rewards[p_id][:, 0, 0, 0])
         # ===== 日志新增：训练阶段也低频导出逐步轨迹 CSV =====
@@ -1709,6 +2058,28 @@ class WolfpackRunner(RecRunner):
                 schedule_info["adj_triplet_balance_coef"] = float(
                     self.adj_network.triplet_balance_coef
                 )
+            if hasattr(self.adj_network, "use_topology_persistence"):
+                schedule_info["use_adj_topology_persistence"] = float(
+                    bool(self.adj_network.use_topology_persistence)
+                )
+            if hasattr(
+                self.adj_network,
+                "last_topology_persistence_candidate_fraction",
+            ):
+                schedule_info[
+                    "adj_topology_persistence_candidate_fraction"
+                ] = float(
+                    self.adj_network.last_topology_persistence_candidate_fraction
+                )
+            if hasattr(
+                self.adj_network,
+                "last_topology_persistence_selected_fraction",
+            ):
+                schedule_info[
+                    "adj_topology_persistence_selected_fraction"
+                ] = float(
+                    self.adj_network.last_topology_persistence_selected_fraction
+                )
             for metric_key in (
                 "raw_order2_factor_rl_loss",
                 "raw_order3_factor_rl_loss",
@@ -1733,9 +2104,100 @@ class WolfpackRunner(RecRunner):
                 "delayed_triplet_future_exact_fraction",
                 "delayed_triplet_future_partial_fraction",
                 "capture_to_win_triplet_credit_mean",
+                "capture_to_win_triplet_credit_abs_mean",
                 "capture_to_win_triplet_credit_active_fraction",
+                "capture_to_win_triplet_credit_positive_fraction",
+                "capture_to_win_triplet_credit_negative_fraction",
+                "capture_to_win_triplet_credit_positive_mass",
+                "capture_to_win_triplet_credit_negative_mass",
+                "capture_outcome_local_delta_positive_mass",
+                "capture_outcome_local_delta_negative_mass",
+                "capture_outcome_local_delta_active_fraction",
+                "capture_outcome_factor_loss_contribution",
+                "capture_outcome_positive_factor_loss_contribution",
+                "capture_outcome_negative_factor_loss_contribution",
+                "capture_identity_factor_credit_active_fraction",
+                "capture_identity_factor_credit_positive_mass",
+                "capture_identity_factor_credit_negative_mass",
+                "capture_outcome_identity_order2_delta_abs_mass",
+                "capture_outcome_identity_order3_delta_abs_mass",
+                "capture_identity_target_order2_fraction",
+                "capture_identity_target_order3_fraction",
+                "capture_outcome_non_target_delta_abs_max",
                 "capture_to_win_quality_gate_mean",
+                "capture_to_win_quality_gate_abs_mean",
                 "capture_to_win_quality_gate_active_fraction",
+                "capture_to_win_quality_gate_positive_fraction",
+                "capture_to_win_quality_gate_negative_fraction",
+                "capture_to_win_quality_gate_positive_mass",
+                "capture_to_win_quality_gate_negative_mass",
+                "capture_to_win_outcome_contrastive",
+                "capture_to_win_quality_gate_definition_version",
+                "capture_outcome_baseline_mean",
+                "capture_outcome_capture_episode_count_mean",
+                "capture_outcome_success_episode_count_mean",
+                "capture_outcome_failure_episode_count_mean",
+                "capture_outcome_mixed_window_fraction",
+                "capture_outcome_single_success_window_fraction",
+                "capture_outcome_single_failure_window_fraction",
+                "capture_outcome_no_capture_window_fraction",
+                "capture_outcome_triplet_labels_per_episode_mean",
+                "capture_outcome_triplet_labels_per_episode_max",
+                "capture_outcome_raw_episode_advantage_mean",
+                "capture_outcome_raw_episode_advantage_abs_mean",
+                "capture_outcome_window_raw_centered_mean",
+                "capture_outcome_window_expanded_gate_sum",
+                "capture_outcome_window_expanded_gate_abs_sum",
+                "capture_outcome_window_center_error_ratio",
+                "capture_to_win_credit_preclip_mean",
+                "capture_to_win_credit_preclip_std",
+                "capture_to_win_credit_preclip_max",
+                "capture_to_win_credit_preclip_min",
+                "capture_to_win_credit_positive_clip_fraction",
+                "capture_to_win_credit_negative_clip_fraction",
+                "capture_identity_event_count_mean",
+                "capture_identity_matched_event_count_mean",
+                "capture_identity_unmatched_event_count_mean",
+                "capture_identity_candidate_factor_count_mean",
+                "capture_identity_match_fraction",
+                "capture_identity_candidates_per_matched_event",
+                "capture_outcome_label_gate_correlation",
+                "capture_outcome_label_gate_correlation_valid",
+                "capture_outcome_success_labels_mean",
+                "capture_outcome_failure_labels_mean",
+                "capture_outcome_success_gate_total_mean",
+                "capture_outcome_failure_gate_total_mean",
+                "pair_pursuit_credit_mean",
+                "pair_pursuit_credit_active_fraction",
+                "pair_credit_active_fraction",
+                "pair_pursuit_credit_std",
+                "pair_pursuit_credit_max",
+                "pair_pursuit_credit_nonzero_count",
+                "pair_credit_top1_mass_fraction",
+                "pair_pursuit_quality_mean",
+                "pair_pursuit_quality_active_fraction",
+                "pair_to_triplet_transition_score_mean",
+                "pair_to_triplet_transition_active_fraction",
+                "triplet_capture_quality_mean",
+                "triplet_capture_quality_active_fraction",
+                "transition_delay_mean",
+                "transition_delay_min",
+                "transition_delay_max",
+                "capture_event_count",
+                "capture_matched_count",
+                "unmatched_capture_count",
+                "capture_matched_fraction",
+                "unmatched_capture_fraction",
+                "failed_episode_capture_count",
+                "failed_episode_capture_fraction",
+                "capture_to_win_capture_success_fraction",
+                "capture_to_win_episode_success_fraction",
+                "positive_reward_without_capture_fraction",
+                "positive_reward_step_count",
+                "positive_reward_without_capture_count",
+                "positive_reward_step_fraction",
+                "offset0_candidate_count",
+                "offset0_candidate_fraction",
                 "graph_return_credit_strength_mean",
                 "credit_order2_factor_rl_loss",
                 "credit_order3_factor_rl_loss",
@@ -1775,6 +2237,11 @@ class WolfpackRunner(RecRunner):
                 "adj_capture_to_win_credit_scale",
                 "adj_capture_to_win_credit_cap",
                 "adj_capture_to_win_credit_require_future_match",
+                "use_adj_pair_triplet_complementary_credit",
+                "adj_pair_pursuit_credit_coef",
+                "adj_pair_pursuit_credit_window",
+                "adj_pair_pursuit_credit_cap",
+                "adj_pair_pursuit_credit_min_reward",
                 "use_adj_advantage_triplet_scorer",
                 "adv_triplet_credit_pair_updates",
                 "adv_triplet_credit_triplet_updates",
@@ -1822,6 +2289,74 @@ class WolfpackRunner(RecRunner):
                 "adj_recent_window_low_stale_count",
                 "adj_sample_episode_count",
                 "adj_sample_recent_fraction",
+                "adj_outcome_contrast_replay_support_version",
+                "adj_sample_base_episode_count",
+                "adj_sample_outcome_contrast_augmented_count",
+                "adj_sample_outcome_positive_available",
+                "adj_sample_outcome_negative_available",
+                "adj_sample_outcome_positive_episode_count",
+                "adj_sample_outcome_negative_episode_count",
+                "adj_sample_outcome_class_complete",
+                "adj_sample_outcome_support_exhausted",
+                "adj_sample_outcome_credit_enabled",
+                "adj_sample_outcome_cached_selection_reused",
+                "adj_sample_outcome_support_round",
+                "adj_sample_outcome_cross_update_reuse_count",
+                "adj_sample_outcome_positive_available_count",
+                "adj_sample_outcome_negative_available_count",
+                "adj_sample_outcome_base_positive_count",
+                "adj_sample_outcome_base_negative_count",
+                "adj_sample_outcome_augmented_positive_count",
+                "adj_sample_outcome_augmented_negative_count",
+                "adj_sample_outcome_base_age_mean",
+                "adj_sample_outcome_base_age_max",
+                "adj_sample_outcome_augmented_age_mean",
+                "adj_sample_outcome_augmented_age_max",
+                "adj_sample_outcome_positive_support_generation",
+                "adj_sample_outcome_negative_support_generation",
+                "adj_sample_outcome_positive_support_age",
+                "adj_sample_outcome_negative_support_age",
+                "adj_sample_outcome_support_used_count",
+                "adj_sample_outcome_support_used_fraction",
+                "adj_sample_outcome_full_buffer_baseline",
+                "adj_sample_outcome_base_cohort_baseline",
+                "adj_sample_outcome_trained_cohort_baseline",
+                "adj_sample_outcome_full_trained_baseline_gap",
+                "adj_sample_outcome_trained_capture_episode_count",
+                "adj_sample_outcome_cohort_centered_sum",
+                "adj_sample_outcome_cohort_center_error",
+                "adj_sample_outcome_cohort_center_valid",
+                "adj_sample_outcome_positive_gate_episode_count",
+                "adj_sample_outcome_negative_gate_episode_count",
+                "adj_sample_outcome_positive_credit_episode_count",
+                "adj_sample_outcome_negative_credit_episode_count",
+                "adj_sample_outcome_signed_scaling_version",
+                "adj_sample_outcome_graph_advantage_source_ready_fraction",
+                "adj_sample_outcome_graph_confidence_mean",
+                "adj_sample_outcome_graph_confidence_std",
+                "adj_sample_outcome_graph_confidence_p50",
+                "adj_sample_outcome_graph_confidence_p95",
+                "adj_sample_outcome_graph_confidence_max",
+                "adj_sample_outcome_positive_graph_confidence_mean",
+                "adj_sample_outcome_positive_graph_confidence_max",
+                "adj_sample_outcome_negative_graph_confidence_mean",
+                "adj_sample_outcome_negative_graph_confidence_max",
+                "adj_sample_outcome_graph_advantage_positive_fraction",
+                "adj_sample_outcome_graph_advantage_negative_fraction",
+                "adj_sample_outcome_graph_advantage_zero_fraction",
+                "adj_sample_outcome_positive_zero_confidence_fraction",
+                "adj_sample_outcome_negative_zero_confidence_fraction",
+                "adj_sample_outcome_gate_to_credit_drop_fraction",
+                "adj_sample_outcome_preclip_positive_mass",
+                "adj_sample_outcome_preclip_negative_mass",
+                "adj_sample_outcome_postclip_positive_mass",
+                "adj_sample_outcome_postclip_negative_mass",
+                "adj_sample_outcome_positive_clip_fraction",
+                "adj_sample_outcome_negative_clip_fraction",
+                "adj_sample_outcome_generation_update_count",
+                "adj_sample_outcome_slot_overwrite_count",
+                "adj_sample_outcome_generation_conflict_count",
+                "adj_sample_outcome_invalid_used_state_count",
                 "adj_recent_episode_window_emergency",
                 "adj_recent_window_emergency_stale_threshold",
                 "adj_recent_window_emergency_factor_stale_threshold",
@@ -1906,6 +2441,9 @@ class WolfpackRunner(RecRunner):
             "adj_selected_prob_mean": [],
             "adj_selected_prob_min": [],
             "adj_factor_retention_ratio": [],
+            "graph_explore_enabled": [],
+            "graph_eval_rng_enabled": [],
+            "topology_persistence_enabled": [],
             "epsilon": [],
             "adj_epsilon": [],
             "adj_sampling_temperature": [],
@@ -1921,6 +2459,9 @@ class WolfpackRunner(RecRunner):
             "adj_order3_credit_gate_max_delta": [],
             "adj_order3_soft_quota_coef": [],
             "adj_triplet_balance_coef": [],
+            "use_adj_topology_persistence": [],
+            "adj_topology_persistence_candidate_fraction": [],
+            "adj_topology_persistence_selected_fraction": [],
             "raw_order2_factor_rl_loss": [],
             "raw_order3_factor_rl_loss": [],
             "raw_o3_minus_o2_factor_rl_loss": [],
@@ -1944,9 +2485,149 @@ class WolfpackRunner(RecRunner):
             "delayed_triplet_future_exact_fraction": [],
             "delayed_triplet_future_partial_fraction": [],
             "capture_to_win_triplet_credit_mean": [],
+            "capture_to_win_triplet_credit_abs_mean": [],
             "capture_to_win_triplet_credit_active_fraction": [],
+            "capture_to_win_triplet_credit_positive_fraction": [],
+            "capture_to_win_triplet_credit_negative_fraction": [],
+            "capture_to_win_triplet_credit_positive_mass": [],
+            "capture_to_win_triplet_credit_negative_mass": [],
+            "capture_outcome_local_delta_positive_mass": [],
+            "capture_outcome_local_delta_negative_mass": [],
+            "capture_outcome_local_delta_active_fraction": [],
+            "capture_outcome_factor_loss_contribution": [],
+            "capture_outcome_positive_factor_loss_contribution": [],
+            "capture_outcome_negative_factor_loss_contribution": [],
+            "capture_outcome_factor_loss_target_count": [],
+            "capture_outcome_factor_loss_valid_transition_count": [],
+            "capture_outcome_factor_loss_factors_per_transition": [],
+            "capture_outcome_factor_loss_normalization_version": [],
+            "capture_candidate_identity_loss_contribution": [],
+            "capture_candidate_identity_positive_loss_contribution": [],
+            "capture_candidate_identity_negative_loss_contribution": [],
+            "capture_candidate_identity_target_count": [],
+            "capture_candidate_identity_positive_mass": [],
+            "capture_candidate_identity_negative_mass": [],
+            "capture_candidate_identity_positive_score_mean": [],
+            "capture_candidate_identity_negative_score_mean": [],
+            "capture_candidate_identity_positive_probability_mean": [],
+            "capture_candidate_identity_negative_probability_mean": [],
+            "capture_candidate_identity_positive_legacy_bounded_score_mean": [],
+            "capture_candidate_identity_negative_legacy_bounded_score_mean": [],
+            "capture_candidate_identity_loss_definition_version": [],
+            "capture_candidate_identity_score_semantics_version": [],
+            "capture_candidate_identity_positive_log_score_mean": [],
+            "capture_candidate_identity_negative_log_score_mean": [],
+            "capture_candidate_identity_positive_log_probability_mean": [],
+            "capture_candidate_identity_negative_log_probability_mean": [],
+            "capture_candidate_identity_valid_score_mean": [],
+            "capture_candidate_identity_valid_score_min": [],
+            "capture_candidate_identity_valid_score_max": [],
+            "capture_candidate_identity_behavior_score_mean": [],
+            "capture_candidate_identity_behavior_rank_mean": [],
+            "capture_candidate_identity_positive_behavior_score_mean": [],
+            "capture_candidate_identity_negative_behavior_score_mean": [],
+            "capture_candidate_identity_positive_behavior_probability_mean": [],
+            "capture_candidate_identity_negative_behavior_probability_mean": [],
+            "capture_candidate_identity_positive_behavior_rank_mean": [],
+            "capture_candidate_identity_negative_behavior_rank_mean": [],
+            "capture_candidate_identity_positive_current_rank_mean": [],
+            "capture_candidate_identity_negative_current_rank_mean": [],
+            "capture_candidate_identity_positive_log_score_change_mean": [],
+            "capture_candidate_identity_negative_log_score_change_mean": [],
+            "capture_candidate_identity_positive_log_probability_change_mean": [],
+            "capture_candidate_identity_negative_log_probability_change_mean": [],
+            "capture_candidate_identity_positive_score_improved_fraction": [],
+            "capture_candidate_identity_negative_score_reduced_fraction": [],
+            "capture_candidate_identity_positive_probability_improved_fraction": [],
+            "capture_candidate_identity_negative_probability_reduced_fraction": [],
+            "capture_candidate_identity_positive_rank_improved_fraction": [],
+            "capture_candidate_identity_negative_rank_reduced_fraction": [],
+            "capture_candidate_identity_behavior_valid_fraction": [],
+            "capture_candidate_identity_policy_age_mean": [],
+            "capture_candidate_identity_policy_age_max": [],
+            "capture_candidate_identity_policy_version": [],
+            "capture_identity_factor_credit_active_fraction": [],
+            "capture_identity_factor_credit_positive_mass": [],
+            "capture_identity_factor_credit_negative_mass": [],
+            "capture_outcome_identity_order2_delta_abs_mass": [],
+            "capture_outcome_identity_order3_delta_abs_mass": [],
+            "capture_identity_target_order2_fraction": [],
+            "capture_identity_target_order3_fraction": [],
+            "capture_outcome_non_target_delta_abs_max": [],
             "capture_to_win_quality_gate_mean": [],
+            "capture_to_win_quality_gate_abs_mean": [],
             "capture_to_win_quality_gate_active_fraction": [],
+            "capture_to_win_quality_gate_positive_fraction": [],
+            "capture_to_win_quality_gate_negative_fraction": [],
+            "capture_to_win_quality_gate_positive_mass": [],
+            "capture_to_win_quality_gate_negative_mass": [],
+            "capture_to_win_outcome_contrastive": [],
+            "capture_to_win_quality_gate_definition_version": [],
+            "capture_outcome_baseline_mean": [],
+            "capture_outcome_capture_episode_count_mean": [],
+            "capture_outcome_success_episode_count_mean": [],
+            "capture_outcome_failure_episode_count_mean": [],
+            "capture_outcome_mixed_window_fraction": [],
+            "capture_outcome_single_success_window_fraction": [],
+            "capture_outcome_single_failure_window_fraction": [],
+            "capture_outcome_no_capture_window_fraction": [],
+            "capture_outcome_triplet_labels_per_episode_mean": [],
+            "capture_outcome_triplet_labels_per_episode_max": [],
+            "capture_outcome_raw_episode_advantage_mean": [],
+            "capture_outcome_raw_episode_advantage_abs_mean": [],
+            "capture_outcome_window_raw_centered_mean": [],
+            "capture_outcome_window_expanded_gate_sum": [],
+            "capture_outcome_window_expanded_gate_abs_sum": [],
+            "capture_outcome_window_center_error_ratio": [],
+            "capture_to_win_credit_preclip_mean": [],
+            "capture_to_win_credit_preclip_std": [],
+            "capture_to_win_credit_preclip_max": [],
+            "capture_to_win_credit_preclip_min": [],
+            "capture_to_win_credit_positive_clip_fraction": [],
+            "capture_to_win_credit_negative_clip_fraction": [],
+            "capture_identity_event_count_mean": [],
+            "capture_identity_matched_event_count_mean": [],
+            "capture_identity_unmatched_event_count_mean": [],
+            "capture_identity_candidate_factor_count_mean": [],
+            "capture_identity_match_fraction": [],
+            "capture_identity_candidates_per_matched_event": [],
+            "capture_outcome_label_gate_correlation": [],
+            "capture_outcome_label_gate_correlation_valid": [],
+            "capture_outcome_success_labels_mean": [],
+            "capture_outcome_failure_labels_mean": [],
+            "capture_outcome_success_gate_total_mean": [],
+            "capture_outcome_failure_gate_total_mean": [],
+            "pair_pursuit_credit_mean": [],
+            "pair_pursuit_credit_active_fraction": [],
+            "pair_credit_active_fraction": [],
+            "pair_pursuit_credit_std": [],
+            "pair_pursuit_credit_max": [],
+            "pair_pursuit_credit_nonzero_count": [],
+            "pair_credit_top1_mass_fraction": [],
+            "pair_pursuit_quality_mean": [],
+            "pair_pursuit_quality_active_fraction": [],
+            "pair_to_triplet_transition_score_mean": [],
+            "pair_to_triplet_transition_active_fraction": [],
+            "triplet_capture_quality_mean": [],
+            "triplet_capture_quality_active_fraction": [],
+            "transition_delay_mean": [],
+            "transition_delay_min": [],
+            "transition_delay_max": [],
+            "capture_event_count": [],
+            "capture_matched_count": [],
+            "unmatched_capture_count": [],
+            "capture_matched_fraction": [],
+            "unmatched_capture_fraction": [],
+            "failed_episode_capture_count": [],
+            "failed_episode_capture_fraction": [],
+            "capture_to_win_capture_success_fraction": [],
+            "capture_to_win_episode_success_fraction": [],
+            "positive_reward_without_capture_fraction": [],
+            "positive_reward_step_count": [],
+            "positive_reward_without_capture_count": [],
+            "positive_reward_step_fraction": [],
+            "offset0_candidate_count": [],
+            "offset0_candidate_fraction": [],
             "graph_return_credit_strength_mean": [],
             "credit_order2_factor_rl_loss": [],
             "credit_order3_factor_rl_loss": [],
@@ -1986,6 +2667,11 @@ class WolfpackRunner(RecRunner):
             "adj_capture_to_win_credit_scale": [],
             "adj_capture_to_win_credit_cap": [],
             "adj_capture_to_win_credit_require_future_match": [],
+            "use_adj_pair_triplet_complementary_credit": [],
+            "adj_pair_pursuit_credit_coef": [],
+            "adj_pair_pursuit_credit_window": [],
+            "adj_pair_pursuit_credit_cap": [],
+            "adj_pair_pursuit_credit_min_reward": [],
             "use_adj_advantage_triplet_scorer": [],
             "adv_triplet_credit_pair_updates": [],
             "adv_triplet_credit_triplet_updates": [],
@@ -2033,6 +2719,51 @@ class WolfpackRunner(RecRunner):
             "adj_recent_window_low_stale_count": [],
             "adj_sample_episode_count": [],
             "adj_sample_recent_fraction": [],
+            "adj_outcome_contrast_replay_support_version": [],
+            "adj_sample_base_episode_count": [],
+            "adj_sample_outcome_contrast_augmented_count": [],
+            "adj_sample_outcome_positive_available": [],
+            "adj_sample_outcome_negative_available": [],
+            "adj_sample_outcome_positive_episode_count": [],
+            "adj_sample_outcome_negative_episode_count": [],
+            "adj_sample_outcome_class_complete": [],
+            "adj_sample_outcome_support_exhausted": [],
+            "adj_sample_outcome_credit_enabled": [],
+            "adj_sample_outcome_cached_selection_reused": [],
+            "adj_sample_outcome_support_round": [],
+            "adj_sample_outcome_cross_update_reuse_count": [],
+            "adj_sample_outcome_positive_available_count": [],
+            "adj_sample_outcome_negative_available_count": [],
+            "adj_sample_outcome_base_positive_count": [],
+            "adj_sample_outcome_base_negative_count": [],
+            "adj_sample_outcome_augmented_positive_count": [],
+            "adj_sample_outcome_augmented_negative_count": [],
+            "adj_sample_outcome_base_age_mean": [],
+            "adj_sample_outcome_base_age_max": [],
+            "adj_sample_outcome_augmented_age_mean": [],
+            "adj_sample_outcome_augmented_age_max": [],
+            "adj_sample_outcome_positive_support_generation": [],
+            "adj_sample_outcome_negative_support_generation": [],
+            "adj_sample_outcome_positive_support_age": [],
+            "adj_sample_outcome_negative_support_age": [],
+            "adj_sample_outcome_support_used_count": [],
+            "adj_sample_outcome_support_used_fraction": [],
+            "adj_sample_outcome_full_buffer_baseline": [],
+            "adj_sample_outcome_base_cohort_baseline": [],
+            "adj_sample_outcome_trained_cohort_baseline": [],
+            "adj_sample_outcome_full_trained_baseline_gap": [],
+            "adj_sample_outcome_trained_capture_episode_count": [],
+            "adj_sample_outcome_cohort_centered_sum": [],
+            "adj_sample_outcome_cohort_center_error": [],
+            "adj_sample_outcome_cohort_center_valid": [],
+            "adj_sample_outcome_positive_gate_episode_count": [],
+            "adj_sample_outcome_negative_gate_episode_count": [],
+            "adj_sample_outcome_positive_credit_episode_count": [],
+            "adj_sample_outcome_negative_credit_episode_count": [],
+            "adj_sample_outcome_generation_update_count": [],
+            "adj_sample_outcome_slot_overwrite_count": [],
+            "adj_sample_outcome_generation_conflict_count": [],
+            "adj_sample_outcome_invalid_used_state_count": [],
             "adj_recent_episode_window_emergency": [],
             "adj_recent_window_emergency_stale_threshold": [],
             "adj_recent_window_emergency_factor_stale_threshold": [],

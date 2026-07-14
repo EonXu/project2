@@ -3,6 +3,7 @@ import copy
 from utils.util import soft_update, huber_loss, mse_loss, to_torch
 import numpy as np
 from utils.popart import PopArt
+from utils.pair_credit import CAPTURE_OUTCOME_DIAGNOSTIC_WIDTH
 
 def _to_float(x):
     """兼容 torch 标量 / python float / numpy float"""
@@ -60,6 +61,305 @@ def _parameter_grad_norm(parameters):
         grad_norm = float(parameter.grad.detach().norm(2).cpu().item())
         total_sq += grad_norm * grad_norm
     return float(total_sq ** 0.5)
+
+
+def compute_capture_outcome_factor_ppo_loss(
+        factor_imp_weights,
+        clipped_factor_imp_weights,
+        capture_outcome_local_delta,
+        factor_loss_mask,
+        transition_mask):
+    """Return the target-local outcome PPO term with transition normalization.
+
+    Capture outcome mass is normalized per episode before it reaches the
+    trainer.  Dividing its sparse factor surrogate by *all* selected factors
+    makes the same episode-level supervision shrink whenever unrelated factor
+    slots are added.  The graph PPO objective is transition averaged, so this
+    auxiliary factor term uses the same transition denominator while summing
+    the already event/episode-normalized target-factor mass.
+
+    Outcome sign is preserved by the standard PPO min surrogate.  The helper
+    never changes reward, Q targets, priorities, or non-target factor values.
+    """
+    tensors = (
+        factor_imp_weights,
+        clipped_factor_imp_weights,
+        capture_outcome_local_delta,
+        factor_loss_mask,
+    )
+    reference_shape = factor_imp_weights.shape
+    if any(tensor.shape != reference_shape for tensor in tensors[1:]):
+        raise ValueError(
+            "outcome factor PPO tensors must share shape {}, got {}".format(
+                reference_shape,
+                [tuple(tensor.shape) for tensor in tensors],
+            )
+        )
+    if transition_mask.dim() == 1:
+        transition_mask = transition_mask.unsqueeze(-1)
+    if (
+            transition_mask.dim() != 2
+            or transition_mask.shape[0] != reference_shape[0]
+            or transition_mask.shape[1] != 1):
+        raise ValueError(
+            "transition_mask must have shape [{}, 1], got {}".format(
+                reference_shape[0], tuple(transition_mask.shape)
+            )
+        )
+    if not all(bool(torch.isfinite(tensor).all().item()) for tensor in tensors):
+        raise FloatingPointError("non-finite outcome factor PPO input")
+    if not bool(torch.isfinite(transition_mask).all().item()):
+        raise FloatingPointError("non-finite outcome transition mask")
+    target_mask = capture_outcome_local_delta.abs() > 0.0
+    if bool(torch.any(target_mask & (factor_loss_mask <= 0.0)).item()):
+        raise RuntimeError(
+            "capture outcome delta reached a padded or invalid factor"
+        )
+    valid_transition_count = transition_mask.sum()
+    if (
+            bool(torch.any(target_mask).item())
+            and not bool((valid_transition_count > 0.0).item())):
+        raise RuntimeError(
+            "capture outcome delta has no valid transition denominator"
+        )
+
+    surr1 = factor_imp_weights * capture_outcome_local_delta
+    surr2 = clipped_factor_imp_weights * capture_outcome_local_delta
+    min_surr = torch.min(surr1, surr2)
+    denominator = valid_transition_count.clamp_min(1.0)
+    masked_surr = min_surr * factor_loss_mask
+    loss = -masked_surr.sum() / denominator
+    positive_loss = -(
+        masked_surr * (capture_outcome_local_delta > 0.0).float()
+    ).sum() / denominator
+    negative_loss = -(
+        masked_surr * (capture_outcome_local_delta < 0.0).float()
+    ).sum() / denominator
+    target_count = (
+        target_mask.float() * (factor_loss_mask > 0.0).float()
+    ).sum()
+    valid_factor_count = (
+        (factor_loss_mask > 0.0).float().sum()
+    )
+    factors_per_transition = (
+        valid_factor_count / denominator
+    )
+    return {
+        "loss": loss,
+        "positive_loss": positive_loss,
+        "negative_loss": negative_loss,
+        "min_surr": min_surr,
+        "target_count": target_count,
+        "valid_transition_count": valid_transition_count,
+        "factors_per_transition": factors_per_transition,
+    }
+
+
+def compute_capture_candidate_identity_loss(
+        candidate_scores,
+        candidate_identity_delta,
+        candidate_valid_mask,
+        transition_mask):
+    """Target-local loss for exact real captures absent from the active graph.
+
+    Candidate scores are positive *relative selection weights*.  They are not
+    independent Bernoulli probabilities: every graph-selection slot samples
+    from a conditionally normalized candidate set.  Definition version 3
+    therefore supervises the canonical valid-catalog distribution
+
+        ``P(c | C_t) = score_c / sum(j in C_t, score_j)``
+
+    with the signed conditional objective
+
+        ``loss = -sum(delta * log(P(c | C_t))) / valid_graph_transitions``.
+
+    For a single target in a transition, the derivative with respect to a
+    candidate log-weight is ``-delta * (1[c == target] - P(c | C_t))``.
+    Positive outcomes raise the target relative to its competitors; negative
+    outcomes lower it.  Multiplying every valid score by the same constant
+    leaves both the loss and gradients unchanged, so the auxiliary objective
+    cannot improve itself through global score-scale drift.  Competitors get
+    only the implicit normalization gradient: their explicit identity delta
+    remains exactly zero.  No behavior importance ratio is used because these
+    candidates were explicitly *not* active graph actions.
+    """
+    if (
+            candidate_scores.shape != candidate_identity_delta.shape
+            or candidate_scores.shape != candidate_valid_mask.shape):
+        raise ValueError(
+            "candidate score/delta/mask shapes must match: {}, {}, {}"
+            .format(
+                tuple(candidate_scores.shape),
+                tuple(candidate_identity_delta.shape),
+                tuple(candidate_valid_mask.shape),
+            )
+        )
+    if transition_mask.dim() == 1:
+        transition_mask = transition_mask.unsqueeze(-1)
+    if (
+            transition_mask.dim() != 2
+            or transition_mask.shape[0] != candidate_scores.shape[0]
+            or transition_mask.shape[1] != 1):
+        raise ValueError(
+            "candidate transition_mask must have shape [{}, 1], got {}"
+            .format(candidate_scores.shape[0], tuple(transition_mask.shape))
+        )
+    for tensor in (
+            candidate_scores,
+            candidate_identity_delta,
+            candidate_valid_mask,
+            transition_mask):
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise FloatingPointError("non-finite candidate identity loss input")
+    if bool(torch.any(candidate_scores < 0.0).item()):
+        raise RuntimeError("candidate scores must be non-negative")
+    target_mask = candidate_identity_delta.abs() > 0.0
+    if bool(torch.any(target_mask & (candidate_scores <= 0.0)).item()):
+        raise RuntimeError(
+            "candidate-only outcome delta requires a strictly positive "
+            "selection weight"
+        )
+    if bool(torch.any(target_mask & (candidate_valid_mask <= 0.0)).item()):
+        raise RuntimeError(
+            "candidate-only outcome delta targets an invalid candidate"
+        )
+    if bool(torch.any(target_mask & (transition_mask <= 0.0)).item()):
+        raise RuntimeError(
+            "candidate-only outcome delta targets a padded or invalid "
+            "transition"
+        )
+    if bool(torch.any(
+            (candidate_valid_mask > 0.0)
+            & (transition_mask > 0.0)
+            & (candidate_scores <= 0.0)
+    ).item()):
+        raise RuntimeError(
+            "valid conditional candidate set contains a non-positive score"
+        )
+    valid_transition_count = transition_mask.sum()
+    if (
+            bool(torch.any(target_mask).item())
+            and not bool((valid_transition_count > 0.0).item())):
+        raise RuntimeError(
+            "candidate-only outcome delta has no valid transition denominator"
+        )
+    effective_valid = (
+        (candidate_valid_mask > 0.0)
+        & (transition_mask > 0.0)
+    )
+    target_transition = target_mask.any(dim=1)
+    valid_candidate_count = effective_valid.long().sum(dim=1)
+    if bool(torch.any(target_transition & (valid_candidate_count <= 0)).item()):
+        raise RuntimeError(
+            "candidate-only outcome target has no valid conditional "
+            "candidate set"
+        )
+
+    # Evaluate the conditional log probability in log space.  Invalid entries
+    # receive a finite sentinel only inside logsumexp and are zeroed before any
+    # objective or diagnostic reduction.  Valid scores are strictly positive
+    # by construction; target scores were checked explicitly above.
+    safe_valid_score = torch.where(
+        effective_valid,
+        candidate_scores,
+        torch.ones_like(candidate_scores),
+    )
+    log_selection_weight = torch.log(safe_valid_score)
+    masked_log_weight = torch.where(
+        effective_valid,
+        log_selection_weight,
+        torch.full_like(log_selection_weight, -1.0e30),
+    )
+    log_normalizer = torch.logsumexp(
+        masked_log_weight,
+        dim=1,
+        keepdim=True,
+    )
+    log_selection_probability = torch.where(
+        effective_valid,
+        log_selection_weight - log_normalizer,
+        torch.zeros_like(log_selection_weight),
+    )
+    selection_probability = (
+        torch.exp(log_selection_probability)
+        * effective_valid.to(candidate_scores.dtype)
+    )
+    positive_weight = candidate_identity_delta.clamp_min(0.0)
+    negative_weight = (-candidate_identity_delta).clamp_min(0.0)
+    positive_objective = -(positive_weight * log_selection_probability)
+    negative_objective = negative_weight * log_selection_probability
+    effective_mask = candidate_valid_mask * transition_mask
+    denominator = valid_transition_count.clamp_min(1.0)
+    positive_loss = (positive_objective * effective_mask).sum() / denominator
+    negative_loss = (negative_objective * effective_mask).sum() / denominator
+    loss = positive_loss + negative_loss
+    positive_target_mask = (
+        (candidate_identity_delta > 0.0).float() * effective_mask
+    )
+    negative_target_mask = (
+        (candidate_identity_delta < 0.0).float() * effective_mask
+    )
+    return {
+        "loss": loss,
+        "positive_loss": positive_loss,
+        "negative_loss": negative_loss,
+        "target_count": (
+            target_mask.float() * (effective_mask > 0.0).float()
+        ).sum(),
+        "valid_transition_count": valid_transition_count,
+        "positive_mass": positive_weight.sum(),
+        "negative_mass": negative_weight.sum(),
+        "positive_score_mean": (
+            (candidate_scores * positive_target_mask).sum()
+            / positive_target_mask.sum().clamp_min(1.0)
+        ),
+        "negative_score_mean": (
+            (candidate_scores * negative_target_mask).sum()
+            / negative_target_mask.sum().clamp_min(1.0)
+        ),
+        "selection_probability": selection_probability,
+        "log_selection_probability": log_selection_probability,
+        "positive_selection_probability_mean": (
+            (selection_probability * positive_target_mask).sum()
+            / positive_target_mask.sum().clamp_min(1.0)
+        ),
+        "negative_selection_probability_mean": (
+            (selection_probability * negative_target_mask).sum()
+            / negative_target_mask.sum().clamp_min(1.0)
+        ),
+        # Retain the old bounded-score diagnostic for CSV compatibility only.
+        # Definition version 2 never consumes it as a probability or loss.
+        "positive_legacy_bounded_score_mean": (
+            (
+                (candidate_scores / (1.0 + candidate_scores))
+                * positive_target_mask
+            ).sum()
+            / positive_target_mask.sum().clamp_min(1.0)
+        ),
+        "negative_legacy_bounded_score_mean": (
+            (
+                (candidate_scores / (1.0 + candidate_scores))
+                * negative_target_mask
+            ).sum()
+            / negative_target_mask.sum().clamp_min(1.0)
+        ),
+        "positive_log_score_mean": (
+            (log_selection_weight * positive_target_mask).sum()
+            / positive_target_mask.sum().clamp_min(1.0)
+        ),
+        "negative_log_score_mean": (
+            (log_selection_weight * negative_target_mask).sum()
+            / negative_target_mask.sum().clamp_min(1.0)
+        ),
+        "positive_log_probability_mean": (
+            (log_selection_probability * positive_target_mask).sum()
+            / positive_target_mask.sum().clamp_min(1.0)
+        ),
+        "negative_log_probability_mean": (
+            (log_selection_probability * negative_target_mask).sum()
+            / negative_target_mask.sum().clamp_min(1.0)
+        ),
+    }
 
 
 def _infer_inactive_dones_from_obs(obs_seq: torch.Tensor) -> torch.Tensor:
@@ -295,6 +595,28 @@ class R_SDDFG:
                 "adj_capture_to_win_credit_require_future_match",
                 False,
             )
+        )
+        self.use_adj_pair_triplet_complementary_credit = bool(
+            getattr(
+                self.args,
+                "use_adj_pair_triplet_complementary_credit",
+                False,
+            )
+        )
+        self.adj_pair_pursuit_credit_coef = max(
+            0.0,
+            float(getattr(self.args, "adj_pair_pursuit_credit_coef", 0.0)),
+        )
+        self.adj_pair_pursuit_credit_window = max(
+            1,
+            int(getattr(self.args, "adj_pair_pursuit_credit_window", 20)),
+        )
+        self.adj_pair_pursuit_credit_cap = max(
+            0.0,
+            float(getattr(self.args, "adj_pair_pursuit_credit_cap", 0.20)),
+        )
+        self.adj_pair_pursuit_credit_min_reward = float(
+            getattr(self.args, "adj_pair_pursuit_credit_min_reward", 0.0)
         )
         self.use_adj_ppo_stale_trust = bool(
             getattr(self.args, "use_adj_ppo_stale_trust", False)
@@ -781,7 +1103,89 @@ class R_SDDFG:
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):
         """See parent class."""
 
-        if len(batch) >= 16:
+        pair_transition_delay_batch = None
+        capture_counts_batch = None
+        capture_matched_count_batch = None
+        positive_reward_without_capture_batch = None
+        offset0_candidate_count_batch = None
+        positive_reward_step_batch = None
+        previous_adj_batch = None
+        capture_to_win_episode_success_gate_batch = None
+        failed_episode_capture_count_batch = None
+        capture_outcome_diagnostics_batch = None
+        candidate_identity_delta_batch = None
+        candidate_behavior_batch = None
+        if len(batch) >= 27:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, \
+                delayed_triplet_credit_batch, \
+                delayed_triplet_success_gate_batch, \
+                delayed_triplet_future_match_batch, \
+                delayed_triplet_future_exact_batch, \
+                delayed_triplet_future_partial_batch, \
+                capture_to_win_triplet_credit_batch, \
+                capture_to_win_quality_gate_batch, \
+                pair_pursuit_credit_batch, \
+                pair_pursuit_quality_batch, \
+                pair_to_triplet_transition_score_batch, \
+                triplet_capture_quality_batch, \
+                rnn_obs_batch, \
+                pair_transition_delay_batch, \
+                capture_counts_batch, \
+                capture_matched_count_batch, \
+                positive_reward_without_capture_batch, \
+                offset0_candidate_count_batch, \
+                positive_reward_step_batch, \
+                previous_adj_batch = batch[:27]
+            if len(batch) >= 29:
+                capture_to_win_episode_success_gate_batch, \
+                    failed_episode_capture_count_batch = batch[27:29]
+            if len(batch) >= 30:
+                capture_outcome_diagnostics_batch = batch[29]
+            if len(batch) >= 31:
+                candidate_identity_delta_batch = batch[30]
+            if len(batch) >= 32:
+                candidate_behavior_batch = batch[31]
+        elif len(batch) >= 26:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, \
+                delayed_triplet_credit_batch, \
+                delayed_triplet_success_gate_batch, \
+                delayed_triplet_future_match_batch, \
+                delayed_triplet_future_exact_batch, \
+                delayed_triplet_future_partial_batch, \
+                capture_to_win_triplet_credit_batch, \
+                capture_to_win_quality_gate_batch, \
+                pair_pursuit_credit_batch, \
+                pair_pursuit_quality_batch, \
+                pair_to_triplet_transition_score_batch, \
+                triplet_capture_quality_batch, \
+                rnn_obs_batch, \
+                pair_transition_delay_batch, \
+                capture_counts_batch, \
+                capture_matched_count_batch, \
+                positive_reward_without_capture_batch, \
+                offset0_candidate_count_batch, \
+                positive_reward_step_batch = batch[:26]
+        elif len(batch) >= 20:
+            obs_batch, _share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                _advantages_batch, f_advts_batch, \
+                delayed_triplet_credit_batch, \
+                delayed_triplet_success_gate_batch, \
+                delayed_triplet_future_match_batch, \
+                delayed_triplet_future_exact_batch, \
+                delayed_triplet_future_partial_batch, \
+                capture_to_win_triplet_credit_batch, \
+                capture_to_win_quality_gate_batch, \
+                pair_pursuit_credit_batch, \
+                pair_pursuit_quality_batch, \
+                pair_to_triplet_transition_score_batch, \
+                triplet_capture_quality_batch, \
+                rnn_obs_batch = batch[:20]
+        elif len(batch) >= 16:
             obs_batch, _share_obs_batch, dones_batch, \
                 dones_env_batch, adj_batch, prob_adj_batch, \
                 _advantages_batch, f_advts_batch, \
@@ -793,6 +1197,10 @@ class R_SDDFG:
                 capture_to_win_triplet_credit_batch, \
                 capture_to_win_quality_gate_batch, \
                 rnn_obs_batch = batch[:16]
+            pair_pursuit_credit_batch = None
+            pair_pursuit_quality_batch = None
+            pair_to_triplet_transition_score_batch = None
+            triplet_capture_quality_batch = None
         elif len(batch) >= 14:
             obs_batch, _share_obs_batch, dones_batch, \
                 dones_env_batch, adj_batch, prob_adj_batch, \
@@ -805,6 +1213,10 @@ class R_SDDFG:
                 rnn_obs_batch = batch[:14]
             capture_to_win_triplet_credit_batch = None
             capture_to_win_quality_gate_batch = None
+            pair_pursuit_credit_batch = None
+            pair_pursuit_quality_batch = None
+            pair_to_triplet_transition_score_batch = None
+            triplet_capture_quality_batch = None
         elif len(batch) >= 11:
             obs_batch, _share_obs_batch, dones_batch, \
                 dones_env_batch, adj_batch, prob_adj_batch, \
@@ -817,6 +1229,10 @@ class R_SDDFG:
             delayed_triplet_future_partial_batch = None
             capture_to_win_triplet_credit_batch = None
             capture_to_win_quality_gate_batch = None
+            pair_pursuit_credit_batch = None
+            pair_pursuit_quality_batch = None
+            pair_to_triplet_transition_score_batch = None
+            triplet_capture_quality_batch = None
         elif len(batch) >= 10:
             obs_batch, _share_obs_batch, dones_batch, \
                 dones_env_batch, adj_batch, prob_adj_batch, \
@@ -828,6 +1244,10 @@ class R_SDDFG:
             delayed_triplet_future_partial_batch = None
             capture_to_win_triplet_credit_batch = None
             capture_to_win_quality_gate_batch = None
+            pair_pursuit_credit_batch = None
+            pair_pursuit_quality_batch = None
+            pair_to_triplet_transition_score_batch = None
+            triplet_capture_quality_batch = None
         else:
             obs_batch, _share_obs_batch, dones_batch, \
                 dones_env_batch, adj_batch, prob_adj_batch, \
@@ -839,6 +1259,10 @@ class R_SDDFG:
             delayed_triplet_future_partial_batch = None
             capture_to_win_triplet_credit_batch = None
             capture_to_win_quality_gate_batch = None
+            pair_pursuit_credit_batch = None
+            pair_pursuit_quality_batch = None
+            pair_to_triplet_transition_score_batch = None
+            triplet_capture_quality_batch = None
         tarprob_adj = []
         adj_entropy = []
         adj = to_torch(adj_batch)  # [batch_size,step,num_agent,-1]
@@ -847,6 +1271,13 @@ class R_SDDFG:
         dones = to_torch(dones_batch).reshape(batch_size, self.num_agents, -1).to(self.device)
         dones_env = to_torch(dones_env_batch).reshape(batch_size, -1).to(**self.tpdv)
         prob_adj = to_torch(prob_adj_batch).reshape(batch_size, self.num_agents, -1).to(**self.tpdv)
+        previous_adj = None
+        if previous_adj_batch is not None:
+            previous_adj = (
+                to_torch(previous_adj_batch)
+                .reshape(batch_size, self.num_agents, -1)
+                .to(**self.tpdv)
+            )
         f_advts = to_torch(f_advts_batch).reshape(batch_size, self.num_factor, -1).to(**self.tpdv)
         if delayed_triplet_credit_batch is None:
             delayed_triplet_credit = torch.zeros_like(f_advts)
@@ -904,6 +1335,139 @@ class R_SDDFG:
                 .reshape(batch_size, self.num_factor, -1)
                 .to(**self.tpdv)
             )
+        if pair_pursuit_credit_batch is None:
+            pair_pursuit_credit = torch.zeros_like(f_advts)
+        else:
+            pair_pursuit_credit = (
+                to_torch(pair_pursuit_credit_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if pair_pursuit_quality_batch is None:
+            pair_pursuit_quality = torch.zeros_like(f_advts)
+        else:
+            pair_pursuit_quality = (
+                to_torch(pair_pursuit_quality_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if pair_to_triplet_transition_score_batch is None:
+            pair_to_triplet_transition_score = torch.zeros_like(f_advts)
+        else:
+            pair_to_triplet_transition_score = (
+                to_torch(pair_to_triplet_transition_score_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        if triplet_capture_quality_batch is None:
+            triplet_capture_quality = torch.zeros_like(f_advts)
+        else:
+            triplet_capture_quality = (
+                to_torch(triplet_capture_quality_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+        num_candidate_factor = (
+            self.num_agents * (self.num_agents - 1) // 2
+            + self.num_agents * (self.num_agents - 1)
+            * (self.num_agents - 2) // 6
+        )
+        if candidate_identity_delta_batch is None:
+            candidate_identity_delta = torch.zeros(
+                batch_size,
+                num_candidate_factor,
+                1,
+                device=self.device,
+                dtype=f_advts.dtype,
+            )
+        else:
+            candidate_identity_delta = (
+                to_torch(candidate_identity_delta_batch)
+                .reshape(batch_size, num_candidate_factor, -1)
+                .to(**self.tpdv)
+            )
+        if candidate_behavior_batch is None:
+            candidate_behavior = torch.zeros(
+                batch_size,
+                num_candidate_factor,
+                4,
+                device=self.device,
+                dtype=f_advts.dtype,
+            )
+        else:
+            candidate_behavior = (
+                to_torch(candidate_behavior_batch)
+                .reshape(batch_size, num_candidate_factor, 4)
+                .to(**self.tpdv)
+            )
+        if not bool(torch.isfinite(candidate_behavior).all().item()):
+            raise FloatingPointError(
+                "non-finite rollout candidate behavior metadata"
+            )
+        if pair_transition_delay_batch is None:
+            pair_transition_delay = torch.zeros_like(f_advts)
+        else:
+            pair_transition_delay = (
+                to_torch(pair_transition_delay_batch)
+                .reshape(batch_size, self.num_factor, -1)
+                .to(**self.tpdv)
+            )
+
+        def _graph_diagnostic_tensor(values):
+            if values is None:
+                return torch.zeros_like(dones_env)
+            return (
+                to_torch(values)
+                .reshape(batch_size, -1)
+                .to(**self.tpdv)
+            )
+
+        capture_counts = _graph_diagnostic_tensor(capture_counts_batch)
+        capture_matched_count = _graph_diagnostic_tensor(
+            capture_matched_count_batch
+        )
+        positive_reward_without_capture = _graph_diagnostic_tensor(
+            positive_reward_without_capture_batch
+        )
+        offset0_candidate_count = _graph_diagnostic_tensor(
+            offset0_candidate_count_batch
+        )
+        positive_reward_step = _graph_diagnostic_tensor(
+            positive_reward_step_batch
+        )
+        capture_to_win_episode_success_gate = _graph_diagnostic_tensor(
+            capture_to_win_episode_success_gate_batch
+        )
+        failed_episode_capture_count = _graph_diagnostic_tensor(
+            failed_episode_capture_count_batch
+        )
+        if capture_outcome_diagnostics_batch is None:
+            capture_outcome_diagnostics = torch.zeros(
+                (batch_size, CAPTURE_OUTCOME_DIAGNOSTIC_WIDTH),
+                device=self.device,
+                dtype=f_advts.dtype,
+            )
+        else:
+            capture_outcome_diagnostics = (
+                to_torch(capture_outcome_diagnostics_batch)
+                .reshape(batch_size, -1)
+                .to(**self.tpdv)
+            )
+            if (
+                capture_outcome_diagnostics.shape[-1]
+                != CAPTURE_OUTCOME_DIAGNOSTIC_WIDTH
+            ):
+                raise RuntimeError(
+                    "capture outcome diagnostics must have width {}, got {}"
+                    .format(
+                        CAPTURE_OUTCOME_DIAGNOSTIC_WIDTH,
+                        capture_outcome_diagnostics.shape[-1],
+                    )
+                )
+            if not bool(torch.isfinite(capture_outcome_diagnostics).all().item()):
+                raise FloatingPointError(
+                    "non-finite capture outcome diagnostics in adjacency batch"
+                )
         rnn_obs = to_torch(rnn_obs_batch).reshape(batch_size, self.num_agents, -1).to(
             **self.tpdv)  # [batch_size,step-1,1]
         obs = to_torch(obs_batch).reshape(batch_size, self.num_agents, -1).to(**self.tpdv)
@@ -914,7 +1478,8 @@ class R_SDDFG:
                 rnn_obs=rnn_obs,
                 use_adj_init=use_adj_init,
                 dones=dones.bool(),
-                adj=adj
+                adj=adj,
+                previous_adj=previous_adj,
             )
 
             target_prob = torch.where(
@@ -928,6 +1493,26 @@ class R_SDDFG:
 
         tarlog_prob_adj = torch.cat(tarprob_adj, dim=-1)
         adj_entropy_batch = torch.cat(adj_entropy, dim=-1).unsqueeze(-1)
+        candidate_identity_scores, candidate_identity_valid_mask = (
+            self.adj_network.evaluate_candidate_identity_scores(
+                rnn_obs=rnn_obs,
+                dones=dones.bool(),
+            )
+        )
+        if candidate_identity_scores.shape != candidate_identity_delta[..., 0].shape:
+            raise RuntimeError(
+                "candidate identity replay/catalog shape mismatch: {} vs {}"
+                .format(
+                    tuple(candidate_identity_delta[..., 0].shape),
+                    tuple(candidate_identity_scores.shape),
+                )
+            )
+        candidate_identity_current_rank = (
+            self.adj_network.canonical_candidate_ranks(
+                candidate_identity_scores,
+                candidate_identity_valid_mask,
+            ).to(candidate_identity_scores.dtype)
+        )
 
         prob_adj_safe = torch.where(
             adj == 1,
@@ -1065,6 +1650,10 @@ class R_SDDFG:
             1.0 + self.adj_order_adv_coef * order_extra
         )
         triplet_order_mask = order_extra > 0.0
+        capture_factor_order_mask = (
+            ((factor_order_2d == 2.0) | (factor_order_2d == 3.0))
+            & (factor_training_mask > 0.0)
+        )
         triplet_graph_return_credit = torch.zeros_like(
             raw_local_factor_advantage
         )
@@ -1156,6 +1745,27 @@ class R_SDDFG:
                 raw_local_factor_advantage
                 + triplet_graph_return_credit
             )
+        # Outcome credit has an exact capture-factor identity.  Keep it out of
+        # AdjBuffer's shared f_advt tensor and inject it only after the graph
+        # mean has been removed.  Otherwise one credited capture factor changes the
+        # graph mean and silently broadcasts the opposite residual to every
+        # unrelated pair/triplet in the same transition.
+        capture_outcome_local_delta = (
+            capture_to_win_triplet_credit.squeeze(-1)
+            * factor_training_mask
+        )
+        if bool(torch.any(
+                (capture_outcome_local_delta.abs() > 0.0)
+                & ~capture_factor_order_mask
+        ).item()):
+            raise RuntimeError(
+                "capture outcome credit leaked into a non-pair/non-triplet "
+                "or invalid factor"
+            )
+        # Keep the capture-outcome objective separate from generic order credit.
+        # Its event/episode mass is already normalized and its identity is exact;
+        # mixing it into the shared residual makes later order weighting and the
+        # all-factor loss denominator change that mass.
         positive_residual_mask = credit_local_factor_advantage > 0.0
         graph_promotion_strength = torch.ones_like(graph_advantage)
         if self.adj_order_adv_require_positive_graph_adv:
@@ -1234,9 +1844,14 @@ class R_SDDFG:
             order_credit_weight,
             torch.ones_like(order_credit_weight),
         )
-        local_factor_advantage = (
+        base_local_factor_advantage = (
             credit_local_factor_advantage
             * order_credit_weight
+        )
+        capture_outcome_weighted_delta = capture_outcome_local_delta
+        local_factor_advantage = (
+            base_local_factor_advantage
+            + capture_outcome_weighted_delta
         )
         factor_diff_log = (
             target_factor_logp - behavior_factor_logp
@@ -1277,6 +1892,16 @@ class R_SDDFG:
             clipped_factor_imp_weights * local_factor_advantage
         )
         factor_min_surr = torch.min(factor_surr1, factor_surr2)
+        base_factor_surr1 = (
+            factor_imp_weights * base_local_factor_advantage
+        )
+        base_factor_surr2 = (
+            clipped_factor_imp_weights * base_local_factor_advantage
+        )
+        base_factor_min_surr = torch.min(
+            base_factor_surr1,
+            base_factor_surr2,
+        )
         raw_factor_surr1 = (
             factor_imp_weights * raw_local_factor_advantage
         )
@@ -1297,10 +1922,365 @@ class R_SDDFG:
             credit_factor_surr1,
             credit_factor_surr2,
         )
-        factor_rl_loss = -(
-            factor_min_surr
+        base_factor_rl_loss = -(
+            base_factor_min_surr
             * factor_loss_mask
         ).sum() / factor_loss_mask.sum().clamp_min(1.0)
+        capture_outcome_loss_info = compute_capture_outcome_factor_ppo_loss(
+            factor_imp_weights=factor_imp_weights,
+            clipped_factor_imp_weights=clipped_factor_imp_weights,
+            capture_outcome_local_delta=capture_outcome_weighted_delta,
+            factor_loss_mask=factor_loss_mask,
+            transition_mask=transition_mask,
+        )
+        capture_outcome_factor_loss_contribution = (
+            capture_outcome_loss_info["loss"]
+        )
+        capture_outcome_positive_factor_loss_contribution = (
+            capture_outcome_loss_info["positive_loss"]
+        )
+        capture_outcome_negative_factor_loss_contribution = (
+            capture_outcome_loss_info["negative_loss"]
+        )
+        capture_outcome_factor_loss_target_count = (
+            capture_outcome_loss_info["target_count"]
+        )
+        capture_outcome_factor_loss_valid_transition_count = (
+            capture_outcome_loss_info["valid_transition_count"]
+        )
+        capture_outcome_factor_loss_factors_per_transition = (
+            capture_outcome_loss_info["factors_per_transition"]
+        )
+        capture_outcome_factor_loss_normalization_version = 2.0
+        candidate_identity_loss_info = compute_capture_candidate_identity_loss(
+            candidate_scores=candidate_identity_scores,
+            candidate_identity_delta=candidate_identity_delta[..., 0],
+            candidate_valid_mask=candidate_identity_valid_mask,
+            transition_mask=transition_mask,
+        )
+        candidate_target_mask = candidate_identity_delta[..., 0].abs() > 0.0
+        behavior_candidate_score = candidate_behavior[..., 0]
+        behavior_candidate_rank = candidate_behavior[..., 1]
+        behavior_candidate_valid = candidate_behavior[..., 2]
+        behavior_candidate_version = candidate_behavior[..., 3]
+        if bool(torch.any(
+                candidate_target_mask & (behavior_candidate_score <= 0.0)
+        ).item()):
+            raise RuntimeError(
+                "candidate-only outcome target has no positive rollout "
+                "selection weight"
+            )
+        if bool(torch.any(candidate_target_mask & (behavior_candidate_valid <= 0.0)).item()):
+            raise RuntimeError(
+                "candidate-only outcome target was invalid under the rollout "
+                "candidate mask"
+            )
+        if bool(torch.any(candidate_target_mask & (behavior_candidate_rank < 1.0)).item()):
+            raise RuntimeError(
+                "candidate-only outcome target has no rollout canonical rank"
+            )
+        if not bool(torch.all(
+                behavior_candidate_version
+                == torch.round(behavior_candidate_version)
+        ).item()):
+            raise RuntimeError("candidate graph-policy version must be integral")
+        current_candidate_policy_version = int(getattr(
+            self.adj_network,
+            "candidate_policy_version",
+            0,
+        ))
+        candidate_policy_age = (
+            float(current_candidate_policy_version)
+            - behavior_candidate_version
+        )
+        if bool(torch.any(candidate_target_mask & (candidate_policy_age < 0.0)).item()):
+            raise RuntimeError(
+                "candidate replay metadata comes from a future graph-policy "
+                "version"
+            )
+        candidate_target_float = candidate_target_mask.float()
+        candidate_positive_target = (
+            candidate_identity_delta[..., 0] > 0.0
+        ).float()
+        candidate_negative_target = (
+            candidate_identity_delta[..., 0] < 0.0
+        ).float()
+        candidate_target_denominator = candidate_target_float.sum().clamp_min(1.0)
+        candidate_positive_denominator = candidate_positive_target.sum().clamp_min(1.0)
+        candidate_negative_denominator = candidate_negative_target.sum().clamp_min(1.0)
+        capture_candidate_identity_behavior_score_mean = (
+            (behavior_candidate_score * candidate_target_float).sum()
+            / candidate_target_denominator
+        )
+        capture_candidate_identity_behavior_rank_mean = (
+            (behavior_candidate_rank * candidate_target_float).sum()
+            / candidate_target_denominator
+        )
+        capture_candidate_identity_positive_behavior_score_mean = (
+            (behavior_candidate_score * candidate_positive_target).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_behavior_score_mean = (
+            (behavior_candidate_score * candidate_negative_target).sum()
+            / candidate_negative_denominator
+        )
+        capture_candidate_identity_positive_behavior_rank_mean = (
+            (behavior_candidate_rank * candidate_positive_target).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_behavior_rank_mean = (
+            (behavior_candidate_rank * candidate_negative_target).sum()
+            / candidate_negative_denominator
+        )
+        capture_candidate_identity_positive_current_rank_mean = (
+            (candidate_identity_current_rank * candidate_positive_target).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_current_rank_mean = (
+            (candidate_identity_current_rank * candidate_negative_target).sum()
+            / candidate_negative_denominator
+        )
+        behavior_effective_valid = (
+            (behavior_candidate_valid > 0.0)
+            & (transition_mask > 0.0)
+        )
+        behavior_safe_score = torch.where(
+            behavior_effective_valid,
+            behavior_candidate_score,
+            torch.ones_like(behavior_candidate_score),
+        )
+        behavior_log_score = torch.log(behavior_safe_score)
+        behavior_masked_log_score = torch.where(
+            behavior_effective_valid,
+            behavior_log_score,
+            torch.full_like(behavior_log_score, -1.0e30),
+        )
+        behavior_log_probability = torch.where(
+            behavior_effective_valid,
+            behavior_log_score - torch.logsumexp(
+                behavior_masked_log_score,
+                dim=1,
+                keepdim=True,
+            ),
+            torch.zeros_like(behavior_log_score),
+        )
+        behavior_probability = (
+            torch.exp(behavior_log_probability)
+            * behavior_effective_valid.to(behavior_candidate_score.dtype)
+        )
+        current_probability = candidate_identity_loss_info[
+            "selection_probability"
+        ]
+        current_log_probability = candidate_identity_loss_info[
+            "log_selection_probability"
+        ]
+        capture_candidate_identity_positive_behavior_probability_mean = (
+            (behavior_probability * candidate_positive_target).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_behavior_probability_mean = (
+            (behavior_probability * candidate_negative_target).sum()
+            / candidate_negative_denominator
+        )
+        candidate_safe_current_score = torch.where(
+            candidate_target_mask,
+            candidate_identity_scores,
+            torch.ones_like(candidate_identity_scores),
+        )
+        candidate_safe_behavior_score = torch.where(
+            candidate_target_mask,
+            behavior_candidate_score,
+            torch.ones_like(behavior_candidate_score),
+        )
+        candidate_log_score_change = (
+            torch.log(candidate_safe_current_score)
+            - torch.log(candidate_safe_behavior_score)
+        )
+        capture_candidate_identity_positive_log_score_change_mean = (
+            (candidate_log_score_change * candidate_positive_target).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_log_score_change_mean = (
+            (candidate_log_score_change * candidate_negative_target).sum()
+            / candidate_negative_denominator
+        )
+        candidate_safe_current_log_probability = torch.where(
+            candidate_target_mask,
+            current_log_probability,
+            torch.zeros_like(current_log_probability),
+        )
+        candidate_safe_behavior_log_probability = torch.where(
+            candidate_target_mask,
+            behavior_log_probability,
+            torch.zeros_like(behavior_log_probability),
+        )
+        candidate_log_probability_change = (
+            candidate_safe_current_log_probability
+            - candidate_safe_behavior_log_probability
+        )
+        capture_candidate_identity_positive_log_probability_change_mean = (
+            (
+                candidate_log_probability_change
+                * candidate_positive_target
+            ).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_log_probability_change_mean = (
+            (
+                candidate_log_probability_change
+                * candidate_negative_target
+            ).sum()
+            / candidate_negative_denominator
+        )
+        capture_candidate_identity_positive_score_improved_fraction = (
+            (
+                (candidate_log_score_change > 0.0).float()
+                * candidate_positive_target
+            ).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_score_reduced_fraction = (
+            (
+                (candidate_log_score_change < 0.0).float()
+                * candidate_negative_target
+            ).sum()
+            / candidate_negative_denominator
+        )
+        capture_candidate_identity_positive_probability_improved_fraction = (
+            (
+                (candidate_log_probability_change > 0.0).float()
+                * candidate_positive_target
+            ).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_probability_reduced_fraction = (
+            (
+                (candidate_log_probability_change < 0.0).float()
+                * candidate_negative_target
+            ).sum()
+            / candidate_negative_denominator
+        )
+        capture_candidate_identity_positive_rank_improved_fraction = (
+            (
+                (
+                    candidate_identity_current_rank
+                    < behavior_candidate_rank
+                ).float()
+                * candidate_positive_target
+            ).sum()
+            / candidate_positive_denominator
+        )
+        capture_candidate_identity_negative_rank_reduced_fraction = (
+            (
+                (
+                    candidate_identity_current_rank
+                    > behavior_candidate_rank
+                ).float()
+                * candidate_negative_target
+            ).sum()
+            / candidate_negative_denominator
+        )
+        capture_candidate_identity_behavior_valid_fraction = (
+            (behavior_candidate_valid * candidate_target_float).sum()
+            / candidate_target_denominator
+        )
+        capture_candidate_identity_policy_age_mean = (
+            (candidate_policy_age * candidate_target_float).sum()
+            / candidate_target_denominator
+        )
+        capture_candidate_identity_policy_age_max = torch.where(
+            candidate_target_mask,
+            candidate_policy_age,
+            torch.zeros_like(candidate_policy_age),
+        ).max()
+        capture_candidate_identity_loss_contribution = (
+            candidate_identity_loss_info["loss"]
+        )
+        capture_candidate_identity_positive_loss_contribution = (
+            candidate_identity_loss_info["positive_loss"]
+        )
+        capture_candidate_identity_negative_loss_contribution = (
+            candidate_identity_loss_info["negative_loss"]
+        )
+        capture_candidate_identity_target_count = (
+            candidate_identity_loss_info["target_count"]
+        )
+        capture_candidate_identity_positive_mass = (
+            candidate_identity_loss_info["positive_mass"]
+        )
+        capture_candidate_identity_negative_mass = (
+            candidate_identity_loss_info["negative_mass"]
+        )
+        capture_candidate_identity_positive_score_mean = (
+            candidate_identity_loss_info["positive_score_mean"]
+        )
+        capture_candidate_identity_negative_score_mean = (
+            candidate_identity_loss_info["negative_score_mean"]
+        )
+        capture_candidate_identity_positive_probability_mean = (
+            candidate_identity_loss_info[
+                "positive_selection_probability_mean"
+            ]
+        )
+        capture_candidate_identity_negative_probability_mean = (
+            candidate_identity_loss_info[
+                "negative_selection_probability_mean"
+            ]
+        )
+        capture_candidate_identity_positive_legacy_bounded_score_mean = (
+            candidate_identity_loss_info[
+                "positive_legacy_bounded_score_mean"
+            ]
+        )
+        capture_candidate_identity_negative_legacy_bounded_score_mean = (
+            candidate_identity_loss_info[
+                "negative_legacy_bounded_score_mean"
+            ]
+        )
+        capture_candidate_identity_positive_log_score_mean = (
+            candidate_identity_loss_info["positive_log_score_mean"]
+        )
+        capture_candidate_identity_negative_log_score_mean = (
+            candidate_identity_loss_info["negative_log_score_mean"]
+        )
+        capture_candidate_identity_positive_log_probability_mean = (
+            candidate_identity_loss_info["positive_log_probability_mean"]
+        )
+        capture_candidate_identity_negative_log_probability_mean = (
+            candidate_identity_loss_info["negative_log_probability_mean"]
+        )
+        candidate_valid_transition_mask = (
+            (candidate_identity_valid_mask > 0.0)
+            & (transition_mask > 0.0)
+        )
+        candidate_valid_scores = candidate_identity_scores[
+            candidate_valid_transition_mask
+        ]
+        if candidate_valid_scores.numel() > 0:
+            capture_candidate_identity_valid_score_mean = (
+                candidate_valid_scores.mean()
+            )
+            capture_candidate_identity_valid_score_min = (
+                candidate_valid_scores.min()
+            )
+            capture_candidate_identity_valid_score_max = (
+                candidate_valid_scores.max()
+            )
+        else:
+            capture_candidate_identity_valid_score_mean = (
+                candidate_identity_scores.new_tensor(0.0)
+            )
+            capture_candidate_identity_valid_score_min = (
+                candidate_identity_scores.new_tensor(0.0)
+            )
+            capture_candidate_identity_valid_score_max = (
+                candidate_identity_scores.new_tensor(0.0)
+            )
+        factor_rl_loss = (
+            base_factor_rl_loss
+            + capture_outcome_factor_loss_contribution
+            + capture_candidate_identity_loss_contribution
+        )
         rl_loss = graph_rl_loss + factor_rl_loss
 
         # 仅对环境未结束且在线的 agent 计算图熵。
@@ -1339,6 +2319,16 @@ class R_SDDFG:
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.adj_parameters, self.adj_max_grad_norm)
         self.adj_optimizer.step()
+        current_candidate_policy_version = int(getattr(
+            self.adj_network,
+            "candidate_policy_version",
+            0,
+        ))
+        if current_candidate_policy_version < 0:
+            raise RuntimeError("candidate graph-policy version is negative")
+        self.adj_network.candidate_policy_version = (
+            current_candidate_policy_version + 1
+        )
 
         with torch.no_grad():
             valid_transition_ratio = float((1.0 - bad_transitions_mask).mean().detach().cpu().item())
@@ -1422,6 +2412,12 @@ class R_SDDFG:
             )
             order2_factor_count = order2_factor_mask.sum()
             order3_factor_count = order3_factor_mask.sum()
+            capture_factor_order_mask_float = (
+                order2_factor_mask + order3_factor_mask
+            ).clamp(max=1.0)
+            capture_factor_order_count = (
+                capture_factor_order_mask_float.sum()
+            )
             selected_order_factor_count = (
                 order2_factor_count + order3_factor_count
             ).clamp_min(1.0)
@@ -1604,32 +2600,500 @@ class R_SDDFG:
             capture_to_win_triplet_credit_mean = (
                 (
                     capture_to_win_triplet_credit_2d
-                    * order3_factor_mask
+                    * capture_factor_order_mask_float
                 ).sum()
-                / order3_factor_count.clamp_min(1.0)
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_triplet_credit_abs_mean = (
+                (
+                    capture_to_win_triplet_credit_2d.abs()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
             )
             capture_to_win_triplet_credit_active_fraction = (
                 (
                     (
                         capture_to_win_triplet_credit_2d.abs() > 0.0
                     ).float()
-                    * order3_factor_mask
+                    * capture_factor_order_mask_float
                 ).sum()
-                / order3_factor_count.clamp_min(1.0)
+                / capture_factor_order_count.clamp_min(1.0)
             )
+            capture_to_win_triplet_credit_positive_fraction = (
+                (
+                    (capture_to_win_triplet_credit_2d > 0.0).float()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_triplet_credit_negative_fraction = (
+                (
+                    (capture_to_win_triplet_credit_2d < 0.0).float()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_triplet_credit_positive_mass = (
+                (
+                    torch.clamp(
+                        capture_to_win_triplet_credit_2d,
+                        min=0.0,
+                    )
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_triplet_credit_negative_mass = (
+                (
+                    torch.clamp(
+                        -capture_to_win_triplet_credit_2d,
+                        min=0.0,
+                    )
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_outcome_local_delta_positive_mass = (
+                (
+                    torch.clamp(
+                        capture_outcome_weighted_delta,
+                        min=0.0,
+                    )
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_outcome_local_delta_negative_mass = (
+                (
+                    torch.clamp(
+                        -capture_outcome_weighted_delta,
+                        min=0.0,
+                    )
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_outcome_local_delta_active_fraction = (
+                (
+                    (capture_outcome_weighted_delta.abs() > 0.0).float()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_identity_target_mask_float = (
+                (capture_to_win_triplet_credit_2d.abs() > 0.0).float()
+                * capture_factor_order_mask_float
+            )
+            capture_identity_target_count = (
+                capture_identity_target_mask_float.sum()
+            )
+            capture_outcome_identity_order2_delta_abs_mass = (
+                capture_outcome_weighted_delta.abs() * order2_factor_mask
+            ).sum()
+            capture_outcome_identity_order3_delta_abs_mass = (
+                capture_outcome_weighted_delta.abs() * order3_factor_mask
+            ).sum()
+            capture_identity_target_order2_fraction = (
+                (capture_identity_target_mask_float * order2_factor_mask).sum()
+                / capture_identity_target_count.clamp_min(1.0)
+            )
+            capture_identity_target_order3_fraction = (
+                (capture_identity_target_mask_float * order3_factor_mask).sum()
+                / capture_identity_target_count.clamp_min(1.0)
+            )
+            capture_outcome_non_target_delta_abs_max = (
+                capture_outcome_weighted_delta.abs()
+                * (capture_identity_target_mask_float <= 0.0).float()
+                * capture_factor_order_mask_float
+            ).max()
             capture_to_win_quality_gate_mean = (
                 (
                     capture_to_win_quality_gate_2d
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_abs_mean = (
+                (
+                    capture_to_win_quality_gate_2d.abs()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_active_fraction = (
+                (
+                    (capture_to_win_quality_gate_2d.abs() > 0.0).float()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_positive_fraction = (
+                (
+                    (capture_to_win_quality_gate_2d > 0.0).float()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_negative_fraction = (
+                (
+                    (capture_to_win_quality_gate_2d < 0.0).float()
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_positive_mass = (
+                (
+                    torch.clamp(
+                        capture_to_win_quality_gate_2d,
+                        min=0.0,
+                    )
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            capture_to_win_quality_gate_negative_mass = (
+                (
+                    torch.clamp(
+                        -capture_to_win_quality_gate_2d,
+                        min=0.0,
+                    )
+                    * capture_factor_order_mask_float
+                ).sum()
+                / capture_factor_order_count.clamp_min(1.0)
+            )
+            pair_pursuit_credit_2d = pair_pursuit_credit.squeeze(-1)
+            pair_pursuit_quality_2d = pair_pursuit_quality.squeeze(-1)
+            pair_to_triplet_transition_score_2d = (
+                pair_to_triplet_transition_score.squeeze(-1)
+            )
+            triplet_capture_quality_2d = triplet_capture_quality.squeeze(-1)
+            pair_pursuit_credit_mean = (
+                (
+                    pair_pursuit_credit_2d
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            pair_pursuit_credit_active_fraction = (
+                (
+                    (pair_pursuit_credit_2d.abs() > 0.0).float()
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            valid_pair_credit_values = pair_pursuit_credit_2d[
+                order2_factor_mask > 0.0
+            ].abs()
+            if valid_pair_credit_values.numel() > 0:
+                pair_pursuit_credit_std = valid_pair_credit_values.std(
+                    unbiased=False
+                )
+                pair_pursuit_credit_max = valid_pair_credit_values.max()
+                pair_pursuit_credit_nonzero_count = (
+                    valid_pair_credit_values > 0.0
+                ).float().sum()
+                nonzero_pair_credit_values = valid_pair_credit_values[
+                    valid_pair_credit_values > 0.0
+                ]
+                pair_credit_top1_count = max(
+                    1,
+                    int(np.ceil(
+                        float(nonzero_pair_credit_values.numel()) * 0.01
+                    )),
+                )
+                if nonzero_pair_credit_values.numel() > 0:
+                    pair_credit_top1_mass_fraction = (
+                        torch.topk(
+                            nonzero_pair_credit_values,
+                            k=pair_credit_top1_count,
+                        )[0].sum()
+                        / nonzero_pair_credit_values.sum().clamp_min(1e-8)
+                    )
+                else:
+                    pair_credit_top1_mass_fraction = torch.zeros(
+                        (), device=self.device, dtype=f_advts.dtype
+                    )
+            else:
+                pair_pursuit_credit_std = torch.zeros(
+                    (), device=self.device, dtype=f_advts.dtype
+                )
+                pair_pursuit_credit_max = torch.zeros(
+                    (), device=self.device, dtype=f_advts.dtype
+                )
+                pair_pursuit_credit_nonzero_count = torch.zeros(
+                    (), device=self.device, dtype=f_advts.dtype
+                )
+                pair_credit_top1_mass_fraction = torch.zeros(
+                    (), device=self.device, dtype=f_advts.dtype
+                )
+            pair_pursuit_quality_mean = (
+                (
+                    pair_pursuit_quality_2d
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            pair_pursuit_quality_active_fraction = (
+                (
+                    (pair_pursuit_quality_2d > 0.0).float()
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            pair_to_triplet_transition_score_mean = (
+                (
+                    pair_to_triplet_transition_score_2d
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            pair_to_triplet_transition_active_fraction = (
+                (
+                    (
+                        pair_to_triplet_transition_score_2d > 0.0
+                    ).float()
+                    * order2_factor_mask
+                ).sum()
+                / order2_factor_count.clamp_min(1.0)
+            )
+            triplet_capture_quality_mean = (
+                (
+                    triplet_capture_quality_2d
                     * order3_factor_mask
                 ).sum()
                 / order3_factor_count.clamp_min(1.0)
             )
-            capture_to_win_quality_gate_active_fraction = (
+            triplet_capture_quality_active_fraction = (
                 (
-                    (capture_to_win_quality_gate_2d > 0.0).float()
+                    (triplet_capture_quality_2d > 0.0).float()
                     * order3_factor_mask
                 ).sum()
                 / order3_factor_count.clamp_min(1.0)
+            )
+            pair_transition_delay_2d = pair_transition_delay.squeeze(-1)
+            pair_transition_delay_mask = (
+                (pair_transition_delay_2d > 0.0).float()
+                * order2_factor_mask
+            )
+            pair_transition_delay_count = (
+                pair_transition_delay_mask.sum()
+            )
+            transition_delay_mean = (
+                (
+                    pair_transition_delay_2d
+                    * pair_transition_delay_mask
+                ).sum()
+                / pair_transition_delay_count.clamp_min(1.0)
+            )
+            if bool((pair_transition_delay_count > 0.0).item()):
+                valid_transition_delays = pair_transition_delay_2d[
+                    pair_transition_delay_mask > 0.0
+                ]
+                transition_delay_min = valid_transition_delays.min()
+                transition_delay_max = valid_transition_delays.max()
+            else:
+                transition_delay_min = torch.zeros(
+                    (), device=self.device, dtype=f_advts.dtype
+                )
+                transition_delay_max = torch.zeros(
+                    (), device=self.device, dtype=f_advts.dtype
+                )
+
+            capture_counts_safe = torch.clamp(capture_counts, min=0.0)
+            capture_matched_count_nonnegative = torch.clamp(
+                capture_matched_count, min=0.0
+            )
+            # Keep compatibility with the older server PyTorch, which does not
+            # provide torch.minimum. This is elementwise min(matched, captures)
+            # and also prevents a malformed diagnostic count from exceeding the
+            # number of real capture events.
+            capture_matched_count_safe = torch.where(
+                capture_matched_count_nonnegative <= capture_counts_safe,
+                capture_matched_count_nonnegative,
+                capture_counts_safe,
+            )
+            capture_count_total = capture_counts_safe.sum()
+            capture_matched_count_value = capture_matched_count_safe.sum()
+            unmatched_capture_count_value = (
+                capture_count_total - capture_matched_count_value
+            ).clamp_min(0.0)
+            capture_matched_fraction = (
+                capture_matched_count_value
+                / capture_count_total.clamp_min(1.0)
+            )
+            unmatched_capture_fraction = (
+                unmatched_capture_count_value
+                / capture_count_total.clamp_min(1.0)
+            )
+            failed_episode_capture_count_value = (
+                torch.clamp(
+                    failed_episode_capture_count,
+                    min=0.0,
+                ).sum()
+            )
+            failed_episode_capture_fraction = (
+                failed_episode_capture_count_value
+                / capture_count_total.clamp_min(1.0)
+            )
+            capture_to_win_capture_success_fraction = (
+                (
+                    capture_count_total - failed_episode_capture_count_value
+                ).clamp_min(0.0)
+                / capture_count_total.clamp_min(1.0)
+            )
+            capture_to_win_episode_success_fraction = (
+                (
+                    capture_to_win_episode_success_gate
+                    * transition_mask.reshape(batch_size, -1)
+                ).sum()
+                / transition_mask.sum().clamp_min(1.0)
+            )
+            outcome_episode_mask = torch.clamp(
+                capture_outcome_diagnostics[:, 10],
+                min=0.0,
+                max=1.0,
+            )
+            outcome_global_mask = (
+                transition_mask.reshape(batch_size, -1)
+                .max(dim=1)
+                .values
+            )
+            def _outcome_episode_mean(column, mask=outcome_episode_mask):
+                return (
+                    capture_outcome_diagnostics[:, column] * mask
+                ).sum() / mask.sum().clamp_min(1.0)
+
+            def _outcome_global_mean(column):
+                return (
+                    capture_outcome_diagnostics[:, column]
+                    * outcome_global_mask
+                ).sum() / outcome_global_mask.sum().clamp_min(1.0)
+
+            capture_outcome_baseline_mean = _outcome_global_mean(0)
+            capture_outcome_capture_episode_count_mean = (
+                _outcome_global_mean(1)
+            )
+            capture_outcome_success_episode_count_mean = (
+                _outcome_global_mean(2)
+            )
+            capture_outcome_failure_episode_count_mean = (
+                _outcome_global_mean(3)
+            )
+            capture_outcome_mixed_window_fraction = _outcome_global_mean(4)
+            capture_outcome_single_success_window_fraction = (
+                _outcome_global_mean(5)
+            )
+            capture_outcome_single_failure_window_fraction = (
+                _outcome_global_mean(6)
+            )
+            capture_outcome_no_capture_window_fraction = (
+                _outcome_global_mean(7)
+            )
+            sampled_capture_episode_mask = (
+                outcome_episode_mask
+                * (capture_outcome_diagnostics[:, 8] > 0.0).float()
+            )
+            capture_outcome_triplet_labels_per_episode_mean = (
+                _outcome_episode_mean(
+                    8,
+                    mask=sampled_capture_episode_mask,
+                )
+            )
+            if bool((sampled_capture_episode_mask.sum() > 0.0).item()):
+                capture_outcome_triplet_labels_per_episode_max = (
+                    capture_outcome_diagnostics[
+                        sampled_capture_episode_mask > 0.0,
+                        8,
+                    ].max()
+                )
+            else:
+                capture_outcome_triplet_labels_per_episode_max = torch.zeros(
+                    (), device=self.device, dtype=f_advts.dtype
+                )
+            capture_outcome_raw_episode_advantage_mean = (
+                _outcome_episode_mean(
+                    9,
+                    mask=sampled_capture_episode_mask,
+                )
+            )
+            capture_outcome_raw_episode_advantage_abs_mean = (
+                (
+                    capture_outcome_diagnostics[:, 9].abs()
+                    * sampled_capture_episode_mask
+                ).sum()
+                / sampled_capture_episode_mask.sum().clamp_min(1.0)
+            )
+            capture_outcome_window_raw_centered_mean = (
+                _outcome_global_mean(11)
+            )
+            capture_outcome_window_expanded_gate_sum = (
+                _outcome_global_mean(12)
+            )
+            capture_outcome_window_expanded_gate_abs_sum = (
+                _outcome_global_mean(13)
+            )
+            capture_outcome_window_center_error_ratio = (
+                capture_outcome_window_expanded_gate_sum.abs()
+                / capture_outcome_window_expanded_gate_abs_sum.clamp_min(1e-8)
+            )
+            capture_to_win_credit_preclip_mean = _outcome_global_mean(14)
+            capture_to_win_credit_preclip_std = _outcome_global_mean(15)
+            capture_to_win_credit_preclip_max = _outcome_global_mean(16)
+            capture_to_win_credit_preclip_min = _outcome_global_mean(17)
+            capture_to_win_credit_positive_clip_fraction = (
+                _outcome_global_mean(18)
+            )
+            capture_to_win_credit_negative_clip_fraction = (
+                _outcome_global_mean(19)
+            )
+            capture_identity_event_count_mean = _outcome_episode_mean(20)
+            capture_identity_matched_event_count_mean = (
+                _outcome_episode_mean(21)
+            )
+            capture_identity_unmatched_event_count_mean = (
+                _outcome_episode_mean(22)
+            )
+            capture_identity_candidate_factor_count_mean = (
+                _outcome_episode_mean(23)
+            )
+            capture_identity_match_fraction = (
+                capture_identity_matched_event_count_mean
+                / capture_identity_event_count_mean.clamp_min(1e-8)
+            )
+            capture_identity_candidates_per_matched_event = (
+                capture_identity_candidate_factor_count_mean
+                / capture_identity_matched_event_count_mean.clamp_min(1e-8)
+            )
+            capture_outcome_label_gate_correlation = _outcome_global_mean(24)
+            capture_outcome_label_gate_correlation_valid = (
+                _outcome_global_mean(25)
+            )
+            capture_outcome_success_labels_mean = _outcome_global_mean(26)
+            capture_outcome_failure_labels_mean = _outcome_global_mean(27)
+            capture_outcome_success_gate_total_mean = _outcome_global_mean(28)
+            capture_outcome_failure_gate_total_mean = _outcome_global_mean(29)
+            positive_reward_step_count_value = positive_reward_step.sum()
+            positive_reward_without_capture_count_value = (
+                positive_reward_without_capture.sum()
+            )
+            positive_reward_without_capture_fraction = (
+                positive_reward_without_capture_count_value
+                / positive_reward_step_count_value.clamp_min(1.0)
+            )
+            positive_reward_step_fraction = (
+                positive_reward_step_count_value
+                / transition_mask.sum().clamp_min(1.0)
+            )
+            offset0_candidate_count_value = (
+                offset0_candidate_count.sum()
+            )
+            offset0_candidate_fraction = (
+                (
+                    (offset0_candidate_count > 0.0).float()
+                    * transition_mask.reshape(batch_size, -1)
+                ).sum()
+                / transition_mask.sum().clamp_min(1.0)
             )
             graph_return_credit_strength_mean = (
                 (graph_return_credit_strength * transition_mask).sum()
@@ -1926,14 +3390,475 @@ class R_SDDFG:
         train_info['capture_to_win_triplet_credit_mean'] = _to_float(
             capture_to_win_triplet_credit_mean
         )
+        train_info['capture_to_win_triplet_credit_abs_mean'] = _to_float(
+            capture_to_win_triplet_credit_abs_mean
+        )
         train_info['capture_to_win_triplet_credit_active_fraction'] = _to_float(
             capture_to_win_triplet_credit_active_fraction
+        )
+        train_info['capture_to_win_triplet_credit_positive_fraction'] = _to_float(
+            capture_to_win_triplet_credit_positive_fraction
+        )
+        train_info['capture_to_win_triplet_credit_negative_fraction'] = _to_float(
+            capture_to_win_triplet_credit_negative_fraction
+        )
+        train_info['capture_to_win_triplet_credit_positive_mass'] = _to_float(
+            capture_to_win_triplet_credit_positive_mass
+        )
+        train_info['capture_to_win_triplet_credit_negative_mass'] = _to_float(
+            capture_to_win_triplet_credit_negative_mass
+        )
+        train_info['capture_outcome_local_delta_positive_mass'] = _to_float(
+            capture_outcome_local_delta_positive_mass
+        )
+        train_info['capture_outcome_local_delta_negative_mass'] = _to_float(
+            capture_outcome_local_delta_negative_mass
+        )
+        train_info['capture_outcome_local_delta_active_fraction'] = _to_float(
+            capture_outcome_local_delta_active_fraction
+        )
+        train_info['capture_outcome_factor_loss_contribution'] = _to_float(
+            capture_outcome_factor_loss_contribution
+        )
+        train_info[
+            'capture_outcome_positive_factor_loss_contribution'
+        ] = _to_float(capture_outcome_positive_factor_loss_contribution)
+        train_info[
+            'capture_outcome_negative_factor_loss_contribution'
+        ] = _to_float(capture_outcome_negative_factor_loss_contribution)
+        train_info[
+            'capture_outcome_factor_loss_target_count'
+        ] = _to_float(capture_outcome_factor_loss_target_count)
+        train_info[
+            'capture_outcome_factor_loss_valid_transition_count'
+        ] = _to_float(capture_outcome_factor_loss_valid_transition_count)
+        train_info[
+            'capture_outcome_factor_loss_factors_per_transition'
+        ] = _to_float(capture_outcome_factor_loss_factors_per_transition)
+        train_info[
+            'capture_outcome_factor_loss_normalization_version'
+        ] = float(capture_outcome_factor_loss_normalization_version)
+        train_info['capture_candidate_identity_loss_contribution'] = _to_float(
+            capture_candidate_identity_loss_contribution
+        )
+        train_info[
+            'capture_candidate_identity_positive_loss_contribution'
+        ] = _to_float(
+            capture_candidate_identity_positive_loss_contribution
+        )
+        train_info[
+            'capture_candidate_identity_negative_loss_contribution'
+        ] = _to_float(
+            capture_candidate_identity_negative_loss_contribution
+        )
+        train_info['capture_candidate_identity_target_count'] = _to_float(
+            capture_candidate_identity_target_count
+        )
+        train_info['capture_candidate_identity_positive_mass'] = _to_float(
+            capture_candidate_identity_positive_mass
+        )
+        train_info['capture_candidate_identity_negative_mass'] = _to_float(
+            capture_candidate_identity_negative_mass
+        )
+        train_info['capture_candidate_identity_positive_score_mean'] = _to_float(
+            capture_candidate_identity_positive_score_mean
+        )
+        train_info['capture_candidate_identity_negative_score_mean'] = _to_float(
+            capture_candidate_identity_negative_score_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_probability_mean'
+        ] = _to_float(capture_candidate_identity_positive_probability_mean)
+        train_info[
+            'capture_candidate_identity_negative_probability_mean'
+        ] = _to_float(capture_candidate_identity_negative_probability_mean)
+        train_info[
+            'capture_candidate_identity_positive_legacy_bounded_score_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_legacy_bounded_score_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_legacy_bounded_score_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_legacy_bounded_score_mean
+        )
+        # Version 3 uses the conditional probability over the current valid
+        # canonical candidate catalog.  The legacy s/(1+s) diagnostic now has
+        # an explicit field name and is never consumed by the objective.
+        train_info['capture_candidate_identity_loss_definition_version'] = 3.0
+        train_info['capture_candidate_identity_score_semantics_version'] = 3.0
+        train_info[
+            'capture_candidate_identity_positive_log_score_mean'
+        ] = _to_float(capture_candidate_identity_positive_log_score_mean)
+        train_info[
+            'capture_candidate_identity_negative_log_score_mean'
+        ] = _to_float(capture_candidate_identity_negative_log_score_mean)
+        train_info[
+            'capture_candidate_identity_positive_log_probability_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_log_probability_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_log_probability_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_log_probability_mean
+        )
+        train_info[
+            'capture_candidate_identity_valid_score_mean'
+        ] = _to_float(capture_candidate_identity_valid_score_mean)
+        train_info[
+            'capture_candidate_identity_valid_score_min'
+        ] = _to_float(capture_candidate_identity_valid_score_min)
+        train_info[
+            'capture_candidate_identity_valid_score_max'
+        ] = _to_float(capture_candidate_identity_valid_score_max)
+        train_info['capture_candidate_identity_behavior_score_mean'] = _to_float(
+            capture_candidate_identity_behavior_score_mean
+        )
+        train_info['capture_candidate_identity_behavior_rank_mean'] = _to_float(
+            capture_candidate_identity_behavior_rank_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_behavior_score_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_behavior_score_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_behavior_score_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_behavior_score_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_behavior_probability_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_behavior_probability_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_behavior_probability_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_behavior_probability_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_behavior_rank_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_behavior_rank_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_behavior_rank_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_behavior_rank_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_current_rank_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_current_rank_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_current_rank_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_current_rank_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_log_score_change_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_log_score_change_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_log_score_change_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_log_score_change_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_log_probability_change_mean'
+        ] = _to_float(
+            capture_candidate_identity_positive_log_probability_change_mean
+        )
+        train_info[
+            'capture_candidate_identity_negative_log_probability_change_mean'
+        ] = _to_float(
+            capture_candidate_identity_negative_log_probability_change_mean
+        )
+        train_info[
+            'capture_candidate_identity_positive_score_improved_fraction'
+        ] = _to_float(
+            capture_candidate_identity_positive_score_improved_fraction
+        )
+        train_info[
+            'capture_candidate_identity_negative_score_reduced_fraction'
+        ] = _to_float(
+            capture_candidate_identity_negative_score_reduced_fraction
+        )
+        train_info[
+            'capture_candidate_identity_positive_probability_improved_fraction'
+        ] = _to_float(
+            capture_candidate_identity_positive_probability_improved_fraction
+        )
+        train_info[
+            'capture_candidate_identity_negative_probability_reduced_fraction'
+        ] = _to_float(
+            capture_candidate_identity_negative_probability_reduced_fraction
+        )
+        train_info[
+            'capture_candidate_identity_positive_rank_improved_fraction'
+        ] = _to_float(
+            capture_candidate_identity_positive_rank_improved_fraction
+        )
+        train_info[
+            'capture_candidate_identity_negative_rank_reduced_fraction'
+        ] = _to_float(
+            capture_candidate_identity_negative_rank_reduced_fraction
+        )
+        train_info[
+            'capture_candidate_identity_behavior_valid_fraction'
+        ] = _to_float(capture_candidate_identity_behavior_valid_fraction)
+        train_info['capture_candidate_identity_policy_age_mean'] = _to_float(
+            capture_candidate_identity_policy_age_mean
+        )
+        train_info['capture_candidate_identity_policy_age_max'] = _to_float(
+            capture_candidate_identity_policy_age_max
+        )
+        train_info['capture_candidate_identity_policy_version'] = float(
+            current_candidate_policy_version
+        )
+        train_info['capture_identity_factor_credit_active_fraction'] = _to_float(
+            capture_to_win_triplet_credit_active_fraction
+        )
+        train_info['capture_identity_factor_credit_positive_mass'] = _to_float(
+            capture_to_win_triplet_credit_positive_mass
+        )
+        train_info['capture_identity_factor_credit_negative_mass'] = _to_float(
+            capture_to_win_triplet_credit_negative_mass
+        )
+        train_info['capture_outcome_identity_order2_delta_abs_mass'] = _to_float(
+            capture_outcome_identity_order2_delta_abs_mass
+        )
+        train_info['capture_outcome_identity_order3_delta_abs_mass'] = _to_float(
+            capture_outcome_identity_order3_delta_abs_mass
+        )
+        train_info['capture_identity_target_order2_fraction'] = _to_float(
+            capture_identity_target_order2_fraction
+        )
+        train_info['capture_identity_target_order3_fraction'] = _to_float(
+            capture_identity_target_order3_fraction
+        )
+        train_info['capture_outcome_non_target_delta_abs_max'] = _to_float(
+            capture_outcome_non_target_delta_abs_max
         )
         train_info['capture_to_win_quality_gate_mean'] = _to_float(
             capture_to_win_quality_gate_mean
         )
+        train_info['capture_to_win_quality_gate_abs_mean'] = _to_float(
+            capture_to_win_quality_gate_abs_mean
+        )
         train_info['capture_to_win_quality_gate_active_fraction'] = _to_float(
             capture_to_win_quality_gate_active_fraction
+        )
+        train_info['capture_to_win_quality_gate_positive_fraction'] = _to_float(
+            capture_to_win_quality_gate_positive_fraction
+        )
+        train_info['capture_to_win_quality_gate_negative_fraction'] = _to_float(
+            capture_to_win_quality_gate_negative_fraction
+        )
+        train_info['capture_to_win_quality_gate_positive_mass'] = _to_float(
+            capture_to_win_quality_gate_positive_mass
+        )
+        train_info['capture_to_win_quality_gate_negative_mass'] = _to_float(
+            capture_to_win_quality_gate_negative_mass
+        )
+        train_info['capture_to_win_outcome_contrastive'] = 1.0
+        train_info['capture_to_win_quality_gate_definition_version'] = 5.0
+        train_info['capture_outcome_baseline_mean'] = _to_float(
+            capture_outcome_baseline_mean
+        )
+        train_info['capture_outcome_capture_episode_count_mean'] = _to_float(
+            capture_outcome_capture_episode_count_mean
+        )
+        train_info['capture_outcome_success_episode_count_mean'] = _to_float(
+            capture_outcome_success_episode_count_mean
+        )
+        train_info['capture_outcome_failure_episode_count_mean'] = _to_float(
+            capture_outcome_failure_episode_count_mean
+        )
+        train_info['capture_outcome_mixed_window_fraction'] = _to_float(
+            capture_outcome_mixed_window_fraction
+        )
+        train_info['capture_outcome_single_success_window_fraction'] = _to_float(
+            capture_outcome_single_success_window_fraction
+        )
+        train_info['capture_outcome_single_failure_window_fraction'] = _to_float(
+            capture_outcome_single_failure_window_fraction
+        )
+        train_info['capture_outcome_no_capture_window_fraction'] = _to_float(
+            capture_outcome_no_capture_window_fraction
+        )
+        train_info['capture_outcome_triplet_labels_per_episode_mean'] = _to_float(
+            capture_outcome_triplet_labels_per_episode_mean
+        )
+        train_info['capture_outcome_triplet_labels_per_episode_max'] = _to_float(
+            capture_outcome_triplet_labels_per_episode_max
+        )
+        train_info['capture_outcome_raw_episode_advantage_mean'] = _to_float(
+            capture_outcome_raw_episode_advantage_mean
+        )
+        train_info['capture_outcome_raw_episode_advantage_abs_mean'] = _to_float(
+            capture_outcome_raw_episode_advantage_abs_mean
+        )
+        train_info['capture_outcome_window_raw_centered_mean'] = _to_float(
+            capture_outcome_window_raw_centered_mean
+        )
+        train_info['capture_outcome_window_expanded_gate_sum'] = _to_float(
+            capture_outcome_window_expanded_gate_sum
+        )
+        train_info['capture_outcome_window_expanded_gate_abs_sum'] = _to_float(
+            capture_outcome_window_expanded_gate_abs_sum
+        )
+        train_info['capture_outcome_window_center_error_ratio'] = _to_float(
+            capture_outcome_window_center_error_ratio
+        )
+        train_info['capture_to_win_credit_preclip_mean'] = _to_float(
+            capture_to_win_credit_preclip_mean
+        )
+        train_info['capture_to_win_credit_preclip_std'] = _to_float(
+            capture_to_win_credit_preclip_std
+        )
+        train_info['capture_to_win_credit_preclip_max'] = _to_float(
+            capture_to_win_credit_preclip_max
+        )
+        train_info['capture_to_win_credit_preclip_min'] = _to_float(
+            capture_to_win_credit_preclip_min
+        )
+        train_info['capture_to_win_credit_positive_clip_fraction'] = _to_float(
+            capture_to_win_credit_positive_clip_fraction
+        )
+        train_info['capture_to_win_credit_negative_clip_fraction'] = _to_float(
+            capture_to_win_credit_negative_clip_fraction
+        )
+        train_info['capture_identity_event_count_mean'] = _to_float(
+            capture_identity_event_count_mean
+        )
+        train_info['capture_identity_matched_event_count_mean'] = _to_float(
+            capture_identity_matched_event_count_mean
+        )
+        train_info['capture_identity_unmatched_event_count_mean'] = _to_float(
+            capture_identity_unmatched_event_count_mean
+        )
+        train_info['capture_identity_candidate_factor_count_mean'] = _to_float(
+            capture_identity_candidate_factor_count_mean
+        )
+        train_info['capture_identity_match_fraction'] = _to_float(
+            capture_identity_match_fraction
+        )
+        train_info['capture_identity_candidates_per_matched_event'] = _to_float(
+            capture_identity_candidates_per_matched_event
+        )
+        train_info['capture_outcome_label_gate_correlation'] = _to_float(
+            capture_outcome_label_gate_correlation
+        )
+        train_info['capture_outcome_label_gate_correlation_valid'] = _to_float(
+            capture_outcome_label_gate_correlation_valid
+        )
+        train_info['capture_outcome_success_labels_mean'] = _to_float(
+            capture_outcome_success_labels_mean
+        )
+        train_info['capture_outcome_failure_labels_mean'] = _to_float(
+            capture_outcome_failure_labels_mean
+        )
+        train_info['capture_outcome_success_gate_total_mean'] = _to_float(
+            capture_outcome_success_gate_total_mean
+        )
+        train_info['capture_outcome_failure_gate_total_mean'] = _to_float(
+            capture_outcome_failure_gate_total_mean
+        )
+        train_info['pair_pursuit_credit_mean'] = _to_float(
+            pair_pursuit_credit_mean
+        )
+        train_info['pair_pursuit_credit_active_fraction'] = _to_float(
+            pair_pursuit_credit_active_fraction
+        )
+        train_info['pair_credit_active_fraction'] = _to_float(
+            pair_pursuit_credit_active_fraction
+        )
+        train_info['pair_pursuit_credit_std'] = _to_float(
+            pair_pursuit_credit_std
+        )
+        train_info['pair_pursuit_credit_max'] = _to_float(
+            pair_pursuit_credit_max
+        )
+        train_info['pair_pursuit_credit_nonzero_count'] = _to_float(
+            pair_pursuit_credit_nonzero_count
+        )
+        train_info['pair_credit_top1_mass_fraction'] = _to_float(
+            pair_credit_top1_mass_fraction
+        )
+        train_info['pair_pursuit_quality_mean'] = _to_float(
+            pair_pursuit_quality_mean
+        )
+        train_info['pair_pursuit_quality_active_fraction'] = _to_float(
+            pair_pursuit_quality_active_fraction
+        )
+        train_info['pair_to_triplet_transition_score_mean'] = _to_float(
+            pair_to_triplet_transition_score_mean
+        )
+        train_info[
+            'pair_to_triplet_transition_active_fraction'
+        ] = _to_float(pair_to_triplet_transition_active_fraction)
+        train_info['triplet_capture_quality_mean'] = _to_float(
+            triplet_capture_quality_mean
+        )
+        train_info['triplet_capture_quality_active_fraction'] = _to_float(
+            triplet_capture_quality_active_fraction
+        )
+        train_info['transition_delay_mean'] = _to_float(
+            transition_delay_mean
+        )
+        train_info['transition_delay_min'] = _to_float(
+            transition_delay_min
+        )
+        train_info['transition_delay_max'] = _to_float(
+            transition_delay_max
+        )
+        train_info['capture_event_count'] = _to_float(capture_count_total)
+        train_info['capture_matched_count'] = _to_float(
+            capture_matched_count_value
+        )
+        train_info['unmatched_capture_count'] = _to_float(
+            unmatched_capture_count_value
+        )
+        train_info['capture_matched_fraction'] = _to_float(
+            capture_matched_fraction
+        )
+        train_info['unmatched_capture_fraction'] = _to_float(
+            unmatched_capture_fraction
+        )
+        train_info['failed_episode_capture_count'] = _to_float(
+            failed_episode_capture_count_value
+        )
+        train_info['failed_episode_capture_fraction'] = _to_float(
+            failed_episode_capture_fraction
+        )
+        train_info['capture_to_win_capture_success_fraction'] = _to_float(
+            capture_to_win_capture_success_fraction
+        )
+        train_info['capture_to_win_episode_success_fraction'] = _to_float(
+            capture_to_win_episode_success_fraction
+        )
+        train_info['positive_reward_without_capture_fraction'] = _to_float(
+            positive_reward_without_capture_fraction
+        )
+        train_info['positive_reward_step_count'] = _to_float(
+            positive_reward_step_count_value
+        )
+        train_info['positive_reward_without_capture_count'] = _to_float(
+            positive_reward_without_capture_count_value
+        )
+        train_info['positive_reward_step_fraction'] = _to_float(
+            positive_reward_step_fraction
+        )
+        train_info['offset0_candidate_count'] = _to_float(
+            offset0_candidate_count_value
+        )
+        train_info['offset0_candidate_fraction'] = _to_float(
+            offset0_candidate_fraction
         )
         train_info['graph_return_credit_strength_mean'] = _to_float(
             graph_return_credit_strength_mean
@@ -2084,6 +4009,21 @@ class R_SDDFG:
         )
         train_info['adj_capture_to_win_credit_require_future_match'] = float(
             self.adj_capture_to_win_credit_require_future_match
+        )
+        train_info['use_adj_pair_triplet_complementary_credit'] = float(
+            self.use_adj_pair_triplet_complementary_credit
+        )
+        train_info['adj_pair_pursuit_credit_coef'] = float(
+            self.adj_pair_pursuit_credit_coef
+        )
+        train_info['adj_pair_pursuit_credit_window'] = float(
+            self.adj_pair_pursuit_credit_window
+        )
+        train_info['adj_pair_pursuit_credit_cap'] = float(
+            self.adj_pair_pursuit_credit_cap
+        )
+        train_info['adj_pair_pursuit_credit_min_reward'] = float(
+            self.adj_pair_pursuit_credit_min_reward
         )
         for credit_key, credit_value in advantage_triplet_credit_info.items():
             train_info[credit_key] = float(credit_value)

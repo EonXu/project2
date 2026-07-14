@@ -214,6 +214,26 @@ def get_config():
         ),
     )
     parser.add_argument(
+        "--use_train_consistent_eval_graph",
+        action="store_true",
+        default=False,
+        help=(
+            "Sample eval-time SDDFG graphs from the current training graph "
+            "behavior distribution while keeping policy actions greedy. "
+            "Evaluation uses an isolated graph RNG."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_topology_persistence",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the existing greedy-mixture mass to retain the previous "
+            "factor at the same slot when it remains eligible. The exact "
+            "Markov behavior probability is stored for adjacency PPO."
+        ),
+    )
+    parser.add_argument(
         "--adj_min_order3_ratio_start",
         type=float,
         default=0.0,
@@ -882,6 +902,42 @@ def get_config():
         help=(
             "Require the current triplet to reappear or overlap in the "
             "future success window before capture-to-win credit is applied."
+        ),
+    )
+    parser.add_argument(
+        "--use_adj_pair_triplet_complementary_credit",
+        action="store_true",
+        default=False,
+        help=(
+            "Add capture-anchored credit only when a pair-only backbone becomes "
+            "part of a strictly later triplet on a real capture_count event."
+        ),
+    )
+    parser.add_argument(
+        "--adj_pair_pursuit_credit_coef",
+        type=float,
+        default=0.0,
+        help="Coefficient for strict-future pair-to-capture-triplet credit.",
+    )
+    parser.add_argument(
+        "--adj_pair_pursuit_credit_window",
+        type=int,
+        default=20,
+        help="Strictly-future window for pair-to-capture-triplet matching.",
+    )
+    parser.add_argument(
+        "--adj_pair_pursuit_credit_cap",
+        type=float,
+        default=0.20,
+        help="Maximum pair pursuit credit as a multiple of graph-advantage scale.",
+    )
+    parser.add_argument(
+        "--adj_pair_pursuit_credit_min_reward",
+        type=float,
+        default=0.0,
+        help=(
+            "Deprecated compatibility option. Capture-anchored pair credit "
+            "uses the environment capture_count event and never team reward."
         ),
     )
     parser.add_argument(

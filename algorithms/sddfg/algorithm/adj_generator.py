@@ -345,7 +345,23 @@ class Adj_Generator(nn.Module):
         self._triplet_flat_id_cache = {}
         self._triplet_pair_id_cache = {}
 
-        self.rng = np.random.RandomState(int(getattr(args, "seed", 0)) + 520000)
+        graph_seed = int(getattr(args, "seed", 0)) + 520000
+        self.rng = np.random.RandomState(graph_seed)
+        # Evaluation may deliberately use the same stochastic graph behavior
+        # distribution as training.  Its samples must not consume the rollout
+        # RNG, otherwise changing eval frequency changes the training run.
+        self.eval_rng = np.random.RandomState(graph_seed + 1)
+        self.use_topology_persistence = bool(
+            getattr(args, "use_adj_topology_persistence", False)
+        )
+        self.last_topology_persistence_candidate_fraction = 0.0
+        self.last_topology_persistence_selected_fraction = 0.0
+        # Monotone optimizer-step version plus the exact canonical candidate
+        # metadata seen by the rollout policy.  Candidate-only capture labels
+        # are retrospective; persisting this snapshot prevents training-time
+        # recomputation from being mistaken for the behavior-policy score.
+        self.candidate_policy_version = 0
+        self.last_candidate_behavior_metadata = None
 
         gat_heads = args.gat_heads
         gat_slope = args.gat_negative_slope
@@ -1091,6 +1107,105 @@ class Adj_Generator(nn.Module):
 
         return torch.cat(scores, dim=1), torch.cat(node_masks, dim=0)
 
+    def evaluate_candidate_identity_scores(self, rnn_obs, dones):
+        """Return canonical candidate scores for exact-identity supervision.
+
+        This path does not sample a graph and does not pretend an unselected
+        candidate was active.  It exposes the same pair/triplet catalog used
+        by graph selection so a real candidate-only capture can update only
+        its exact candidate score through a separate supervised objective.
+        """
+        rnn_obs, exist_mask = self._prepare_inputs(rnn_obs, dones)
+        attention = self.gat(rnn_obs, exist_mask)
+        pair_score, _ = self._pair_score(attention, exist_mask)
+        candidate_scores, candidate_nodes = self._candidate_catalog(
+            pair_score
+        )
+        active_nodes = exist_mask > 0.5
+        candidate_valid = torch.all(
+            (~candidate_nodes.unsqueeze(0)) | active_nodes.unsqueeze(1),
+            dim=2,
+        ) & (candidate_scores > 0.0)
+        if candidate_scores.shape != candidate_valid.shape:
+            raise RuntimeError(
+                "candidate score/mask shape mismatch: {} vs {}".format(
+                    tuple(candidate_scores.shape),
+                    tuple(candidate_valid.shape),
+                )
+            )
+        return candidate_scores, candidate_valid.to(candidate_scores.dtype)
+
+    @staticmethod
+    def canonical_candidate_ranks(candidate_scores, candidate_valid):
+        """Rank canonical candidates with deterministic identity tie breaks.
+
+        The score is a positive graph-selection weight, not an independent
+        Bernoulli probability.  Ranks therefore provide the policy-relevant
+        relative diagnostic while preserving the fixed canonical catalog axis.
+        Invalid candidates receive rank zero.
+        """
+        if candidate_scores.shape != candidate_valid.shape:
+            raise ValueError(
+                "candidate score/mask shapes must match: {} vs {}".format(
+                    tuple(candidate_scores.shape),
+                    tuple(candidate_valid.shape),
+                )
+            )
+        if candidate_scores.dim() != 2:
+            raise ValueError(
+                "candidate score/rank inputs must be rank 2, got {}".format(
+                    tuple(candidate_scores.shape)
+                )
+            )
+        if not bool(torch.isfinite(candidate_scores).all().item()):
+            raise FloatingPointError("non-finite canonical candidate score")
+        valid = candidate_valid > 0.0
+        num_candidates = int(candidate_scores.shape[1])
+        candidate_index = torch.arange(
+            num_candidates,
+            device=candidate_scores.device,
+        )
+        own_score = candidate_scores.unsqueeze(2)
+        other_score = candidate_scores.unsqueeze(1)
+        other_valid = valid.unsqueeze(1)
+        tie_precedes = (
+            (other_score == own_score)
+            & (
+                candidate_index.view(1, 1, -1)
+                < candidate_index.view(1, -1, 1)
+            )
+        )
+        rank = 1 + (
+            other_valid & ((other_score > own_score) | tie_precedes)
+        ).long().sum(dim=2)
+        return rank * valid.long()
+
+    def _cache_candidate_behavior_metadata(
+            self, candidate_scores, candidate_nodes, exist_mask):
+        """Cache score/rank/valid/version in canonical candidate order."""
+        active_nodes = exist_mask > 0.5
+        candidate_valid = torch.all(
+            (~candidate_nodes.unsqueeze(0)) | active_nodes.unsqueeze(1),
+            dim=2,
+        ) & (candidate_scores > 0.0)
+        rank = self.canonical_candidate_ranks(
+            candidate_scores,
+            candidate_valid.to(candidate_scores.dtype),
+        )
+        policy_version = torch.full_like(
+            candidate_scores,
+            float(self.candidate_policy_version),
+        )
+        self.last_candidate_behavior_metadata = torch.stack(
+            [
+                candidate_scores.detach(),
+                rank.to(candidate_scores.dtype).detach(),
+                candidate_valid.to(candidate_scores.dtype).detach(),
+                policy_version.detach(),
+            ],
+            dim=-1,
+        )
+
     @staticmethod
     def _constrained_probabilities(
             scores,
@@ -1352,7 +1467,9 @@ class Adj_Generator(nn.Module):
             pair_score,
             exist_mask,
             explore=False,
-            t_env=None):
+            t_env=None,
+            sampling_rng=None,
+            previous_adj=None):
         """
         Build a coverage-safe sparse graph by sequential constrained sampling.
 
@@ -1362,7 +1479,20 @@ class Adj_Generator(nn.Module):
         separate greedy pair cover, making the PPO importance ratio invalid.
         """
         B, N, _ = pair_score.shape
+        sampling_rng = self.rng if sampling_rng is None else sampling_rng
         device = pair_score.device
+        previous_adj_t = None
+        if self.use_topology_persistence and previous_adj is not None:
+            previous_adj_t = to_torch(previous_adj).to(device)
+            if previous_adj_t.dim() == 2:
+                previous_adj_t = previous_adj_t.unsqueeze(0)
+            previous_adj_t = previous_adj_t[:, :, :self.num_factor]
+            if previous_adj_t.shape[:2] != (B, N):
+                raise ValueError(
+                    "previous_adj must have batch/agent shape {}, got {}".format(
+                        (B, N), tuple(previous_adj_t.shape[:2])
+                    )
+                )
         prob_adj = torch.ones(
             B,
             N,
@@ -1382,6 +1512,9 @@ class Adj_Generator(nn.Module):
         candidate_scores, candidate_nodes = self._candidate_catalog(
             pair_score
         )
+        persistence_candidate_count = 0
+        persistence_selected_count = 0
+        explored_decision_count = 0
         for b in range(B):
             scores = candidate_scores[b]
             valid = scores > 0.0
@@ -1445,8 +1578,32 @@ class Adj_Generator(nn.Module):
                     )
                     greedy_prob = float(self.current_greedy_sample_prob)
                     greedy_idx = int(torch.argmax(policy_probs).item())
-                    if self.rng.rand() < greedy_prob:
-                        selected_idx = greedy_idx
+                    mixture_idx = greedy_idx
+                    has_persistence_candidate = False
+                    if (
+                        previous_adj_t is not None
+                        and slot < previous_adj_t.shape[-1]
+                    ):
+                        previous_nodes = previous_adj_t[b, :, slot] > 0.5
+                        previous_order = int(
+                            previous_nodes.long().sum().item()
+                        )
+                        if previous_order in (2, 3):
+                            previous_match = torch.all(
+                                candidate_nodes
+                                == previous_nodes.unsqueeze(0),
+                                dim=1,
+                            ) & eligible
+                            matched_previous = torch.where(previous_match)[0]
+                            if matched_previous.numel() > 0:
+                                mixture_idx = int(
+                                    matched_previous[0].item()
+                                )
+                                has_persistence_candidate = True
+                                persistence_candidate_count += 1
+                    explored_decision_count += 1
+                    if sampling_rng.rand() < greedy_prob:
+                        selected_idx = mixture_idx
                     else:
                         sample_probs = (
                             behavior_probs.detach().cpu().numpy()
@@ -1457,7 +1614,7 @@ class Adj_Generator(nn.Module):
                             1e-8,
                         )
                         selected_idx = int(
-                            self.rng.choice(
+                            sampling_rng.choice(
                                 sample_probs.shape[0],
                                 p=sample_probs,
                             )
@@ -1465,11 +1622,13 @@ class Adj_Generator(nn.Module):
                     selected_probability = (
                         (1.0 - greedy_prob) * behavior_probs[selected_idx]
                     )
-                    if selected_idx == greedy_idx:
+                    if selected_idx == mixture_idx:
                         selected_probability = (
                             selected_probability
                             + behavior_probs.new_tensor(greedy_prob)
                         )
+                    if has_persistence_candidate and selected_idx == mixture_idx:
+                        persistence_selected_count += 1
                 else:
                     selected_idx = int(
                         torch.argmax(policy_probs).item()
@@ -1495,9 +1654,29 @@ class Adj_Generator(nn.Module):
                     "active agents"
                 )
 
+        # A terminal all-done sampling call has no graph decisions.  Do not let
+        # that empty call overwrite the diagnostics from the last real graph
+        # decision with misleading zeros.
+        if explored_decision_count > 0:
+            self.last_topology_persistence_candidate_fraction = float(
+                persistence_candidate_count / explored_decision_count
+            )
+            self.last_topology_persistence_selected_fraction = float(
+                persistence_selected_count / explored_decision_count
+            )
+
         return prob_adj, cond_adj
 
-    def sample(self, obs, rnn_obs, use_adj_init, dones, explore=False, t_env=None):
+    def sample(
+            self,
+            obs,
+            rnn_obs,
+            use_adj_init,
+            dones,
+            explore=False,
+            t_env=None,
+            use_eval_rng=False,
+            previous_adj=None):
         """
         输出保持原接口:
             prob_adj: [B, N, num_factor]
@@ -1511,6 +1690,14 @@ class Adj_Generator(nn.Module):
 
         A = self.gat(rnn_obs, exist_mask)
         pair_score, _ = self._pair_score(A, exist_mask)
+        behavior_candidate_scores, behavior_candidate_nodes = (
+            self._candidate_catalog(pair_score)
+        )
+        self._cache_candidate_behavior_metadata(
+            behavior_candidate_scores,
+            behavior_candidate_nodes,
+            exist_mask,
+        )
 
         # Training uses an epsilon mixture over the exact constrained policy;
         # the selected conditional behavior probability is stored for PPO.
@@ -1519,12 +1706,22 @@ class Adj_Generator(nn.Module):
             exist_mask=exist_mask,
             explore=explore,
             t_env=t_env,
+            sampling_rng=self.eval_rng if use_eval_rng else self.rng,
+            previous_adj=previous_adj,
         )
 
         entropy = self._candidate_entropy(pair_score, exist_mask)
         return prob_adj, cond_adj, entropy
 
-    def evaluate_prob(self, obs, rnn_obs, use_adj_init, dones, adj, t_env=None):
+    def evaluate_prob(
+            self,
+            obs,
+            rnn_obs,
+            use_adj_init,
+            dones,
+            adj,
+            t_env=None,
+            previous_adj=None):
         """
         评估 buffer 中旧 adj 在当前 GAT 参数下的概率。
         train_adj_on_batch 中必须使用这个函数，而不是重新 sample 当前图。
@@ -1543,6 +1740,18 @@ class Adj_Generator(nn.Module):
         adj_t = adj_t[:, :, :self.num_factor]
 
         B, N, F_total = adj_t.shape
+        previous_adj_t = None
+        if self.use_topology_persistence and previous_adj is not None:
+            previous_adj_t = to_torch(previous_adj).to(self.device)
+            if previous_adj_t.dim() == 2:
+                previous_adj_t = previous_adj_t.unsqueeze(0)
+            previous_adj_t = previous_adj_t[:, :, :self.num_factor]
+            if previous_adj_t.shape[:2] != (B, N):
+                raise ValueError(
+                    "previous_adj must have batch/agent shape {}, got {}".format(
+                        (B, N), tuple(previous_adj_t.shape[:2])
+                    )
+                )
 
         A = self.gat(rnn_obs, exist_mask)
         pair_score, _ = self._pair_score(A, exist_mask)
@@ -1624,8 +1833,28 @@ class Adj_Generator(nn.Module):
                 greedy_prob = float(self.current_greedy_sample_prob)
                 if greedy_prob > 0.0:
                     greedy_idx = int(torch.argmax(policy_probs).item())
+                    mixture_idx = greedy_idx
+                    if (
+                        previous_adj_t is not None
+                        and f < previous_adj_t.shape[-1]
+                    ):
+                        previous_nodes = previous_adj_t[b, :, f] > 0.5
+                        previous_order = int(
+                            previous_nodes.long().sum().item()
+                        )
+                        if previous_order in (2, 3):
+                            previous_match = torch.all(
+                                candidate_nodes
+                                == previous_nodes.unsqueeze(0),
+                                dim=1,
+                            ) & eligible
+                            matched_previous = torch.where(previous_match)[0]
+                            if matched_previous.numel() > 0:
+                                mixture_idx = int(
+                                    matched_previous[0].item()
+                                )
                     greedy_mass = torch.zeros_like(policy_probs)
-                    greedy_mass[greedy_idx] = greedy_prob
+                    greedy_mass[mixture_idx] = greedy_prob
                     policy_probs = (
                         (1.0 - greedy_prob) * policy_probs
                         + greedy_mass

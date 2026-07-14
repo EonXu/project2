@@ -311,6 +311,25 @@ def parse_args(args, parser):
             parser.add_argument(option, *option_args, **option_kwargs)
 
     add_missing_option(
+        "--use_train_consistent_eval_graph",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the current stochastic training graph behavior during "
+            "evaluation, with greedy policy actions and an isolated eval RNG."
+        ),
+    )
+    add_missing_option(
+        "--use_adj_topology_persistence",
+        action="store_true",
+        default=False,
+        help=(
+            "Redirect graph greedy-mixture mass to the previous same-slot "
+            "factor when it remains eligible, with exact PPO probability."
+        ),
+    )
+
+    add_missing_option(
         "--adj_recent_episode_window",
         type=int,
         default=0,
@@ -510,6 +529,42 @@ def parse_args(args, parser):
         action="store_true",
         default=False,
         help="Require future triplet match evidence for capture-to-win credit.",
+    )
+    add_missing_option(
+        "--use_adj_pair_triplet_complementary_credit",
+        action="store_true",
+        default=False,
+        help=(
+            "Credit a pair-only backbone only when it becomes part of a "
+            "strictly later capture_count triplet."
+        ),
+    )
+    add_missing_option(
+        "--adj_pair_pursuit_credit_coef",
+        type=float,
+        default=0.0,
+        help="Coefficient for strict-future pair-to-capture-triplet credit.",
+    )
+    add_missing_option(
+        "--adj_pair_pursuit_credit_window",
+        type=int,
+        default=20,
+        help="Future window for pair-to-triplet pursuit credit.",
+    )
+    add_missing_option(
+        "--adj_pair_pursuit_credit_cap",
+        type=float,
+        default=0.20,
+        help="Credit cap for pair-to-triplet pursuit credit.",
+    )
+    add_missing_option(
+        "--adj_pair_pursuit_credit_min_reward",
+        type=float,
+        default=0.0,
+        help=(
+            "Deprecated compatibility option; capture-anchored pair credit "
+            "uses capture_count and ignores team reward."
+        ),
     )
 
     all_args, unknown_args = parser.parse_known_args(args)

@@ -41,7 +41,9 @@ set -euo pipefail
 
 seed="${1:-1}"
 gpu="${2:-${CUDA_DEVICE:-0}}"
-num_env_steps="${3:-${NUM_ENV_STEPS:-2000000}}"
+# Structural pair-credit changes must pass the 200k gate before any long run.
+# A future 2M run therefore requires an explicit third argument or override.
+num_env_steps="${3:-${NUM_ENV_STEPS:-200000}}"
 python_bin="${PYTHON_BIN:-python}"
 user_name="${USER_NAME:-sddfg_dynamic}"
 
@@ -79,6 +81,8 @@ adj_greedy_sample_prob_start="${ADJ_GREEDY_SAMPLE_PROB_START:-0.0}"
 adj_greedy_sample_prob_final="${ADJ_GREEDY_SAMPLE_PROB_FINAL:-0.75}"
 adj_greedy_sample_prob_anneal_steps="${ADJ_GREEDY_SAMPLE_PROB_ANNEAL_STEPS:-200000}"
 adj_greedy_sample_prob_cap="${ADJ_GREEDY_SAMPLE_PROB_CAP:-0.50}"
+use_train_consistent_eval_graph="${USE_TRAIN_CONSISTENT_EVAL_GRAPH:-1}"
+use_adj_topology_persistence="${USE_ADJ_TOPOLOGY_PERSISTENCE:-1}"
 adj_order3_quota_mode="${ADJ_ORDER3_QUOTA_MODE:-soft}"
 adj_order3_soft_quota_coef="${ADJ_ORDER3_SOFT_QUOTA_COEF:-2.5}"
 adj_triplet_feature_mode="${ADJ_TRIPLET_FEATURE_MODE:-synergy}"
@@ -126,6 +130,11 @@ adj_capture_to_win_credit_min_outcome_adv="${ADJ_CAPTURE_TO_WIN_CREDIT_MIN_OUTCO
 adj_capture_to_win_credit_scale="${ADJ_CAPTURE_TO_WIN_CREDIT_SCALE:-0.75}"
 adj_capture_to_win_credit_cap="${ADJ_CAPTURE_TO_WIN_CREDIT_CAP:-0.25}"
 adj_capture_to_win_credit_require_future_match="${ADJ_CAPTURE_TO_WIN_CREDIT_REQUIRE_FUTURE_MATCH:-1}"
+use_adj_pair_triplet_complementary_credit="${USE_ADJ_PAIR_TRIPLET_COMPLEMENTARY_CREDIT:-1}"
+adj_pair_pursuit_credit_coef="${ADJ_PAIR_PURSUIT_CREDIT_COEF:-0.10}"
+adj_pair_pursuit_credit_window="${ADJ_PAIR_PURSUIT_CREDIT_WINDOW:-20}"
+adj_pair_pursuit_credit_cap="${ADJ_PAIR_PURSUIT_CREDIT_CAP:-0.20}"
+adj_pair_pursuit_credit_min_reward="${ADJ_PAIR_PURSUIT_CREDIT_MIN_REWARD:-0.0}"
 use_adj_order3_credit_gate="${USE_ADJ_ORDER3_CREDIT_GATE:-1}"
 use_adj_order3_relative_credit_gate="${USE_ADJ_ORDER3_RELATIVE_CREDIT_GATE:-1}"
 adj_order3_credit_gate_loss_scale="${ADJ_ORDER3_CREDIT_GATE_LOSS_SCALE:-0.004}"
@@ -197,6 +206,10 @@ if ! [[ "${adj_delayed_triplet_future_overlap_min_nodes}" =~ ^[0-9]+$ ]]; then
   echo "ADJ_DELAYED_TRIPLET_FUTURE_OVERLAP_MIN_NODES must be a non-negative integer, got: ${adj_delayed_triplet_future_overlap_min_nodes}" >&2
   exit 2
 fi
+if ! [[ "${adj_pair_pursuit_credit_window}" =~ ^[0-9]+$ ]] || [ "${adj_pair_pursuit_credit_window}" -le 0 ]; then
+  echo "ADJ_PAIR_PURSUIT_CREDIT_WINDOW must be a positive integer, got: ${adj_pair_pursuit_credit_window}" >&2
+  exit 2
+fi
 adj_order3_credit_gate_args=()
 if [[ "${use_adj_order3_credit_gate}" == "1" ]]; then
   adj_order3_credit_gate_args=(--use_adj_order3_credit_gate)
@@ -245,6 +258,17 @@ fi
 if [[ "${adj_capture_to_win_credit_require_future_match}" == "1" ]]; then
   adj_capture_to_win_credit_args+=(--adj_capture_to_win_credit_require_future_match)
 fi
+adj_pair_triplet_complementary_args=()
+if [[ "${use_adj_pair_triplet_complementary_credit}" == "1" ]]; then
+  adj_pair_triplet_complementary_args=(--use_adj_pair_triplet_complementary_credit)
+fi
+eval_graph_consistency_args=()
+if [[ "${use_train_consistent_eval_graph}" == "1" ]]; then
+  eval_graph_consistency_args=(--use_train_consistent_eval_graph)
+fi
+if [[ "${use_adj_topology_persistence}" == "1" ]]; then
+  eval_graph_consistency_args+=(--use_adj_topology_persistence)
+fi
 adj_ppo_stale_trust_args=()
 if [[ "${use_adj_ppo_stale_trust}" == "1" ]]; then
   adj_ppo_stale_trust_args=(--use_adj_ppo_stale_trust)
@@ -292,6 +316,7 @@ repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
 # revisions cannot be reconciled afterwards.
 git_commit="unavailable"
 git_tree_state="unavailable"
+source_manifest_sha256="unavailable"
 if command -v git >/dev/null 2>&1 && git -C "${repo_root}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git_commit="$(git -C "${repo_root}" rev-parse HEAD)"
   if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=no)" ]]; then
@@ -300,18 +325,52 @@ if command -v git >/dev/null 2>&1 && git -C "${repo_root}" rev-parse --is-inside
     git_tree_state="clean"
   fi
 fi
+if command -v sha256sum >/dev/null 2>&1; then
+  source_manifest_sha256="$({
+    sha256sum \
+      "${repo_root}/utils/pair_credit.py" \
+      "${repo_root}/utils/adj_buffer.py" \
+      "${repo_root}/utils/graph_sampling.py" \
+      "${repo_root}/envs/Wolfpack/wolfpack_penalty_open.py" \
+      "${repo_root}/algorithms/sddfg/r_sddfg.py" \
+      "${repo_root}/algorithms/sddfg/algorithm/adj_generator.py" \
+      "${repo_root}/runner/base_runner.py" \
+      "${repo_root}/runner/wolfpack_runner.py" \
+      "${repo_root}/scripts/train/train_wolfpack.py" \
+      "${repo_root}/scripts/debug_pair_credit_synthetic.py" \
+      "${repo_root}/scripts/debug_capture_outcome_contrast_synthetic.py" \
+      "${repo_root}/scripts/debug_capture_identity_synthetic.py" \
+      "${repo_root}/scripts/debug_outcome_replay_support_synthetic.py" \
+      "${repo_root}/scripts/debug_outcome_cohort_centering_synthetic.py" \
+      "${repo_root}/scripts/debug_outcome_confidence_scaling_synthetic.py" \
+      "${repo_root}/scripts/debug_outcome_factor_loss_synthetic.py" \
+      "${repo_root}/scripts/debug_candidate_identity_supervision_synthetic.py" \
+      "${repo_root}/scripts/debug_eval_graph_consistency.py" \
+      "${repo_root}/scripts/debug_topology_persistence_synthetic.py" \
+      "${repo_root}/scripts/validate_sddfg_dynamic_graph.py" \
+      "${repo_root}/config.py"
+  } | sha256sum | awk '{print $1}')"
+fi
 
 {
   echo "Algorithm: ${algorithm}"
   echo "Seed: ${seed}; GPU: ${gpu}; num_env_steps: ${num_env_steps}"
   echo "Anneal steps: lr=${anneal_steps}; adj_entropy=${adj_entropy_anneal_steps}; adj_entropy_coef=${adj_entropy_coef}; adj_order3_bonus=${adj_order3_bonus_start}->${adj_order3_bonus}/${adj_order3_bonus_anneal_steps}; adj_sampling_temp=${adj_sampling_temp_start}->${adj_sampling_temp_final}/${adj_sampling_temp_anneal_steps}"
   echo "Order-aware graph: min_order3_ratio=${adj_min_order3_ratio_start}->${adj_min_order3_ratio_final}/${adj_min_order3_ratio_anneal_steps}; max_order3_ratio=${adj_max_order3_ratio_start}->${adj_max_order3_ratio_final}/${adj_max_order3_ratio_anneal_steps}; greedy_sample_prob=${adj_greedy_sample_prob_start}->${adj_greedy_sample_prob_final}/${adj_greedy_sample_prob_anneal_steps}; greedy_cap=${adj_greedy_sample_prob_cap}; quota_mode=${adj_order3_quota_mode}; soft_quota_coef=${adj_order3_soft_quota_coef}; triplet_feature_mode=${adj_triplet_feature_mode}; triplet_balance_coef=${adj_triplet_balance_coef}; advantage_triplet_scorer=${use_adj_advantage_triplet_scorer}; credit_alpha=${adj_triplet_credit_ema_alpha}; credit_coef=${adj_triplet_credit_score_coef}; credit_scale=${adj_triplet_credit_score_scale}; direct_rank=${use_adj_triplet_credit_direct_rank}; rank_coef=${adj_triplet_credit_rank_coef}; rank_multiplier=[${adj_triplet_credit_min_multiplier},${adj_triplet_credit_max_multiplier}]; negative_rank_scale=${adj_triplet_credit_negative_rank_scale}; min_positive_fraction=${adj_triplet_credit_min_positive_fraction}; negative_graph_penalty=${adj_triplet_negative_graph_penalty}; quota_score_floor=${adj_order3_quota_score_floor}; min_pair_ratio=${adj_min_pair_ratio}; adj_order_adv_coef=${adj_order_adv_coef}; positive_only=${adj_order_adv_positive_only}; negative_coef=${adj_order_adv_negative_coef}; require_positive_graph_adv=${adj_order_adv_require_positive_graph_adv}; triplet_graph_return_credit=${use_adj_triplet_graph_return_credit}; triplet_graph_return_credit_coef=${adj_triplet_graph_return_credit_coef}; triplet_graph_return_credit_cap=${adj_triplet_graph_return_credit_cap}; triplet_graph_return_credit_min_graph_adv=${adj_triplet_graph_return_credit_min_graph_adv}; triplet_graph_return_credit_raw_gate_scale=${adj_triplet_graph_return_credit_raw_gate_scale}; triplet_graph_return_credit_require_delayed_gate=${adj_triplet_graph_return_credit_require_delayed_gate}; delayed_triplet_credit=${use_adj_delayed_triplet_credit}; delayed_triplet_credit_coef=${adj_delayed_triplet_credit_coef}; delayed_triplet_credit_window=${adj_delayed_triplet_credit_window}; delayed_triplet_credit_cap=${adj_delayed_triplet_credit_cap}; delayed_triplet_credit_min_reward=${adj_delayed_triplet_credit_min_reward}; delayed_triplet_credit_positive_only=${adj_delayed_triplet_credit_positive_only}; delayed_triplet_credit_min_adv=${adj_delayed_triplet_credit_min_adv}; delayed_triplet_credit_require_future_match=${adj_delayed_triplet_credit_require_future_match}; delayed_triplet_success_gate=${use_adj_delayed_triplet_success_gate}; delayed_triplet_success_gate_min_adv=${adj_delayed_triplet_success_gate_min_adv}; delayed_triplet_success_gate_scale=${adj_delayed_triplet_success_gate_scale}; delayed_triplet_success_gate_floor=${adj_delayed_triplet_success_gate_floor}; delayed_triplet_future_overlap_min_nodes=${adj_delayed_triplet_future_overlap_min_nodes}; delayed_triplet_partial_match_weight=${adj_delayed_triplet_partial_match_weight}"
-  echo "Capture-to-win credit: enabled=${use_adj_capture_to_win_credit}; coef=${adj_capture_to_win_credit_coef}; min_outcome_adv=${adj_capture_to_win_credit_min_outcome_adv}; scale=${adj_capture_to_win_credit_scale}; cap=${adj_capture_to_win_credit_cap}; require_future_match=${adj_capture_to_win_credit_require_future_match}"
+  echo "Capture-to-win credit: enabled=${use_adj_capture_to_win_credit}; source=capture_event_participant_identity+centered_episode_success_now; contrast=success_vs_failed_capture_episodes; attribution=episode_total_distributed_across_highest_exactly_representable_capture_factors; definition_version=5; coef=${adj_capture_to_win_credit_coef}; cap=${adj_capture_to_win_credit_cap}; shaped_return_gate=false; legacy_min_outcome_adv_ignored=${adj_capture_to_win_credit_min_outcome_adv}; legacy_scale_ignored=${adj_capture_to_win_credit_scale}; legacy_future_match_ignored=${adj_capture_to_win_credit_require_future_match}"
+  echo "Capture-to-win signed scaling: version=3; confidence=abs_detached_stored_graph_return_advantage; source_ready=required; outcome_sign=episode_outcome_only"
+  echo "Capture outcome factor loss: normalization_version=2; denominator=valid_graph_transitions; target_local=true; unrelated_factor_count_invariant=true"
+  echo "Capture candidate identity loss: definition_version=3; source=exact_candidate_only_real_capture; score_semantics=conditional_probability_over_current_valid_canonical_catalog; objective=signed_log_conditional_selection_probability; derivative_wrt_log_score=-delta*(target_indicator-current_probability); denominator=valid_graph_transitions; scale_invariant=true; active_factor_excluded=true; legacy_s_over_1_plus_s=diagnostic_only; replay_metadata=identity+behavior_score+canonical_rank+valid_mask+graph_policy_version"
+  echo "Outcome replay support: version=3; baseline=final_optimizer_cohort; supplemental_episode_cross_update_reuse=false; same_update_ppo_epoch_reuse=true; exhausted_support=disable_outcome_credit_only"
+  echo "Pair/triplet complementary credit: enabled=${use_adj_pair_triplet_complementary_credit}; source=capture_count; strict_future=true; offset0=false; pair_coef=${adj_pair_pursuit_credit_coef}; pair_window=${adj_pair_pursuit_credit_window}; pair_cap=${adj_pair_pursuit_credit_cap}; legacy_pair_min_reward_ignored=${adj_pair_pursuit_credit_min_reward}"
+  echo "Eval graph consistency: enabled=${use_train_consistent_eval_graph}; graph_behavior=train_distribution; policy_actions=greedy; rng=isolated_eval"
+  echo "Topology persistence: enabled=${use_adj_topology_persistence}; source=previous_same_slot_factor; probability=exact_markov_mixture; new_coef=none"
   echo "Order3 credit gate: enabled=${use_adj_order3_credit_gate}; relative=${use_adj_order3_relative_credit_gate}; loss_scale=${adj_order3_credit_gate_loss_scale}; margin=${adj_order3_credit_gate_margin}; min_scale=${adj_order3_credit_gate_min_scale}; ema_alpha=${adj_order3_credit_gate_ema_alpha}; max_delta=${adj_order3_credit_gate_max_delta}"
   echo "Adj PPO guard: clip_stop=${adj_ppo_clip_stop_ratio}; factor_clip_stop=${adj_ppo_factor_clip_stop_ratio}; min_epochs=${adj_ppo_min_epochs}"
   echo "Adj PPO stale trust: enabled=${use_adj_ppo_stale_trust}; clip=${adj_ppo_stale_trust_clip}; scale=${adj_ppo_stale_trust_scale}; min_weight=${adj_ppo_stale_trust_min_weight}; recent_episode_window=${adj_recent_episode_window}; dynamic_recent=${use_adj_dynamic_recent_window}; min_recent=${adj_recent_episode_window_min}; stale_threshold=${adj_recent_window_stale_threshold}; factor_stale_threshold=${adj_recent_window_factor_stale_threshold}; shrink_patience=${adj_recent_window_shrink_patience}; recover_patience=${adj_recent_window_recover_patience}; recover_threshold=${adj_recent_window_recover_stale_threshold}; recover_factor_threshold=${adj_recent_window_recover_factor_stale_threshold}; severe_margin=${adj_recent_window_severe_margin}; emergency_recent=${adj_recent_episode_window_emergency}; emergency_threshold=${adj_recent_window_emergency_stale_threshold}; emergency_factor_threshold=${adj_recent_window_emergency_factor_stale_threshold}"
   echo "Experiment: ${experiment_name}"
   echo "Git commit: ${git_commit}; tracked tree: ${git_tree_state}"
+  echo "SDDFG source manifest sha256: ${source_manifest_sha256}"
   echo "Console log: ${console_log}"
 } | tee "${console_log}"
 
@@ -319,6 +378,26 @@ fi
 # buffer axes, factor-Q gradients, or critic-free trainer initialization are
 # inconsistent with the server's PyTorch/Gym versions.
 if [[ "${SKIP_SDDFG_PREFLIGHT:-0}" != "1" ]]; then
+  "${python_bin}" "${script_dir}/debug_pair_credit_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_capture_outcome_contrast_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_capture_identity_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_outcome_replay_support_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_outcome_cohort_centering_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_outcome_confidence_scaling_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_outcome_factor_loss_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_candidate_identity_supervision_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_eval_graph_consistency.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_topology_persistence_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
   "${python_bin}" "${script_dir}/validate_sddfg_dynamic_graph.py" \
     2>&1 | tee -a "${console_log}"
 fi
@@ -349,6 +428,7 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" "${script_dir}/train/train_wolfpac
   --hard_update_interval_episode 200 \
   --use_reward_normalization \
   --use_dyn_graph \
+  "${eval_graph_consistency_args[@]}" \
   --require_connected_adj \
   --msg_iterations 4 \
   --highest_orders 3 \
@@ -416,6 +496,11 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" "${script_dir}/train/train_wolfpac
   --adj_capture_to_win_credit_min_outcome_adv "${adj_capture_to_win_credit_min_outcome_adv}" \
   --adj_capture_to_win_credit_scale "${adj_capture_to_win_credit_scale}" \
   --adj_capture_to_win_credit_cap "${adj_capture_to_win_credit_cap}" \
+  "${adj_pair_triplet_complementary_args[@]}" \
+  --adj_pair_pursuit_credit_coef "${adj_pair_pursuit_credit_coef}" \
+  --adj_pair_pursuit_credit_window "${adj_pair_pursuit_credit_window}" \
+  --adj_pair_pursuit_credit_cap "${adj_pair_pursuit_credit_cap}" \
+  --adj_pair_pursuit_credit_min_reward "${adj_pair_pursuit_credit_min_reward}" \
   "${adj_order3_credit_gate_args[@]}" \
   --adj_order3_credit_gate_loss_scale "${adj_order3_credit_gate_loss_scale}" \
   --adj_order3_credit_gate_margin "${adj_order3_credit_gate_margin}" \

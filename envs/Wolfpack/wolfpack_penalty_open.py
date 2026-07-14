@@ -621,6 +621,7 @@ class WolfpackPenaltyOpen(gym.Env):
         """
         self.food_points = [0 for _ in range(self.max_food_num)]
         self.last_capture_count = 0
+        self.last_capture_events = []
 
         # 1) 距离塑形（slot）
         cur_dist_to_food = [None] * self.max_player_num
@@ -658,6 +659,17 @@ class WolfpackPenaltyOpen(gym.Env):
             # 2. 核心捕猎与惩罚逻辑 (课程学习阶段控制)
             # ==========================================
             if k >= 2:
+                participant_slots = sorted(
+                    int(real_to_slot[rid]) for rid in close_real_ids
+                )
+                self.last_capture_events.append({
+                    "event_id": int(
+                        self.episode_step * self.max_food_num + fid
+                    ),
+                    "target_id": int(fid),
+                    "participant_slots": participant_slots,
+                    "capture_position": [int(fx), int(fy)],
+                })
                 # 捕获 prey：标记死亡并冻结
                 self.food_alive_statuses[fid] = False
                 self.food_frozen_time[fid] = self.food_freeze_rate
@@ -988,6 +1000,15 @@ class WolfpackPenaltyOpen(gym.Env):
             "individual_rewards": individual_rewards.copy(),
             "team_reward": team_reward_scalar,
             "capture_count": int(self.last_capture_count),
+            "capture_events": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "target_id": int(event["target_id"]),
+                    "participant_slots": list(event["participant_slots"]),
+                    "capture_position": list(event["capture_position"]),
+                }
+                for event in self.last_capture_events
+            ],
             "success_now": bool(success),
             "topology_changed": topology_changed,
             "left_slots": list(event_info["left_slots"]),

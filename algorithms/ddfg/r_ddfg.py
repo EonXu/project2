@@ -307,7 +307,23 @@ class R_DDFG:
     def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):
         """See parent class."""
 
-        if len(batch) >= 16:
+        if len(batch) >= 20:
+            obs_batch, share_obs_batch, dones_batch, \
+                dones_env_batch, adj_batch, prob_adj_batch, \
+                advantages_batch, f_advts_batch, \
+                _delayed_triplet_credit_batch, \
+                _delayed_triplet_success_gate_batch, \
+                _delayed_triplet_future_match_batch, \
+                _delayed_triplet_future_exact_batch, \
+                _delayed_triplet_future_partial_batch, \
+                _capture_to_win_triplet_credit_batch, \
+                _capture_to_win_quality_gate_batch, \
+                _pair_pursuit_credit_batch, \
+                _pair_pursuit_quality_batch, \
+                _pair_to_triplet_transition_score_batch, \
+                _triplet_capture_quality_batch, \
+                rnn_obs_batch = batch[:20]
+        elif len(batch) >= 16:
             obs_batch, share_obs_batch, dones_batch, \
                 dones_env_batch, adj_batch, prob_adj_batch, \
                 advantages_batch, f_advts_batch, \

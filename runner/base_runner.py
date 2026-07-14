@@ -547,6 +547,41 @@ class RecRunner(object):
                                             False,
                                         )
                                     ),
+                                    use_adj_pair_triplet_complementary_credit=bool(
+                                        getattr(
+                                            self.args,
+                                            "use_adj_pair_triplet_complementary_credit",
+                                            False,
+                                        )
+                                    ),
+                                    adj_pair_pursuit_credit_coef=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_pair_pursuit_credit_coef",
+                                            0.0,
+                                        )
+                                    ),
+                                    adj_pair_pursuit_credit_window=int(
+                                        getattr(
+                                            self.args,
+                                            "adj_pair_pursuit_credit_window",
+                                            20,
+                                        )
+                                    ),
+                                    adj_pair_pursuit_credit_cap=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_pair_pursuit_credit_cap",
+                                            0.20,
+                                        )
+                                    ),
+                                    adj_pair_pursuit_credit_min_reward=float(
+                                        getattr(
+                                            self.args,
+                                            "adj_pair_pursuit_credit_min_reward",
+                                            0.0,
+                                        )
+                                    ),
                                     )
 
     def run(self):
@@ -959,6 +994,78 @@ class RecRunner(object):
         epochs_ran = 0
         sample_episode_count = np.nan
         sample_recent_fraction = np.nan
+        sample_base_episode_count = np.nan
+        sample_outcome_contrast_augmented_count = np.nan
+        sample_outcome_positive_available = np.nan
+        sample_outcome_negative_available = np.nan
+        sample_outcome_positive_episode_count = np.nan
+        sample_outcome_negative_episode_count = np.nan
+        sample_outcome_class_complete = np.nan
+        sample_outcome_support_exhausted = np.nan
+        sample_outcome_credit_enabled = np.nan
+        sample_outcome_cached_selection_reused = np.nan
+        sample_outcome_support_round = np.nan
+        sample_outcome_cross_update_reuse_count = np.nan
+        sample_outcome_positive_available_count = np.nan
+        sample_outcome_negative_available_count = np.nan
+        sample_outcome_base_positive_count = np.nan
+        sample_outcome_base_negative_count = np.nan
+        sample_outcome_augmented_positive_count = np.nan
+        sample_outcome_augmented_negative_count = np.nan
+        sample_outcome_base_age_mean = np.nan
+        sample_outcome_base_age_max = np.nan
+        sample_outcome_augmented_age_mean = np.nan
+        sample_outcome_augmented_age_max = np.nan
+        sample_outcome_positive_support_generation = np.nan
+        sample_outcome_negative_support_generation = np.nan
+        sample_outcome_positive_support_age = np.nan
+        sample_outcome_negative_support_age = np.nan
+        sample_outcome_support_used_count = np.nan
+        sample_outcome_support_used_fraction = np.nan
+        sample_outcome_full_buffer_baseline = np.nan
+        sample_outcome_base_cohort_baseline = np.nan
+        sample_outcome_trained_cohort_baseline = np.nan
+        sample_outcome_full_trained_baseline_gap = np.nan
+        sample_outcome_trained_capture_episode_count = np.nan
+        sample_outcome_cohort_centered_sum = np.nan
+        sample_outcome_cohort_center_error = np.nan
+        sample_outcome_cohort_center_valid = np.nan
+        sample_outcome_positive_gate_episode_count = np.nan
+        sample_outcome_negative_gate_episode_count = np.nan
+        sample_outcome_positive_credit_episode_count = np.nan
+        sample_outcome_negative_credit_episode_count = np.nan
+        sample_outcome_signed_scaling_version = np.nan
+        sample_outcome_graph_advantage_source_ready_fraction = np.nan
+        sample_outcome_graph_confidence_mean = np.nan
+        sample_outcome_graph_confidence_std = np.nan
+        sample_outcome_graph_confidence_p50 = np.nan
+        sample_outcome_graph_confidence_p95 = np.nan
+        sample_outcome_graph_confidence_max = np.nan
+        sample_outcome_positive_graph_confidence_mean = np.nan
+        sample_outcome_positive_graph_confidence_max = np.nan
+        sample_outcome_negative_graph_confidence_mean = np.nan
+        sample_outcome_negative_graph_confidence_max = np.nan
+        sample_outcome_graph_advantage_positive_fraction = np.nan
+        sample_outcome_graph_advantage_negative_fraction = np.nan
+        sample_outcome_graph_advantage_zero_fraction = np.nan
+        sample_outcome_positive_zero_confidence_fraction = np.nan
+        sample_outcome_negative_zero_confidence_fraction = np.nan
+        sample_outcome_gate_to_credit_drop_fraction = np.nan
+        sample_outcome_preclip_positive_mass = np.nan
+        sample_outcome_preclip_negative_mass = np.nan
+        sample_outcome_postclip_positive_mass = np.nan
+        sample_outcome_postclip_negative_mass = np.nan
+        sample_outcome_positive_clip_fraction = np.nan
+        sample_outcome_negative_clip_fraction = np.nan
+        sample_outcome_generation_update_count = np.nan
+        sample_outcome_slot_overwrite_count = np.nan
+        sample_outcome_generation_conflict_count = np.nan
+        sample_outcome_invalid_used_state_count = np.nan
+
+        self._adj_outcome_support_round = int(
+            getattr(self, "_adj_outcome_support_round", 0)
+        ) + 1
+        outcome_support_round = self._adj_outcome_support_round
 
         for epoch_idx in range(self.adj_train_epochs):
             epoch_clip_ratios = []
@@ -967,7 +1074,8 @@ class RecRunner(object):
                 # 从该policy对应的邻接缓冲中，按“连续片段+mini-batch”方式迭代采样
                 data_generator = self.adj_buffer.policy_buffers[p_id].sample_inds(data_chunk_length,
                                                                                   self.num_mini_batch,
-                                                                                  recent_episode_window=recent_episode_window)
+                                                                                  recent_episode_window=recent_episode_window,
+                                                                                  outcome_support_round=outcome_support_round)
                 for sample in data_generator:
                     # 调用trainer的邻接训练：内部是PPO剪切 + 熵正则
                     train_adj_info, new_priorities, idxes = self.trainer.train_adj_on_batch(sample, self.use_adj_init)
@@ -984,6 +1092,343 @@ class RecRunner(object):
                 sample_episode_count = float(
                     getattr(policy_buffer, "last_sample_episode_count", np.nan)
                 )
+                sample_base_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_base_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_contrast_augmented_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_contrast_augmented_count",
+                    np.nan,
+                ))
+                sample_outcome_positive_available = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_available",
+                    np.nan,
+                ))
+                sample_outcome_negative_available = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_available",
+                    np.nan,
+                ))
+                sample_outcome_positive_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_negative_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_class_complete = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_class_complete",
+                    np.nan,
+                ))
+                sample_outcome_support_exhausted = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_support_exhausted",
+                    np.nan,
+                ))
+                sample_outcome_credit_enabled = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_credit_enabled",
+                    np.nan,
+                ))
+                sample_outcome_cached_selection_reused = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_cached_selection_reused",
+                    np.nan,
+                ))
+                sample_outcome_support_round = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_support_round",
+                    np.nan,
+                ))
+                sample_outcome_cross_update_reuse_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_cross_update_reuse_count",
+                    np.nan,
+                ))
+                sample_outcome_positive_available_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_available_count",
+                    np.nan,
+                ))
+                sample_outcome_negative_available_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_available_count",
+                    np.nan,
+                ))
+                sample_outcome_base_positive_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_base_positive_count",
+                    np.nan,
+                ))
+                sample_outcome_base_negative_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_base_negative_count",
+                    np.nan,
+                ))
+                sample_outcome_augmented_positive_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_augmented_positive_count",
+                    np.nan,
+                ))
+                sample_outcome_augmented_negative_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_augmented_negative_count",
+                    np.nan,
+                ))
+                sample_outcome_base_age_mean = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_base_age_mean",
+                    np.nan,
+                ))
+                sample_outcome_base_age_max = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_base_age_max",
+                    np.nan,
+                ))
+                sample_outcome_augmented_age_mean = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_augmented_age_mean",
+                    np.nan,
+                ))
+                sample_outcome_augmented_age_max = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_augmented_age_max",
+                    np.nan,
+                ))
+                sample_outcome_positive_support_generation = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_support_generation",
+                    np.nan,
+                ))
+                sample_outcome_negative_support_generation = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_support_generation",
+                    np.nan,
+                ))
+                sample_outcome_positive_support_age = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_support_age",
+                    np.nan,
+                ))
+                sample_outcome_negative_support_age = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_support_age",
+                    np.nan,
+                ))
+                sample_outcome_support_used_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_support_used_count",
+                    np.nan,
+                ))
+                sample_outcome_support_used_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_support_used_fraction",
+                    np.nan,
+                ))
+                sample_outcome_full_buffer_baseline = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_full_buffer_baseline",
+                    np.nan,
+                ))
+                sample_outcome_base_cohort_baseline = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_base_cohort_baseline",
+                    np.nan,
+                ))
+                sample_outcome_trained_cohort_baseline = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_trained_cohort_baseline",
+                    np.nan,
+                ))
+                sample_outcome_full_trained_baseline_gap = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_full_trained_baseline_gap",
+                    np.nan,
+                ))
+                sample_outcome_trained_capture_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_trained_capture_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_cohort_centered_sum = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_cohort_centered_sum",
+                    np.nan,
+                ))
+                sample_outcome_cohort_center_error = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_cohort_center_error",
+                    np.nan,
+                ))
+                sample_outcome_cohort_center_valid = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_cohort_center_valid",
+                    np.nan,
+                ))
+                sample_outcome_positive_gate_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_gate_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_negative_gate_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_gate_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_positive_credit_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_credit_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_negative_credit_episode_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_credit_episode_count",
+                    np.nan,
+                ))
+                sample_outcome_signed_scaling_version = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_signed_scaling_version",
+                    np.nan,
+                ))
+                sample_outcome_graph_advantage_source_ready_fraction = float(
+                    getattr(
+                        policy_buffer,
+                        "last_sample_outcome_graph_advantage_source_ready_fraction",
+                        np.nan,
+                    )
+                )
+                sample_outcome_graph_confidence_mean = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_confidence_mean",
+                    np.nan,
+                ))
+                sample_outcome_graph_confidence_std = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_confidence_std",
+                    np.nan,
+                ))
+                sample_outcome_graph_confidence_p50 = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_confidence_p50",
+                    np.nan,
+                ))
+                sample_outcome_graph_confidence_p95 = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_confidence_p95",
+                    np.nan,
+                ))
+                sample_outcome_graph_confidence_max = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_confidence_max",
+                    np.nan,
+                ))
+                sample_outcome_positive_graph_confidence_mean = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_graph_confidence_mean",
+                    np.nan,
+                ))
+                sample_outcome_positive_graph_confidence_max = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_graph_confidence_max",
+                    np.nan,
+                ))
+                sample_outcome_negative_graph_confidence_mean = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_graph_confidence_mean",
+                    np.nan,
+                ))
+                sample_outcome_negative_graph_confidence_max = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_graph_confidence_max",
+                    np.nan,
+                ))
+                sample_outcome_graph_advantage_positive_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_advantage_positive_fraction",
+                    np.nan,
+                ))
+                sample_outcome_graph_advantage_negative_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_advantage_negative_fraction",
+                    np.nan,
+                ))
+                sample_outcome_graph_advantage_zero_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_graph_advantage_zero_fraction",
+                    np.nan,
+                ))
+                sample_outcome_positive_zero_confidence_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_zero_confidence_fraction",
+                    np.nan,
+                ))
+                sample_outcome_negative_zero_confidence_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_zero_confidence_fraction",
+                    np.nan,
+                ))
+                sample_outcome_gate_to_credit_drop_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_gate_to_credit_drop_fraction",
+                    np.nan,
+                ))
+                sample_outcome_preclip_positive_mass = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_preclip_positive_mass",
+                    np.nan,
+                ))
+                sample_outcome_preclip_negative_mass = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_preclip_negative_mass",
+                    np.nan,
+                ))
+                sample_outcome_postclip_positive_mass = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_postclip_positive_mass",
+                    np.nan,
+                ))
+                sample_outcome_postclip_negative_mass = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_postclip_negative_mass",
+                    np.nan,
+                ))
+                sample_outcome_positive_clip_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_positive_clip_fraction",
+                    np.nan,
+                ))
+                sample_outcome_negative_clip_fraction = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_negative_clip_fraction",
+                    np.nan,
+                ))
+                sample_outcome_generation_update_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_generation_update_count",
+                    np.nan,
+                ))
+                sample_outcome_slot_overwrite_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_slot_overwrite_count",
+                    np.nan,
+                ))
+                sample_outcome_generation_conflict_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_generation_conflict_count",
+                    np.nan,
+                ))
+                sample_outcome_invalid_used_state_count = float(getattr(
+                    policy_buffer,
+                    "last_sample_outcome_invalid_used_state_count",
+                    np.nan,
+                ))
                 filled_episode_count = float(
                     max(1, getattr(policy_buffer, "filled_i", 1))
                 )
@@ -1065,6 +1510,101 @@ class RecRunner(object):
         self.train_adj_infos.setdefault(
             "adj_sample_recent_fraction", []
         ).append(float(sample_recent_fraction))
+        for metric_name, metric_value in (
+                # v3 keeps v2 generation/round semantics and additionally
+                # recenters outcome labels on the final optimizer cohort.
+                ("adj_outcome_contrast_replay_support_version", 3.0),
+                ("adj_sample_base_episode_count", sample_base_episode_count),
+                (
+                    "adj_sample_outcome_contrast_augmented_count",
+                    sample_outcome_contrast_augmented_count,
+                ),
+                (
+                    "adj_sample_outcome_positive_available",
+                    sample_outcome_positive_available,
+                ),
+                (
+                    "adj_sample_outcome_negative_available",
+                    sample_outcome_negative_available,
+                ),
+                (
+                    "adj_sample_outcome_positive_episode_count",
+                    sample_outcome_positive_episode_count,
+                ),
+                (
+                    "adj_sample_outcome_negative_episode_count",
+                    sample_outcome_negative_episode_count,
+                ),
+                (
+                    "adj_sample_outcome_class_complete",
+                    sample_outcome_class_complete,
+                ),
+                ("adj_sample_outcome_support_exhausted", sample_outcome_support_exhausted),
+                ("adj_sample_outcome_credit_enabled", sample_outcome_credit_enabled),
+                ("adj_sample_outcome_cached_selection_reused", sample_outcome_cached_selection_reused),
+                ("adj_sample_outcome_support_round", sample_outcome_support_round),
+                ("adj_sample_outcome_cross_update_reuse_count", sample_outcome_cross_update_reuse_count),
+                ("adj_sample_outcome_positive_available_count", sample_outcome_positive_available_count),
+                ("adj_sample_outcome_negative_available_count", sample_outcome_negative_available_count),
+                ("adj_sample_outcome_base_positive_count", sample_outcome_base_positive_count),
+                ("adj_sample_outcome_base_negative_count", sample_outcome_base_negative_count),
+                ("adj_sample_outcome_augmented_positive_count", sample_outcome_augmented_positive_count),
+                ("adj_sample_outcome_augmented_negative_count", sample_outcome_augmented_negative_count),
+                ("adj_sample_outcome_base_age_mean", sample_outcome_base_age_mean),
+                ("adj_sample_outcome_base_age_max", sample_outcome_base_age_max),
+                ("adj_sample_outcome_augmented_age_mean", sample_outcome_augmented_age_mean),
+                ("adj_sample_outcome_augmented_age_max", sample_outcome_augmented_age_max),
+                ("adj_sample_outcome_positive_support_generation", sample_outcome_positive_support_generation),
+                ("adj_sample_outcome_negative_support_generation", sample_outcome_negative_support_generation),
+                ("adj_sample_outcome_positive_support_age", sample_outcome_positive_support_age),
+                ("adj_sample_outcome_negative_support_age", sample_outcome_negative_support_age),
+                ("adj_sample_outcome_support_used_count", sample_outcome_support_used_count),
+                ("adj_sample_outcome_support_used_fraction", sample_outcome_support_used_fraction),
+                ("adj_sample_outcome_full_buffer_baseline", sample_outcome_full_buffer_baseline),
+                ("adj_sample_outcome_base_cohort_baseline", sample_outcome_base_cohort_baseline),
+                ("adj_sample_outcome_trained_cohort_baseline", sample_outcome_trained_cohort_baseline),
+                ("adj_sample_outcome_full_trained_baseline_gap", sample_outcome_full_trained_baseline_gap),
+                ("adj_sample_outcome_trained_capture_episode_count", sample_outcome_trained_capture_episode_count),
+                ("adj_sample_outcome_cohort_centered_sum", sample_outcome_cohort_centered_sum),
+                ("adj_sample_outcome_cohort_center_error", sample_outcome_cohort_center_error),
+                ("adj_sample_outcome_cohort_center_valid", sample_outcome_cohort_center_valid),
+                ("adj_sample_outcome_positive_gate_episode_count", sample_outcome_positive_gate_episode_count),
+                ("adj_sample_outcome_negative_gate_episode_count", sample_outcome_negative_gate_episode_count),
+                ("adj_sample_outcome_positive_credit_episode_count", sample_outcome_positive_credit_episode_count),
+                ("adj_sample_outcome_negative_credit_episode_count", sample_outcome_negative_credit_episode_count),
+                ("adj_sample_outcome_signed_scaling_version", sample_outcome_signed_scaling_version),
+                (
+                    "adj_sample_outcome_graph_advantage_source_ready_fraction",
+                    sample_outcome_graph_advantage_source_ready_fraction,
+                ),
+                ("adj_sample_outcome_graph_confidence_mean", sample_outcome_graph_confidence_mean),
+                ("adj_sample_outcome_graph_confidence_std", sample_outcome_graph_confidence_std),
+                ("adj_sample_outcome_graph_confidence_p50", sample_outcome_graph_confidence_p50),
+                ("adj_sample_outcome_graph_confidence_p95", sample_outcome_graph_confidence_p95),
+                ("adj_sample_outcome_graph_confidence_max", sample_outcome_graph_confidence_max),
+                ("adj_sample_outcome_positive_graph_confidence_mean", sample_outcome_positive_graph_confidence_mean),
+                ("adj_sample_outcome_positive_graph_confidence_max", sample_outcome_positive_graph_confidence_max),
+                ("adj_sample_outcome_negative_graph_confidence_mean", sample_outcome_negative_graph_confidence_mean),
+                ("adj_sample_outcome_negative_graph_confidence_max", sample_outcome_negative_graph_confidence_max),
+                ("adj_sample_outcome_graph_advantage_positive_fraction", sample_outcome_graph_advantage_positive_fraction),
+                ("adj_sample_outcome_graph_advantage_negative_fraction", sample_outcome_graph_advantage_negative_fraction),
+                ("adj_sample_outcome_graph_advantage_zero_fraction", sample_outcome_graph_advantage_zero_fraction),
+                ("adj_sample_outcome_positive_zero_confidence_fraction", sample_outcome_positive_zero_confidence_fraction),
+                ("adj_sample_outcome_negative_zero_confidence_fraction", sample_outcome_negative_zero_confidence_fraction),
+                ("adj_sample_outcome_gate_to_credit_drop_fraction", sample_outcome_gate_to_credit_drop_fraction),
+                ("adj_sample_outcome_preclip_positive_mass", sample_outcome_preclip_positive_mass),
+                ("adj_sample_outcome_preclip_negative_mass", sample_outcome_preclip_negative_mass),
+                ("adj_sample_outcome_postclip_positive_mass", sample_outcome_postclip_positive_mass),
+                ("adj_sample_outcome_postclip_negative_mass", sample_outcome_postclip_negative_mass),
+                ("adj_sample_outcome_positive_clip_fraction", sample_outcome_positive_clip_fraction),
+                ("adj_sample_outcome_negative_clip_fraction", sample_outcome_negative_clip_fraction),
+                ("adj_sample_outcome_generation_update_count", sample_outcome_generation_update_count),
+                ("adj_sample_outcome_slot_overwrite_count", sample_outcome_slot_overwrite_count),
+                ("adj_sample_outcome_generation_conflict_count", sample_outcome_generation_conflict_count),
+                ("adj_sample_outcome_invalid_used_state_count", sample_outcome_invalid_used_state_count)):
+            self.train_adj_infos.setdefault(metric_name, []).append(
+                float(metric_value)
+            )
         self.train_adj_infos.setdefault(
             "adj_recent_episode_window_emergency", []
         ).append(float(getattr(self.args, "adj_recent_episode_window_emergency", 1)))
@@ -1504,14 +2044,21 @@ class RecRunner(object):
         row = {"step": self.total_env_steps}
         for k, v in train_adj_info.items():
             if len(v) > 0:
-                v = np.mean(v)
+                v = float(np.mean(v))
             else:
                 v = 0.0
             row[k] = v
-            if self.use_wandb:
-                wandb.log({"adj/" + k: v}, step=self.total_env_steps)
-            else:
-                self.writter.add_scalar("adj/" + k, v, self.total_env_steps)
+            # Missing diagnostics deliberately use NaN so CSV readers can
+            # distinguish "not observed" from a real zero. TensorBoard rejects
+            # non-finite scalars and emitted thousands of misleading warnings
+            # in run62; keep the CSV sentinel but do not write it as an event.
+            if np.isfinite(v):
+                if self.use_wandb:
+                    wandb.log({"adj/" + k: v}, step=self.total_env_steps)
+                else:
+                    self.writter.add_scalar(
+                        "adj/" + k, v, self.total_env_steps
+                    )
 
         self._append_scalar_csv('progress_train_adj.csv', row)
 
