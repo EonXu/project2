@@ -1,0 +1,9 @@
+{
+  "accepted": false,
+  "diagnostic_version": 3,
+  "enabled": true,
+  "mode": "independent_generation_accumulation",
+  "rejection_reason": "independent candidate evidence accumulation requires at least two distinct generations; replaying one generation is not independent evidence",
+  "training_path_imported": false,
+  "trajectory_neutral": true
+}

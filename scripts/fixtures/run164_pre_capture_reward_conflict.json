@@ -1,0 +1,21 @@
+{
+  "source_run": "run164",
+  "environment_episode_id": 259,
+  "offset_to_first_capture": -1,
+  "joint_explore": 0,
+  "greedy_equals_executed": true,
+  "first_capture_target_id": 1,
+  "active_slots": [0, 2, 4],
+  "previous_food_positions": [[9, 10], [1, 17]],
+  "current_food_positions": [[10, 10], [1, 17]],
+  "previous_player_positions": [[0, 15], [0, 13], [2, 16]],
+  "current_player_positions": [[0, 16], [0, 14], [2, 16]],
+  "greedy_actions": [1, 1, 0],
+  "executed_actions": [1, 1, 0],
+  "expected_legacy_previous_cost": 10.0,
+  "expected_legacy_current_cost": 8.0,
+  "expected_coverage_previous_cost": 17.0,
+  "expected_coverage_current_cost": 18.0,
+  "expected_legacy_team_shaping": 0.02,
+  "expected_coverage_team_shaping": -0.01
+}

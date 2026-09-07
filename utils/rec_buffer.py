@@ -1,6 +1,7 @@
 import numpy as np
 from .util import get_dim_from_space
 from .segment_tree import SumSegmentTree, MinSegmentTree
+from .terminal_replay import terminal_win_replay_lane_indices
 
 
 def _cast(x):
@@ -22,6 +23,7 @@ class RecReplayBuffer(object):
         """
         self.policy_info = policy_info
         self.rng = np.random.RandomState(int(seed))
+        self.terminal_win_replay_cursor = 0
 
         self.policy_buffers = {p_id: RecPolicyBuffer(buffer_size,
                                                      episode_length,
@@ -62,6 +64,28 @@ class RecReplayBuffer(object):
                                                          np.array(adj[p_id]),np.array(prob_adj[p_id]))
         return idx_range
 
+    def _sample_indices(self, inds, terminal_replay_lane_episode_mask=None):
+        inds = np.asarray(inds, dtype=np.int64).reshape(-1)
+        if terminal_replay_lane_episode_mask is None:
+            terminal_replay_lane_episode_mask = np.zeros(
+                inds.shape[0], dtype=np.float32
+            )
+        terminal_replay_lane_episode_mask = np.asarray(
+            terminal_replay_lane_episode_mask, dtype=np.float32
+        ).reshape(-1)
+        if terminal_replay_lane_episode_mask.shape[0] != inds.shape[0]:
+            raise RuntimeError(
+                "terminal replay lane mask does not match sampled episodes"
+            )
+        obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj, prob_adj = {}, {}, {}, {}, {}, {}, {}, {}, {}
+        for p_id in self.policy_info.keys():
+            obs[p_id], share_obs[p_id], acts[p_id], rewards[p_id], dones[p_id], dones_env[p_id], \
+            avail_acts[p_id], adj[p_id], prob_adj[p_id] = self.policy_buffers[p_id].sample_inds(inds)
+            self.policy_buffers[p_id].last_reward_sample_diagnostics[
+                "terminal_replay_lane_episode_mask"
+            ] = terminal_replay_lane_episode_mask.copy()
+        return obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj, prob_adj, None
+
     def sample(self, batch_size):
         """
         Sample a set of episodes from buffer, uniformly at random.
@@ -78,13 +102,54 @@ class RecReplayBuffer(object):
         """
         replace = self.__len__() < batch_size
         inds = self.rng.choice(self.__len__(), batch_size, replace=replace)
-        obs, share_obs, acts, rewards, dones, dones_env, avail_acts,adj,prob_adj = {}, {}, {}, {}, {}, {}, {}, {}, {}
-        #import pdb;pdb.set_trace()
-        for p_id in self.policy_info.keys():
-            obs[p_id], share_obs[p_id], acts[p_id], rewards[p_id], dones[p_id], dones_env[p_id], \
-            avail_acts[p_id], adj[p_id], prob_adj[p_id] = self.policy_buffers[p_id].sample_inds(inds)
+        return self._sample_indices(inds)
 
-        return obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj, prob_adj, None
+    def sample_with_terminal_win_lane(self, batch_size):
+        """Keep the uniform batch and append one gated terminal-credit lane.
+
+        A lane is appended only when a real terminal-win episode exists and
+        the unchanged uniform draw did not already contain one.  Selection is
+        deterministic round-robin so enabling this path does not perturb the
+        replay RNG stream or the uniform sample prefix.
+        """
+        replace = self.__len__() < batch_size
+        base_inds = self.rng.choice(
+            self.__len__(), batch_size, replace=replace
+        )
+        terminal_sets = []
+        for p_id in self.policy_info.keys():
+            policy_buffer = self.policy_buffers[p_id]
+            terminal_sets.append(np.flatnonzero(np.any(
+                policy_buffer.terminal_win_rewards[
+                    :, :policy_buffer.filled_i
+                ].astype(np.float64) != 0.0,
+                axis=(0, 2),
+            )))
+        terminal_inds = terminal_sets[0] if terminal_sets else np.zeros(
+            0, dtype=np.int64
+        )
+        for other in terminal_sets[1:]:
+            if not np.array_equal(terminal_inds, other):
+                raise RuntimeError(
+                    "policy replay buffers disagree on terminal-win episodes"
+                )
+        inds, lane_mask, self.terminal_win_replay_cursor, forced = (
+            terminal_win_replay_lane_indices(
+                base_inds,
+                terminal_inds,
+                self.terminal_win_replay_cursor,
+            )
+        )
+        sample = self._sample_indices(inds, lane_mask)
+        for p_id in self.policy_info.keys():
+            diagnostic = self.policy_buffers[
+                p_id
+            ].last_reward_sample_diagnostics
+            diagnostic["terminal_replay_lane_forced"] = float(forced)
+            diagnostic["terminal_replay_candidate_episode_count"] = float(
+                terminal_inds.size
+            )
+        return sample
 
     def norm_reward(self, ind):
 
@@ -148,6 +213,12 @@ class RecPolicyBuffer(object):
 
         # rewards
         self.rewards = np.zeros((self.episode_length, self.buffer_size, self.num_agents, 1), dtype=np.float32)
+        # Environment-provided terminal-win provenance is stored separately
+        # from reward magnitude.  A raw-reward threshold cannot distinguish a
+        # win bonus from an ordinary capture reward.
+        self.terminal_win_rewards = np.zeros(
+            (self.episode_length, self.buffer_size, 1), dtype=np.float32
+        )
 
         # default to done being True
         self.dones = np.ones_like(self.rewards, dtype=np.float32)
@@ -224,6 +295,7 @@ class RecPolicyBuffer(object):
         
         obs = _cast(self.obs[:, sample_inds])
         acts = _cast(self.acts[:, sample_inds])
+        sampled_raw_rewards = self.rewards[:, sample_inds].copy()
         if self.use_reward_normalization:
             # mean std
             # [length, envs, agents, 1]
@@ -239,9 +311,24 @@ class RecPolicyBuffer(object):
             mean_reward = np.nanmean(temp_rewards)
             std_reward = np.nanstd(temp_rewards) + 1e-10
             rewards = _cast(
-                (self.rewards[:, sample_inds] - mean_reward) / std_reward)
+                (sampled_raw_rewards - mean_reward) / std_reward)
         else:
-            rewards = _cast(self.rewards[:, sample_inds])
+            mean_reward = 0.0
+            std_reward = 1.0
+            rewards = _cast(sampled_raw_rewards)
+
+        # Detached, read-only reward audit for the most recent sample.  The
+        # runner consumes this after training; it never enters the batch and
+        # therefore cannot change sampling, RNG, targets, or gradients.
+        self.last_reward_sample_diagnostics = {
+            "sample_indices": np.asarray(sample_inds, dtype=np.int64).copy(),
+            "raw_rewards": _cast(sampled_raw_rewards).copy(),
+            "terminal_win_rewards": self.terminal_win_rewards[
+                :, sample_inds
+            ].transpose(1, 0, 2).copy(),
+            "mean_reward": float(mean_reward),
+            "std_reward": float(std_reward),
+        }
 
         if self.use_same_share_obs:
             share_obs = self.share_obs[:, sample_inds]
@@ -259,6 +346,27 @@ class RecPolicyBuffer(object):
             avail_acts = None
 
         return obs, share_obs, acts, rewards, dones, dones_env, avail_acts, adj, prob_adj
+
+    def reward_normalization_diagnostics(self):
+        """Return current replay reward statistics without changing state."""
+        if not self.use_reward_normalization:
+            return {"mean_reward": 0.0, "std_reward": 1.0}
+        all_dones_env = np.tile(
+            np.expand_dims(self.dones_env[:, :self.filled_i], -1),
+            (1, 1, self.num_agents, 1),
+        )
+        first_step_dones_env = np.zeros(
+            (1, self.filled_i, self.num_agents, 1)
+        )
+        current_dones_env = np.concatenate(
+            (first_step_dones_env, all_dones_env[:self.episode_length - 1])
+        )
+        rewards = self.rewards[:, :self.filled_i].copy()
+        rewards[current_dones_env == 1.0] = np.nan
+        return {
+            "mean_reward": float(np.nanmean(rewards)),
+            "std_reward": float(np.nanstd(rewards) + 1e-10),
+        }
 
     def norm_reward(self, sample_inds):
         

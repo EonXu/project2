@@ -2,9 +2,16 @@
 set -euo pipefail
 
 # Usage:
-#   bash scripts/train_wolfpack_sddfg_intra_episode_dynamic.sh [seed] [gpu] [num_env_steps]
+#   bash train_wolfpack_sddfg_intra_episode_dynamic.sh
+#   bash train_wolfpack_sddfg_intra_episode_dynamic.sh [num_env_steps]
+# Legacy three-position form remains accepted: [seed] [gpu] [num_env_steps].
 # Environment overrides:
-#   PYTHON_BIN=python CUDA_DEVICE=0 USER_NAME=local NUM_ENV_STEPS=200000
+#   PYTHON_BIN=python CUDA_DEVICE=0 USER_NAME=local NUM_ENV_STEPS=60000
+#   Q_N_STEP=24  # recurrent Q return horizon; 1 restores legacy one-step TD
+#   Terminal replay lane is enabled for the formal SDDFG experiment.
+#   Q_TERMINAL_REPLAY_LOSS_WEIGHT=0.10 controls only appended gated steps.
+#   POST_CAPTURE_EXPLORE_MAX_RANDOM_AGENTS=1 bounds only eligible explore branches.
+#   Multi-prey coverage potential is the production pre-capture reward mode.
 #   ANNEAL_STEPS=2000000  # shared policy/graph LR schedule horizon
 #   ADJ_ENTROPY_COEF=0.0002 ADJ_ENTROPY_ANNEAL_STEPS=500000
 #   ADJ_ORDER3_BONUS_START=1.0 ADJ_ORDER3_BONUS=1.35 ADJ_ORDER3_BONUS_ANNEAL_STEPS=120000
@@ -37,18 +44,75 @@ set -euo pipefail
 #   ADJ_RECENT_EPISODE_WINDOW=4
 #   USE_ADJ_DYNAMIC_RECENT_WINDOW=1 ADJ_RECENT_EPISODE_WINDOW_MIN=3
 #   ADJ_RECENT_WINDOW_SHRINK_PATIENCE=3 ADJ_RECENT_WINDOW_RECOVER_PATIENCE=2
+#   PAIR_BOUNDED_PENDING_EVIDENCE=1 PAIR_PENDING_MAX_ADJ_UPDATES=4
+#   Set both pair-pending values to 0 for an explicit default-off control run.
 #   SKIP_SDDFG_PREFLIGHT=1  # only after the same revision has passed once
 
-seed="${1:-1}"
-gpu="${2:-${CUDA_DEVICE:-0}}"
-# Structural pair-credit changes must pass the 200k gate before any long run.
-# A future 2M run therefore requires an explicit third argument or override.
-num_env_steps="${3:-${NUM_ENV_STEPS:-200000}}"
+if [ "$#" -ge 2 ]; then
+  seed="${1:-1}"
+  gpu="${2:-${CUDA_DEVICE:-0}}"
+  num_env_steps="${3:-${NUM_ENV_STEPS:-60000}}"
+else
+  seed="${SEED:-1}"
+  gpu="${CUDA_DEVICE:-0}"
+  num_env_steps="${1:-${NUM_ENV_STEPS:-60000}}"
+fi
+if ! [[ "${num_env_steps}" =~ ^[0-9]+$ ]] || [ "${num_env_steps}" -le 0 ]; then
+  echo "NUM_ENV_STEPS or the single steps argument must be a positive integer." >&2
+  exit 2
+fi
+q_n_step="${Q_N_STEP:-24}"
+if ! [[ "${q_n_step}" =~ ^[0-9]+$ ]] || [ "${q_n_step}" -le 0 ]; then
+  echo "Q_N_STEP must be a positive integer, got: ${q_n_step}" >&2
+  exit 2
+fi
 python_bin="${PYTHON_BIN:-python}"
+q_terminal_replay_loss_weight="${Q_TERMINAL_REPLAY_LOSS_WEIGHT:-0.10}"
+if ! "${python_bin}" -c 'import math,sys; x=float(sys.argv[1]); sys.exit(0 if math.isfinite(x) and 0.0 < x <= 1.0 else 1)' "${q_terminal_replay_loss_weight}"; then
+  echo "Q_TERMINAL_REPLAY_LOSS_WEIGHT must be finite in (0,1], got: ${q_terminal_replay_loss_weight}" >&2
+  exit 2
+fi
+post_capture_explore_max_random_agents="${POST_CAPTURE_EXPLORE_MAX_RANDOM_AGENTS:-1}"
+if ! [[ "${post_capture_explore_max_random_agents}" =~ ^[0-9]+$ ]]; then
+  echo "POST_CAPTURE_EXPLORE_MAX_RANDOM_AGENTS must be a non-negative integer, got: ${post_capture_explore_max_random_agents}" >&2
+  exit 2
+fi
+pre_capture_visible_prey_quorum_guard="${PRE_CAPTURE_VISIBLE_PREY_QUORUM_GUARD:-1}"
+if [ "${pre_capture_visible_prey_quorum_guard}" != "0" ] && [ "${pre_capture_visible_prey_quorum_guard}" != "1" ]; then
+  echo "PRE_CAPTURE_VISIBLE_PREY_QUORUM_GUARD must be 0 or 1, got: ${pre_capture_visible_prey_quorum_guard}" >&2
+  exit 2
+fi
+pre_capture_visible_prey_quorum_guard_args=()
+if [ "${pre_capture_visible_prey_quorum_guard}" = "1" ]; then
+  pre_capture_visible_prey_quorum_guard_args=(
+    --pre_capture_visible_prey_quorum_guard
+  )
+fi
+pre_capture_visible_prey_quorum_greedy_frontier_guard="${PRE_CAPTURE_VISIBLE_PREY_QUORUM_GREEDY_FRONTIER_GUARD:-1}"
+if [ "${pre_capture_visible_prey_quorum_greedy_frontier_guard}" != "0" ] && [ "${pre_capture_visible_prey_quorum_greedy_frontier_guard}" != "1" ]; then
+  echo "PRE_CAPTURE_VISIBLE_PREY_QUORUM_GREEDY_FRONTIER_GUARD must be 0 or 1, got: ${pre_capture_visible_prey_quorum_greedy_frontier_guard}" >&2
+  exit 2
+fi
+pre_capture_visible_prey_quorum_greedy_frontier_guard_args=()
+if [ "${pre_capture_visible_prey_quorum_greedy_frontier_guard}" = "1" ]; then
+  pre_capture_visible_prey_quorum_greedy_frontier_guard_args=(
+    --pre_capture_visible_prey_quorum_greedy_frontier_guard
+  )
+fi
+q_terminal_replay_lane_enabled=0
+q_terminal_replay_lane_args=()
+if [ "${q_n_step}" -gt 1 ]; then
+  q_terminal_replay_lane_enabled=1
+  q_terminal_replay_lane_args=(
+    --q_terminal_replay_lane
+    --q_terminal_replay_loss_weight "${q_terminal_replay_loss_weight}"
+  )
+fi
 user_name="${USER_NAME:-sddfg_dynamic}"
 
-# Keep 20k/200k validation runs as exact LR-schedule prefixes of the intended
-# 2M experiment. Override only for an explicit schedule ablation.
+# Keep the historical optimizer schedule horizon stable unless the experiment
+# explicitly targets schedule behavior.  This is independent of total run
+# length and does not impose a 2M training requirement.
 anneal_steps="${ANNEAL_STEPS:-2000000}"
 if ! [[ "${anneal_steps}" =~ ^[0-9]+$ ]] || [ "${anneal_steps}" -le 0 ]; then
   echo "ANNEAL_STEPS must be a positive integer, got: ${anneal_steps}" >&2
@@ -135,6 +199,34 @@ adj_pair_pursuit_credit_coef="${ADJ_PAIR_PURSUIT_CREDIT_COEF:-0.10}"
 adj_pair_pursuit_credit_window="${ADJ_PAIR_PURSUIT_CREDIT_WINDOW:-20}"
 adj_pair_pursuit_credit_cap="${ADJ_PAIR_PURSUIT_CREDIT_CAP:-0.20}"
 adj_pair_pursuit_credit_min_reward="${ADJ_PAIR_PURSUIT_CREDIT_MIN_REWARD:-0.0}"
+# This experiment-specific launcher validates the bounded-pending mechanism.
+# Keep the library/parser defaults off, but make the three-argument production
+# command resolve to the run108/run110 TTL=4 configuration without relying on
+# an easy-to-omit shell environment prefix.
+pair_bounded_pending_evidence="${PAIR_BOUNDED_PENDING_EVIDENCE:-1}"
+if [[ -n "${PAIR_PENDING_MAX_ADJ_UPDATES+x}" ]]; then
+  pair_pending_max_adj_updates="${PAIR_PENDING_MAX_ADJ_UPDATES}"
+elif [[ "${pair_bounded_pending_evidence}" == "1" ]]; then
+  pair_pending_max_adj_updates=4
+else
+  pair_pending_max_adj_updates=0
+fi
+if [[ "${pair_bounded_pending_evidence}" != "0" && "${pair_bounded_pending_evidence}" != "1" ]]; then
+  echo "PAIR_BOUNDED_PENDING_EVIDENCE must be 0 or 1, got: ${pair_bounded_pending_evidence}" >&2
+  exit 2
+fi
+if ! [[ "${pair_pending_max_adj_updates}" =~ ^[0-9]+$ ]]; then
+  echo "PAIR_PENDING_MAX_ADJ_UPDATES must be a non-negative integer, got: ${pair_pending_max_adj_updates}" >&2
+  exit 2
+fi
+if [[ "${pair_bounded_pending_evidence}" == "1" && "${pair_pending_max_adj_updates}" -le 0 ]]; then
+  echo "PAIR_PENDING_MAX_ADJ_UPDATES must be positive when bounded pending evidence is enabled." >&2
+  exit 2
+fi
+if [[ "${pair_bounded_pending_evidence}" == "0" && "${pair_pending_max_adj_updates}" -ne 0 ]]; then
+  echo "PAIR_PENDING_MAX_ADJ_UPDATES must be 0 when bounded pending evidence is disabled." >&2
+  exit 2
+fi
 use_adj_order3_credit_gate="${USE_ADJ_ORDER3_CREDIT_GATE:-1}"
 use_adj_order3_relative_credit_gate="${USE_ADJ_ORDER3_RELATIVE_CREDIT_GATE:-1}"
 adj_order3_credit_gate_loss_scale="${ADJ_ORDER3_CREDIT_GATE_LOSS_SCALE:-0.004}"
@@ -262,6 +354,13 @@ adj_pair_triplet_complementary_args=()
 if [[ "${use_adj_pair_triplet_complementary_credit}" == "1" ]]; then
   adj_pair_triplet_complementary_args=(--use_adj_pair_triplet_complementary_credit)
 fi
+pair_pending_args=()
+if [[ "${pair_bounded_pending_evidence}" == "1" ]]; then
+  pair_pending_args=(
+    --pair_bounded_pending_evidence
+    --pair_pending_max_adj_updates "${pair_pending_max_adj_updates}"
+  )
+fi
 eval_graph_consistency_args=()
 if [[ "${use_train_consistent_eval_graph}" == "1" ]]; then
   eval_graph_consistency_args=(--use_train_consistent_eval_graph)
@@ -290,6 +389,10 @@ num_agents=4
 max_player_num=6
 max_food_num=2
 episode_length=200
+if [ "${q_n_step}" -gt "${episode_length}" ]; then
+  echo "Q_N_STEP cannot exceed episode_length=${episode_length}." >&2
+  exit 2
+fi
 
 # Intra-episode event schedule:
 #   t=50:  4 -> 2, t=60: 2 -> 3, t=80: 3 -> 5
@@ -308,7 +411,9 @@ experiment_name="sddfg_intra_ep_4to6_r${shock_remove_num}_j${shock_join_num}_rec
 # the experiment root and can be matched by its timestamp.
 result_root="${script_dir}/results/${env_name}/${algorithm}/${experiment_name}"
 mkdir -p "${result_root}/console_logs"
-console_log="${result_root}/console_logs/train_$(date +%Y%m%d_%H%M%S).log"
+run_timestamp="$(date +%Y%m%d_%H%M%S)"
+console_log="${result_root}/console_logs/train_${run_timestamp}.log"
+source_manifest_file="${result_root}/console_logs/source_manifest_${run_timestamp}.sha256"
 repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
 
 # Persist source provenance in the same console log as the training output.
@@ -326,30 +431,70 @@ if command -v git >/dev/null 2>&1 && git -C "${repo_root}" rev-parse --is-inside
   fi
 fi
 if command -v sha256sum >/dev/null 2>&1; then
-  source_manifest_sha256="$({
-    sha256sum \
-      "${repo_root}/utils/pair_credit.py" \
-      "${repo_root}/utils/adj_buffer.py" \
-      "${repo_root}/utils/graph_sampling.py" \
-      "${repo_root}/envs/Wolfpack/wolfpack_penalty_open.py" \
-      "${repo_root}/algorithms/sddfg/r_sddfg.py" \
-      "${repo_root}/algorithms/sddfg/algorithm/adj_generator.py" \
-      "${repo_root}/runner/base_runner.py" \
-      "${repo_root}/runner/wolfpack_runner.py" \
-      "${repo_root}/scripts/train/train_wolfpack.py" \
-      "${repo_root}/scripts/debug_pair_credit_synthetic.py" \
-      "${repo_root}/scripts/debug_capture_outcome_contrast_synthetic.py" \
-      "${repo_root}/scripts/debug_capture_identity_synthetic.py" \
-      "${repo_root}/scripts/debug_outcome_replay_support_synthetic.py" \
-      "${repo_root}/scripts/debug_outcome_cohort_centering_synthetic.py" \
-      "${repo_root}/scripts/debug_outcome_confidence_scaling_synthetic.py" \
-      "${repo_root}/scripts/debug_outcome_factor_loss_synthetic.py" \
-      "${repo_root}/scripts/debug_candidate_identity_supervision_synthetic.py" \
-      "${repo_root}/scripts/debug_eval_graph_consistency.py" \
-      "${repo_root}/scripts/debug_topology_persistence_synthetic.py" \
-      "${repo_root}/scripts/validate_sddfg_dynamic_graph.py" \
-      "${repo_root}/config.py"
-  } | sha256sum | awk '{print $1}')"
+  manifest_paths=(
+    "${repo_root}/utils/pair_credit.py"
+    "${repo_root}/utils/pair_pending.py"
+    "${repo_root}/utils/pair_direction.py"
+    "${repo_root}/utils/terminal_replay.py"
+    "${repo_root}/utils/adj_buffer.py"
+    "${repo_root}/utils/adj_training_control.py"
+    "${repo_root}/utils/graph_sampling.py"
+    "${repo_root}/utils/joint_exploration.py"
+    "${repo_root}/utils/wolfpack_reward.py"
+    "${repo_root}/envs/Wolfpack/wolfpack_penalty_open.py"
+    "${repo_root}/algorithms/sddfg/r_sddfg.py"
+    "${repo_root}/algorithms/sddfg/algorithm/adj_generator.py"
+    "${repo_root}/algorithms/sddfg/algorithm/rSDDFGPolicy.py"
+    "${repo_root}/runner/base_runner.py"
+    "${repo_root}/runner/wolfpack_runner.py"
+    "${repo_root}/scripts/train_wolfpack_sddfg_intra_episode_dynamic.sh"
+    "${repo_root}/scripts/train/train_wolfpack.py"
+    "${repo_root}/scripts/debug_pair_pending_launcher_contract.py"
+    "${repo_root}/scripts/debug_pair_credit_synthetic.py"
+    "${repo_root}/scripts/debug_pair_pending_foundation_synthetic.py"
+    "${repo_root}/scripts/debug_pair_evidence_cohort_overlap_synthetic.py"
+    "${repo_root}/scripts/debug_pair_pending_production_integration.py"
+    "${repo_root}/scripts/debug_pair_optimizer_transaction_diagnostics.py"
+    "${repo_root}/scripts/debug_sddfg_joint_epsilon_exploration.py"
+    "${repo_root}/scripts/fixtures/run168_greedy_frontier_failures.json"
+    "${repo_root}/scripts/debug_sddfg_n_step_targets.py"
+    "${repo_root}/scripts/debug_sddfg_terminal_replay_lane.py"
+    "${repo_root}/scripts/debug_wolfpack_multi_prey_coverage_reward.py"
+    "${repo_root}/scripts/fixtures/run164_pre_capture_reward_conflict.json"
+    "${repo_root}/scripts/fixtures/run165_capture_quorum_reward_conflict.json"
+    "${repo_root}/scripts/debug_pair_transaction_replay_preflight.py"
+    "${repo_root}/scripts/fixtures/run116_transaction_replays.json"
+    "${repo_root}/scripts/debug_capture_outcome_contrast_synthetic.py"
+    "${repo_root}/scripts/debug_capture_identity_synthetic.py"
+    "${repo_root}/scripts/debug_outcome_replay_support_synthetic.py"
+    "${repo_root}/scripts/debug_outcome_cohort_centering_synthetic.py"
+    "${repo_root}/scripts/debug_outcome_confidence_scaling_synthetic.py"
+    "${repo_root}/scripts/debug_outcome_factor_loss_synthetic.py"
+    "${repo_root}/scripts/debug_candidate_identity_supervision_synthetic.py"
+    "${repo_root}/scripts/debug_candidate_evidence_provenance_synthetic.py"
+    "${repo_root}/scripts/debug_candidate_score_to_rank_counterfactual.py"
+    "${repo_root}/scripts/debug_adj_stale_trust_control.py"
+    "${repo_root}/scripts/debug_eval_graph_consistency.py"
+    "${repo_root}/scripts/debug_topology_persistence_synthetic.py"
+    "${repo_root}/scripts/validate_sddfg_dynamic_graph.py"
+    "${repo_root}/config.py"
+  )
+  : > "${source_manifest_file}"
+  for manifest_path in "${manifest_paths[@]}"; do
+    manifest_digest="$(sha256sum "${manifest_path}" | awk '{print $1}')"
+    manifest_relative_path="${manifest_path#${repo_root}/}"
+    printf '%s  %s\n' \
+      "${manifest_digest}" \
+      "${manifest_relative_path}" >> "${source_manifest_file}"
+  done
+  source_manifest_sha256="$(sha256sum "${source_manifest_file}" | awk '{print $1}')"
+fi
+if [[ "${source_manifest_sha256}" != "unavailable" ]]; then
+  export SDDFG_SOURCE_MANIFEST_PATH="${source_manifest_file}"
+  export SDDFG_SOURCE_MANIFEST_SHA256="${source_manifest_sha256}"
+else
+  export SDDFG_SOURCE_MANIFEST_PATH=""
+  export SDDFG_SOURCE_MANIFEST_SHA256=""
 fi
 
 {
@@ -360,17 +505,29 @@ fi
   echo "Capture-to-win credit: enabled=${use_adj_capture_to_win_credit}; source=capture_event_participant_identity+centered_episode_success_now; contrast=success_vs_failed_capture_episodes; attribution=episode_total_distributed_across_highest_exactly_representable_capture_factors; definition_version=5; coef=${adj_capture_to_win_credit_coef}; cap=${adj_capture_to_win_credit_cap}; shaped_return_gate=false; legacy_min_outcome_adv_ignored=${adj_capture_to_win_credit_min_outcome_adv}; legacy_scale_ignored=${adj_capture_to_win_credit_scale}; legacy_future_match_ignored=${adj_capture_to_win_credit_require_future_match}"
   echo "Capture-to-win signed scaling: version=3; confidence=abs_detached_stored_graph_return_advantage; source_ready=required; outcome_sign=episode_outcome_only"
   echo "Capture outcome factor loss: normalization_version=2; denominator=valid_graph_transitions; target_local=true; unrelated_factor_count_invariant=true"
-  echo "Capture candidate identity loss: definition_version=3; source=exact_candidate_only_real_capture; score_semantics=conditional_probability_over_current_valid_canonical_catalog; objective=signed_log_conditional_selection_probability; derivative_wrt_log_score=-delta*(target_indicator-current_probability); denominator=valid_graph_transitions; scale_invariant=true; active_factor_excluded=true; legacy_s_over_1_plus_s=diagnostic_only; replay_metadata=identity+behavior_score+canonical_rank+valid_mask+graph_policy_version"
-  echo "Outcome replay support: version=3; baseline=final_optimizer_cohort; supplemental_episode_cross_update_reuse=false; same_update_ppo_epoch_reuse=true; exhausted_support=disable_outcome_credit_only"
+echo "Pair identity-local factor loss: normalization_version=2; denominator=pair_target_bearing_transitions; outcome_baseline=optimizer_transaction_pair_evidence_cohort; pair_support_population=strict_future_pair_evidence; mixed_pair_chunks=single_atomic_optimizer_transaction; one_sided_optimizer_cohort=zero; optimizer_step_mass_contract=fail_loud; target_local=true; unrelated_transition_and_factor_invariant=true; graph_advantage_excluded=true"
+  echo "pair evidence pending diagnostics version=2; pair_bounded_pending_evidence=${pair_bounded_pending_evidence}; pair_pending_max_adj_updates=${pair_pending_max_adj_updates}; pair_pending_objective_scope=pair_only; pair_nonzero_commit_only=true; pair_multi_epoch_atomic=true; pair_pending_checkpointed=true; pair_generation_event_single_use=true; pair_pending_standard_ppo_early_stop_applicable=false; pair_pending_all_configured_epochs_required=true; pair_pending_control_population=exact_pair_targets; pair_pending_optimizer=isolated_adam; pair_actual_update_direction_guard=true"
+  echo "pair pending launcher contract version=1; experiment_default_enabled=true; experiment_default_max_adj_updates=4; resolved_enabled=${pair_bounded_pending_evidence}; resolved_max_adj_updates=${pair_pending_max_adj_updates}; explicit_default_off_supported=true"
+  echo "Capture candidate identity loss: definition_version=12; normalization_version=3; source=exact_candidate_only_real_capture; score_semantics=first_reachable_replay_slot_log_policy_margin_vs_hardest_legal_competitor; constraints=sequential_coverage+connectivity+order_band+unit_temperature_greedy_boundary; objective=weighted_one_sided_signed_competitor_hinge; signed_goal=max(sign*reference_margin,0); achieved_target_gradient_zero=true; denominator=unsatisfied_target_bearing_transitions; ppo_stop_decoupling=finite_same_update_candidate_residual_epochs_only; residual_optimizer=isolated_adam_state; residual_grad_clear=explicit_none_for_legacy_torch; residual_inactive_parameter_update=forbidden; residual_excludes=graph_ppo+factor_ppo+entropy+factor_credit+outcome_factor_loss; cross_update_replay=false; ttl_refresh=false; unrelated_transition_invariant=true; active_factor_excluded=true; replay_metadata=identity+competitor_margin+competitor_rank+valid_mask+graph_policy_version"
+  echo "Capture candidate actual-update guard: version=2; optimizer_state_sync_version=3; adam_equation=standard_torch_adam_bias_corrected_denom_selected_from_optimizer_type_and_group_flags; observed_raw_delta=validation_only; constraint=-candidate_gradient_dot_executed_delta>0; correction=minimum_conflicting_component_along_candidate_gradient; adam_exp_avg=solved_from_executed_safe_delta; exp_avg_sq=unchanged; unsupported_adam_variants=fail_closed"
+  echo "Wolfpack reward shaping: contract_version=2; mode=capture_quorum_balanced_alive_prey_coverage; capture_quorum=2; distance_scale=0.01; reward_only=true; policy_observation_unchanged=true"
+  echo "Candidate evidence provenance diagnostics: version=1; event_identity_rows=true; generation_event_dedup=true; transaction_join=true; no_additional_forward=true; trajectory_neutral=true"
+  echo "Capture candidate lifecycle: version=10; objective=behavioral_progress_gated_post_update_signed_competitor_margin_no_forget_constraints; registration=committed_pre_unsatisfied_target_with_rank_improvement_or_signed_goal_crossing_only; margin_only_micro_progress_not_registered=true; pre_satisfied_targets_not_registered=true; reference=registered_post_update_competitor_margin; replay_context=rnn_observation+dones+selected_active_graph+previous_active_graph; lifetime=recent_replay_adjacency_update_horizon; cached_outcome_mass_replayed=false; gradient_projection=individual_signed_margin_halfspace_active_set; adam_displacement_projection=individual_signed_margin_halfspace_active_set; nonlinear_constraint_guard=direct_signed_margin_check_then_deterministic_backtracking_then_transactional_rollback; current_real_candidate=strict_priority; incompatible_cached_constraints=explicit_supersession; target_and_base_updates=shared_lifecycle_constraints; final_adam_state=single_sync_to_executed_displacement; rejected_policy_version=not_advanced; ttl_clock=adjacency_update_round"
+echo "Outcome replay support: version=6; baseline=final_optimizer_cohort; pair_support=strict_future_pair_evidence_class_complete; pair_optimizer_partition=atomic_full_selected_population_single_adam_transaction; base_ppo_population_weighting=transaction_population_total; supplemental_episode_cross_update_reuse=false; same_update_ppo_epoch_reuse=true; exhausted_support=disable_outcome_credit_only"
   echo "Pair/triplet complementary credit: enabled=${use_adj_pair_triplet_complementary_credit}; source=capture_count; strict_future=true; offset0=false; pair_coef=${adj_pair_pursuit_credit_coef}; pair_window=${adj_pair_pursuit_credit_window}; pair_cap=${adj_pair_pursuit_credit_cap}; legacy_pair_min_reward_ignored=${adj_pair_pursuit_credit_min_reward}"
   echo "Eval graph consistency: enabled=${use_train_consistent_eval_graph}; graph_behavior=train_distribution; policy_actions=greedy; rng=isolated_eval"
+  echo "Joint epsilon exploration diagnostics: schema_version=4; scope=one_row_per_formal_training_episode; source=existing_branch_flag+raw_greedy+frontier_reranked_greedy+returned_action+available_actions+local_observation_quorum_guard; extra_policy_forward=false; non_explore_mismatch=fail_loud; illegal_action=fail_loud"
+  echo "Pre-capture policy diagnostics: schema_version=4; frontier_value_ranking_schema_version=1; deterministic_stride=8_environment_steps; scope=compatibility_t_minus_32_to_t+full_episode_prefix_to_first_capture; visibility=exact_policy_vector_l1_sight_contract; alignment=action_s_t_to_info_s_t_plus_1; source=already_computed_joint_q+message_utility_margin+factor_q+active_factor_identity+exploration_guard+greedy_frontier_guard+message_action_utilities+coordinate_joint_q+coordinate_factor_q; counterfactual_source=already_computed_factor_tables_with_other_raw_actions_fixed; extra_policy_network_forward=false; extra_environment_forward=false; extra_rng=false"
+  echo "Policy epsilon/action contract: contract_version=6; start=1.0; finish=0.05; anneal_time=228000; post_capture_joint_greedy_floor=0.25; post_capture_explore_max_random_agents=${post_capture_explore_max_random_agents}; pre_capture_visible_prey_quorum_guard=${pre_capture_visible_prey_quorum_guard}; pre_capture_visible_prey_quorum_greedy_frontier_guard=${pre_capture_visible_prey_quorum_greedy_frontier_guard}; pre_capture_quorum=2; exact_quorum_only=true; greedy_frontier_objective=max_guaranteed_locally_visible_exact_quorum_prey; prey_max_step=1; visibility_source=current_local_vector_observation; hidden_state=false; extra_forward=false; joint_bernoulli=unchanged; epsilon_schedule=unchanged; random_action_draws=unchanged; basis=run168_far_T2_to_T1_greedy_first"
+  echo "Q target: contract_version=5; n_step=${q_n_step}; mode=terminal_gated; terminal_replay_lane=${q_terminal_replay_lane_enabled}; lane_schedule=once_per_train_interval_if_uniform_batch_misses_win; auxiliary_loss=terminal_gated_transitions_only; auxiliary_transition_weight=${q_terminal_replay_loss_weight}; frontier_next_action=production_pre_capture_exact_quorum_rerank_from_replayed_local_observation; frontier_future_oracle=false; uniform_batch_prefix=unchanged; gamma=0.97; basis=run169_rollout_policy_vs_double_q_bootstrap_mismatch"
   echo "Topology persistence: enabled=${use_adj_topology_persistence}; source=previous_same_slot_factor; probability=exact_markov_mixture; new_coef=none"
   echo "Order3 credit gate: enabled=${use_adj_order3_credit_gate}; relative=${use_adj_order3_relative_credit_gate}; loss_scale=${adj_order3_credit_gate_loss_scale}; margin=${adj_order3_credit_gate_margin}; min_scale=${adj_order3_credit_gate_min_scale}; ema_alpha=${adj_order3_credit_gate_ema_alpha}; max_delta=${adj_order3_credit_gate_max_delta}"
   echo "Adj PPO guard: clip_stop=${adj_ppo_clip_stop_ratio}; factor_clip_stop=${adj_ppo_factor_clip_stop_ratio}; min_epochs=${adj_ppo_min_epochs}"
-  echo "Adj PPO stale trust: enabled=${use_adj_ppo_stale_trust}; clip=${adj_ppo_stale_trust_clip}; scale=${adj_ppo_stale_trust_scale}; min_weight=${adj_ppo_stale_trust_min_weight}; recent_episode_window=${adj_recent_episode_window}; dynamic_recent=${use_adj_dynamic_recent_window}; min_recent=${adj_recent_episode_window_min}; stale_threshold=${adj_recent_window_stale_threshold}; factor_stale_threshold=${adj_recent_window_factor_stale_threshold}; shrink_patience=${adj_recent_window_shrink_patience}; recover_patience=${adj_recent_window_recover_patience}; recover_threshold=${adj_recent_window_recover_stale_threshold}; recover_factor_threshold=${adj_recent_window_recover_factor_stale_threshold}; severe_margin=${adj_recent_window_severe_margin}; emergency_recent=${adj_recent_episode_window_emergency}; emergency_threshold=${adj_recent_window_emergency_stale_threshold}; emergency_factor_threshold=${adj_recent_window_emergency_factor_stale_threshold}"
+  echo "Adj PPO stale trust: enabled=${use_adj_ppo_stale_trust}; control_population=trusted_loss_population; aggregation=sum_numerator_over_sum_denominator; runtime_contract=fail_loud; sample_execution_contract=selected_equals_trained_unique_generation; clip=${adj_ppo_stale_trust_clip}; scale=${adj_ppo_stale_trust_scale}; min_weight=${adj_ppo_stale_trust_min_weight}; recent_episode_window=${adj_recent_episode_window}; dynamic_recent=${use_adj_dynamic_recent_window}; min_recent=${adj_recent_episode_window_min}; stale_threshold=${adj_recent_window_stale_threshold}; factor_stale_threshold=${adj_recent_window_factor_stale_threshold}; shrink_patience=${adj_recent_window_shrink_patience}; recover_patience=${adj_recent_window_recover_patience}; recover_threshold=${adj_recent_window_recover_stale_threshold}; recover_factor_threshold=${adj_recent_window_recover_factor_stale_threshold}; severe_margin=${adj_recent_window_severe_margin}; emergency_recent=${adj_recent_episode_window_emergency}; emergency_threshold=${adj_recent_window_emergency_stale_threshold}; emergency_factor_threshold=${adj_recent_window_emergency_factor_stale_threshold}"
   echo "Experiment: ${experiment_name}"
   echo "Git commit: ${git_commit}; tracked tree: ${git_tree_state}"
   echo "SDDFG source manifest sha256: ${source_manifest_sha256}"
+  echo "SDDFG source manifest file: ${source_manifest_file}"
   echo "Console log: ${console_log}"
 } | tee "${console_log}"
 
@@ -378,6 +535,28 @@ fi
 # buffer axes, factor-Q gradients, or critic-free trainer initialization are
 # inconsistent with the server's PyTorch/Gym versions.
 if [[ "${SKIP_SDDFG_PREFLIGHT:-0}" != "1" ]]; then
+  "${python_bin}" "${script_dir}/debug_sddfg_joint_epsilon_exploration.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_sddfg_n_step_targets.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_sddfg_terminal_replay_lane.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_wolfpack_multi_prey_coverage_reward.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_pair_pending_launcher_contract.py" \
+    2>&1 | tee -a "${console_log}"
+  if [[ "${pair_bounded_pending_evidence}" == "1" ]]; then
+    "${python_bin}" "${script_dir}/debug_pair_transaction_replay_preflight.py" \
+      2>&1 | tee -a "${console_log}"
+    "${python_bin}" "${script_dir}/debug_pair_pending_foundation_synthetic.py" \
+      2>&1 | tee -a "${console_log}"
+    "${python_bin}" "${script_dir}/debug_pair_evidence_cohort_overlap_synthetic.py" \
+      2>&1 | tee -a "${console_log}"
+    "${python_bin}" "${script_dir}/debug_pair_pending_production_integration.py" \
+      2>&1 | tee -a "${console_log}"
+    "${python_bin}" "${script_dir}/debug_pair_optimizer_transaction_diagnostics.py" \
+      2>&1 | tee -a "${console_log}"
+  fi
   "${python_bin}" "${script_dir}/debug_pair_credit_synthetic.py" \
     2>&1 | tee -a "${console_log}"
   "${python_bin}" "${script_dir}/debug_capture_outcome_contrast_synthetic.py" \
@@ -394,11 +573,16 @@ if [[ "${SKIP_SDDFG_PREFLIGHT:-0}" != "1" ]]; then
     2>&1 | tee -a "${console_log}"
   "${python_bin}" "${script_dir}/debug_candidate_identity_supervision_synthetic.py" \
     2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_candidate_evidence_provenance_synthetic.py" \
+    2>&1 | tee -a "${console_log}"
+  "${python_bin}" "${script_dir}/debug_adj_stale_trust_control.py" \
+    2>&1 | tee -a "${console_log}"
   "${python_bin}" "${script_dir}/debug_eval_graph_consistency.py" \
     2>&1 | tee -a "${console_log}"
   "${python_bin}" "${script_dir}/debug_topology_persistence_synthetic.py" \
     2>&1 | tee -a "${console_log}"
-  "${python_bin}" "${script_dir}/validate_sddfg_dynamic_graph.py" \
+  CUDA_VISIBLE_DEVICES="${gpu}" \
+    "${python_bin}" "${script_dir}/validate_sddfg_dynamic_graph.py" \
     2>&1 | tee -a "${console_log}"
 fi
 
@@ -424,6 +608,9 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" "${script_dir}/train/train_wolfpac
   --adj_lr_anneal_steps "${anneal_steps}" \
   --adj_lr_decay_floor 0.00002 \
   --gamma 0.97 \
+  --use_multi_prey_coverage_shaping \
+  --q_n_step "${q_n_step}" \
+  "${q_terminal_replay_lane_args[@]}" \
   --gae_lambda 0.95 \
   --hard_update_interval_episode 200 \
   --use_reward_normalization \
@@ -501,6 +688,7 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" "${script_dir}/train/train_wolfpac
   --adj_pair_pursuit_credit_window "${adj_pair_pursuit_credit_window}" \
   --adj_pair_pursuit_credit_cap "${adj_pair_pursuit_credit_cap}" \
   --adj_pair_pursuit_credit_min_reward "${adj_pair_pursuit_credit_min_reward}" \
+  "${pair_pending_args[@]}" \
   "${adj_order3_credit_gate_args[@]}" \
   --adj_order3_credit_gate_loss_scale "${adj_order3_credit_gate_loss_scale}" \
   --adj_order3_credit_gate_margin "${adj_order3_credit_gate_margin}" \
@@ -563,7 +751,12 @@ CUDA_VISIBLE_DEVICES="${gpu}" "${python_bin}" "${script_dir}/train/train_wolfpac
   --continue_after_success \
   --epsilon_start 1.0 \
   --epsilon_finish 0.05 \
-  --epsilon_anneal_time 500000 \
+  --epsilon_anneal_time 228000 \
+  --use_joint_epsilon_exploration \
+  --post_capture_joint_greedy_floor 0.25 \
+  --post_capture_explore_max_random_agents "${post_capture_explore_max_random_agents}" \
+  "${pre_capture_visible_prey_quorum_guard_args[@]}" \
+  "${pre_capture_visible_prey_quorum_greedy_frontier_guard_args[@]}" \
   --num_random_episodes 10 \
   --train_interval_episode 4 \
   --log_interval 3000 \

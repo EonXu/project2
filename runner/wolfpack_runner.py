@@ -8,8 +8,17 @@ from utils.pair_credit import (
     build_capture_identity_factor_weights,
     canonical_capture_factor_catalog,
 )
+from utils.wolfpack_reward import terminal_win_diagnostic_fields
 import os
 import pandas as pd
+
+
+def _is_post_capture_pursuit_active(food_alive_statuses):
+    statuses = tuple(bool(value) for value in food_alive_statuses)
+    if not statuses:
+        raise RuntimeError("post-capture exploration requires prey status")
+    return any(statuses) and not all(statuses)
+
 
 def _get_run_csv_path(path: str) -> str:
     """
@@ -137,6 +146,103 @@ class WolfpackRunner(RecRunner):
             obs_arr = obs_arr[None, ...]  # (1, num_agents, obs_dim)
         is_pad = np.all(obs_arr == -1, axis=-1, keepdims=True)
         return (~is_pad).astype(np.float32)
+
+    @staticmethod
+    def _visible_prey_geometry_from_local_vector_obs(
+            obs_batch,
+            num_agents: int,
+            max_food_num: int):
+        """Recover only information already present in each actor observation.
+
+        Wolfpack's vector observation stores each visible prey orientation as
+        a one-hot vector; an unseen or inactive prey has four zeros.  This
+        parser deliberately does not read ``info`` or central state, so the
+        exploration guard cannot gain oracle prey positions.
+        """
+        if torch.is_tensor(obs_batch):
+            obs = obs_batch.detach().cpu().numpy().astype(
+                np.float32, copy=False
+            )
+        else:
+            obs = np.asarray(obs_batch, dtype=np.float32)
+        num_agents = int(num_agents)
+        max_food_num = int(max_food_num)
+        if obs.ndim == 3:
+            if obs.shape[0] != 1:
+                raise RuntimeError(
+                    "visible-prey quorum guard requires one environment"
+                )
+            obs = obs[0]
+        if obs.ndim != 2 or obs.shape[0] != num_agents:
+            raise RuntimeError(
+                "visible-prey quorum guard received an invalid observation "
+                "batch"
+            )
+        if max_food_num <= 0:
+            raise RuntimeError(
+                "visible-prey quorum guard requires at least one prey slot"
+            )
+        expected_dim = (
+            2 + 4 + 2 * (num_agents - 1) + 7 * max_food_num + 4 + 1
+        )
+        if obs.shape[1] != expected_dim:
+            raise RuntimeError(
+                "visible-prey quorum guard observation contract mismatch: "
+                "got {}, expected {}".format(obs.shape[1], expected_dim)
+            )
+        if not np.isfinite(obs).all():
+            raise FloatingPointError(
+                "visible-prey quorum guard received non-finite observation"
+            )
+
+        alive_slots = ~np.all(obs == -1.0, axis=1)
+        prey_start = 2 + 4 + 2 * (num_agents - 1)
+        visible = np.zeros((num_agents, max_food_num), dtype=np.int64)
+        offsets = np.full(
+            (num_agents, max_food_num, 2),
+            np.nan,
+            dtype=np.float32,
+        )
+        for food_id in range(max_food_num):
+            block_start = prey_start + 7 * food_id
+            relative_position = obs[:, block_start:block_start + 2]
+            orientation = obs[:, block_start + 2:block_start + 6]
+            alive_orientation = orientation[alive_slots]
+            if alive_orientation.size and not np.all(
+                    (alive_orientation == 0.0)
+                    | (alive_orientation == 1.0)):
+                raise RuntimeError(
+                    "visible-prey quorum guard found a non-binary prey "
+                    "orientation"
+                )
+            orientation_sum = orientation.sum(axis=1)
+            if np.any(
+                    alive_slots
+                    & (orientation_sum != 0.0)
+                    & (orientation_sum != 1.0)):
+                raise RuntimeError(
+                    "visible-prey quorum guard found an invalid prey one-hot"
+                )
+            visible[:, food_id] = (
+                alive_slots & (orientation_sum == 1.0)
+            ).astype(np.int64)
+            visible_rows = visible[:, food_id].astype(bool)
+            offsets[visible_rows, food_id] = relative_position[visible_rows]
+        return visible, offsets
+
+    @staticmethod
+    def _visible_prey_mask_from_local_vector_obs(
+            obs_batch,
+            num_agents: int,
+            max_food_num: int) -> np.ndarray:
+        visible, _ = (
+            WolfpackRunner._visible_prey_geometry_from_local_vector_obs(
+                obs_batch,
+                num_agents=num_agents,
+                max_food_num=max_food_num,
+            )
+        )
+        return visible
 
     @staticmethod
     def _extract_active_masks_batch(infos, num_envs: int, num_agents: int,
@@ -435,6 +541,95 @@ class WolfpackRunner(RecRunner):
     def __init__(self, config):
         super(WolfpackRunner, self).__init__(config)
 
+        self.post_capture_joint_greedy_floor = float(getattr(
+            self.args,
+            "post_capture_joint_greedy_floor",
+            0.0,
+        ))
+        if not np.isfinite(self.post_capture_joint_greedy_floor) or not (
+                0.0 <= self.post_capture_joint_greedy_floor < 1.0):
+            raise ValueError(
+                "post_capture_joint_greedy_floor must be finite in [0, 1)"
+            )
+        self.post_capture_explore_max_random_agents = int(getattr(
+            self.args,
+            "post_capture_explore_max_random_agents",
+            0,
+        ))
+        if self.post_capture_explore_max_random_agents < 0:
+            raise ValueError(
+                "post_capture_explore_max_random_agents must be non-negative"
+            )
+        if (
+                self.post_capture_explore_max_random_agents > 0
+                and self.post_capture_joint_greedy_floor <= 0.0):
+            raise RuntimeError(
+                "bounded post-capture exploration requires a nonzero "
+                "post-capture joint greedy floor"
+            )
+        if (
+                self.post_capture_joint_greedy_floor > 0.0
+                and not bool(getattr(
+                    self.args,
+                    "use_joint_epsilon_exploration",
+                    False,
+                ))):
+            raise RuntimeError(
+                "post-capture greedy floor requires joint epsilon exploration"
+            )
+        if self.post_capture_joint_greedy_floor > 0.0 and self.num_envs != 1:
+            raise RuntimeError(
+                "post-capture joint greedy floor currently requires one "
+                "environment decision per policy call"
+            )
+        self.pre_capture_visible_prey_quorum_guard = bool(getattr(
+            self.args,
+            "pre_capture_visible_prey_quorum_guard",
+            False,
+        ))
+        if (
+                self.pre_capture_visible_prey_quorum_guard
+                and self.algorithm_name != "sddfg"):
+            raise RuntimeError(
+                "pre-capture visible-prey quorum guard is SDDFG-only"
+            )
+        if (
+                self.pre_capture_visible_prey_quorum_guard
+                and not bool(getattr(
+                    self.args,
+                    "use_joint_epsilon_exploration",
+                    False,
+                ))):
+            raise RuntimeError(
+                "pre-capture visible-prey quorum guard requires joint "
+                "epsilon exploration"
+            )
+        if self.pre_capture_visible_prey_quorum_guard and self.num_envs != 1:
+            raise RuntimeError(
+                "pre-capture visible-prey quorum guard currently requires "
+                "one environment decision per policy call"
+            )
+        self.pre_capture_visible_prey_quorum_greedy_frontier_guard = bool(
+            getattr(
+                self.args,
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard",
+                False,
+            )
+        )
+        if (
+                self.pre_capture_visible_prey_quorum_greedy_frontier_guard
+                and self.algorithm_name != "sddfg"):
+            raise RuntimeError(
+                "pre-capture greedy frontier guard is SDDFG-only"
+            )
+        if (
+                self.pre_capture_visible_prey_quorum_greedy_frontier_guard
+                and self.num_envs != 1):
+            raise RuntimeError(
+                "pre-capture greedy frontier guard currently requires one "
+                "environment decision per policy call"
+            )
+
         # 预热：随机策略采样若干回合填充经验池
         # 回放/可视化时可通过 args.skip_warmup=True 跳过预热，加快启动速度
         skip_warmup = bool(getattr(self.args, "skip_warmup", False))
@@ -442,6 +637,37 @@ class WolfpackRunner(RecRunner):
         if not skip_warmup:
             num_warmup_episodes = max((self.batch_size, self.args.num_random_episodes))
             self.warmup(num_warmup_episodes)
+        warmup_infos = tuple(getattr(self, "warmup_env_infos", ()))
+        self.warmup_terminal_win_first_transition_count = int(round(sum(
+            float(info.get("terminal_win_first_transition_count", 0.0))
+            for info in warmup_infos
+        )))
+        self.warmup_terminal_win_bonus_event_count = int(round(sum(
+            float(info.get("terminal_win_bonus_event_count", 0.0))
+            for info in warmup_infos
+        )))
+        self.warmup_terminal_win_bonus_sum = float(sum(
+            float(info.get("terminal_win_bonus_sum", 0.0))
+            for info in warmup_infos
+        ))
+        if (
+                float(self.args.reward_win) > 0.0
+                and self.warmup_terminal_win_bonus_event_count
+                != self.warmup_terminal_win_first_transition_count):
+            raise RuntimeError(
+                "Wolfpack warmup terminal win bonus count did not match "
+                "first-success transition count"
+            )
+        print(
+            "warmup terminal-win diagnostics: episodes={}, first_transitions={}, "
+            "bonus_events={}, bonus_sum={:.9g}".format(
+                len(warmup_infos),
+                self.warmup_terminal_win_first_transition_count,
+                self.warmup_terminal_win_bonus_event_count,
+                self.warmup_terminal_win_bonus_sum,
+            ),
+            flush=True,
+        )
         end = time.time()
 
         denom = max((end - self.start), 1e-6)
@@ -549,6 +775,7 @@ class WolfpackRunner(RecRunner):
                     event.get("capture_identity_event_mass_error", 0.0)
                 ),
                 "success_now": int(bool(event.get("success_now", False))),
+                **terminal_win_diagnostic_fields(event),
                 "left_slots": ",".join(map(str, event.get("left_slots", []))),
                 "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
                 "recovered_slots": ",".join(map(str, event.get("recovered_slots", []))),
@@ -677,6 +904,7 @@ class WolfpackRunner(RecRunner):
                     event.get("capture_identity_event_mass_error", 0.0)
                 ),
                 "success_now": int(bool(event.get("success_now", False))),
+                **terminal_win_diagnostic_fields(event),
                 "left_slots": ",".join(map(str, event.get("left_slots", []))),
                 "joined_slots": ",".join(map(str, event.get("joined_slots", []))),
                 "recovered_slots": ",".join(map(str, event.get("recovered_slots", []))),
@@ -750,6 +978,900 @@ class WolfpackRunner(RecRunner):
                 os.path.join(run_dir, "progress_train_adj_metrics_traj.csv"),
                 pd.DataFrame(rows_adj)
             )
+
+    @staticmethod
+    def _build_post_capture_row(
+            environment_episode_id: int,
+            training_env_step: int,
+            episode_step: int,
+            first_capture_step: int,
+            first_capture_target_id: int,
+            first_capture_participant_slots,
+            step_info: Dict[str, Any],
+            action_diagnostic: Dict[str, Any]):
+        """Build one already-observed post-capture diagnostic row."""
+        required_info_fields = (
+            "food_alive_statuses",
+            "food_freeze_remaining",
+            "food_positions",
+            "player_slot_positions",
+        )
+        missing = [
+            key for key in required_info_fields if key not in step_info
+        ]
+        if missing:
+            raise RuntimeError(
+                "Wolfpack post-capture diagnostics are missing production "
+                f"environment fields: {missing}"
+            )
+
+        food_positions = list(step_info["food_positions"])
+        player_slot_positions = list(step_info["player_slot_positions"])
+        all_player_positions = [
+            position for position in player_slot_positions
+            if position is not None
+        ]
+        participant_positions = [
+            player_slot_positions[int(slot)]
+            for slot in first_capture_participant_slots
+            if (
+                0 <= int(slot) < len(player_slot_positions)
+                and player_slot_positions[int(slot)] is not None
+            )
+        ]
+
+        def _min_distances(players):
+            result = []
+            for food_position in food_positions:
+                if not players:
+                    result.append(float("nan"))
+                    continue
+                result.append(float(min(
+                    abs(int(player[0]) - int(food_position[0]))
+                    + abs(int(player[1]) - int(food_position[1]))
+                    for player in players
+                )))
+            return result
+
+        def _nearest_player_slots():
+            result = []
+            for food_position in food_positions:
+                distances = []
+                for slot, player_position in enumerate(player_slot_positions):
+                    if player_position is None:
+                        continue
+                    distance = (
+                        abs(int(player_position[0]) - int(food_position[0]))
+                        + abs(int(player_position[1]) - int(food_position[1]))
+                    )
+                    distances.append((int(slot), int(distance)))
+                if not distances:
+                    result.append("")
+                    continue
+                minimum = min(distance for _, distance in distances)
+                result.append("|".join(
+                    str(slot) for slot, distance in distances
+                    if distance == minimum
+                ))
+            return result
+
+        capture_events = list(step_info.get("capture_events", []))
+        return {
+            "environment_episode_id": int(environment_episode_id),
+            "training_env_step": int(training_env_step),
+            "episode_step": int(episode_step),
+            "offset_from_first_capture": int(
+                int(episode_step) - int(first_capture_step)
+            ),
+            "first_capture_target_id": int(first_capture_target_id),
+            "first_capture_participant_slots": ";".join(
+                str(int(slot)) for slot in first_capture_participant_slots
+            ),
+            "capture_target_ids": ";".join(
+                str(int(event["target_id"])) for event in capture_events
+            ),
+            "success_now": int(bool(step_info.get("success_now", False))),
+            "food_alive_statuses": ";".join(
+                str(int(bool(value)))
+                for value in step_info["food_alive_statuses"]
+            ),
+            "food_freeze_remaining": ";".join(
+                format(float(value), ".8g")
+                for value in step_info["food_freeze_remaining"]
+            ),
+            "min_alive_player_distance_to_food": ";".join(
+                format(float(value), ".8g")
+                for value in _min_distances(all_player_positions)
+            ),
+            "min_first_participant_distance_to_food": ";".join(
+                format(float(value), ".8g")
+                for value in _min_distances(participant_positions)
+            ),
+            "nearest_alive_player_slots_to_food": ";".join(
+                _nearest_player_slots()
+            ),
+            "joint_explore": int(action_diagnostic.get("joint_explore", -1)),
+            "epsilon": float(
+                action_diagnostic.get("epsilon", float("nan"))
+            ),
+            "greedy_actions": ";".join(
+                str(int(value))
+                for value in action_diagnostic.get("greedy_actions", [])
+            ),
+            "selected_actions": ";".join(
+                str(int(value))
+                for value in action_diagnostic.get("selected_actions", [])
+            ),
+            "post_capture_explore_max_random_agents": int(
+                action_diagnostic.get(
+                    "post_capture_explore_max_random_agents", 0
+                )
+            ),
+            "post_capture_explore_bounded_applied": int(
+                action_diagnostic.get(
+                    "post_capture_explore_bounded_applied", 0
+                )
+            ),
+            "random_replacement_slots": "|".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "random_replacement_slots", []
+                )
+            ),
+        }
+
+    @staticmethod
+    def _build_pre_capture_transition_row(
+            environment_episode_id: int,
+            training_env_step: int,
+            episode_step: int,
+            step_info: Dict[str, Any],
+            action_diagnostic: Dict[str, Any],
+            greedy_joint_q_value,
+            greedy_message_action_margins,
+            greedy_factor_q_values,
+            adjacency,
+            learned_factor_count: int):
+        """Build one trajectory-neutral s_t action -> s_(t+1) snapshot."""
+        required_info_fields = (
+            "food_alive_statuses",
+            "food_freeze_remaining",
+            "food_positions",
+            "player_slot_positions",
+            "food_visible_player_slots",
+        )
+        missing = [
+            key for key in required_info_fields if key not in step_info
+        ]
+        if missing:
+            raise RuntimeError(
+                "Wolfpack pre-capture diagnostics are missing production "
+                f"environment fields: {missing}"
+            )
+
+        def _as_numpy(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
+
+        def _flat_float_text(value):
+            if value is None:
+                return ""
+            return ";".join(
+                format(float(item), ".9g")
+                for item in _as_numpy(value).reshape(-1)
+            )
+
+        def _flat_int_text(value):
+            if value is None:
+                return ""
+            return ";".join(
+                str(int(item))
+                for item in _as_numpy(value).reshape(-1)
+            )
+
+        food_positions = list(step_info["food_positions"])
+        player_slot_positions = list(step_info["player_slot_positions"])
+        min_distances = []
+        nearest_slots = []
+        for food_position in food_positions:
+            slot_distances = [
+                (
+                    int(slot),
+                    abs(int(position[0]) - int(food_position[0]))
+                    + abs(int(position[1]) - int(food_position[1])),
+                )
+                for slot, position in enumerate(player_slot_positions)
+                if position is not None
+            ]
+            if not slot_distances:
+                min_distances.append(float("nan"))
+                nearest_slots.append("")
+                continue
+            minimum = min(distance for _, distance in slot_distances)
+            min_distances.append(float(minimum))
+            nearest_slots.append("|".join(
+                str(slot) for slot, distance in slot_distances
+                if distance == minimum
+            ))
+
+        adjacency_np = _as_numpy(adjacency)
+        if adjacency_np.ndim == 3:
+            if int(adjacency_np.shape[0]) != 1:
+                raise RuntimeError(
+                    "pre-capture adjacency diagnostic requires one environment"
+                )
+            adjacency_np = adjacency_np[0]
+        if adjacency_np.ndim != 2:
+            raise RuntimeError(
+                "pre-capture adjacency diagnostic expects [agent, factor]"
+            )
+        learned_factor_count = int(learned_factor_count)
+        if not (0 <= learned_factor_count <= int(adjacency_np.shape[1])):
+            raise RuntimeError("invalid learned factor count in diagnostic")
+
+        value_diagnostic = action_diagnostic.get(
+            "frontier_value_ranking_diagnostic", None
+        )
+        if not isinstance(value_diagnostic, dict):
+            if bool(int(action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_enabled",
+                    0))):
+                raise RuntimeError(
+                    "enabled pre-capture frontier action is missing value-"
+                    "ranking diagnostics"
+                )
+            value_diagnostic = {
+                "schema_version": 1,
+                "sampled": 0,
+                "slot_ids": [],
+                "action_dim": 7,
+                "factor_count": int(adjacency_np.shape[1]),
+                "legal_action_mask": [],
+                "frontier_action_mask": [],
+                "message_action_utilities": [],
+                "coordinate_joint_q_values": [],
+                "coordinate_factor_q_values": [],
+            }
+        if int(value_diagnostic.get("schema_version", 0)) != 1:
+            raise RuntimeError(
+                "unexpected frontier value-ranking diagnostic schema"
+            )
+        value_sampled = int(value_diagnostic.get("sampled", -1))
+        if value_sampled not in (0, 1):
+            raise RuntimeError(
+                "frontier value-ranking sampled flag is not binary"
+            )
+        value_slot_ids = np.asarray(
+            value_diagnostic.get("slot_ids", ()), dtype=np.int64
+        ).reshape(-1)
+        value_action_dim = int(value_diagnostic.get("action_dim", 0))
+        value_factor_count = int(value_diagnostic.get("factor_count", 0))
+        if value_action_dim != 7:
+            raise RuntimeError(
+                "frontier value-ranking diagnostic requires seven actions"
+            )
+        if value_factor_count != int(adjacency_np.shape[1]):
+            raise RuntimeError(
+                "frontier value-ranking diagnostic factor width does not "
+                "match the production graph"
+            )
+        if (
+                np.unique(value_slot_ids).size != value_slot_ids.size
+                or np.any(value_slot_ids < 0)
+                or np.any(value_slot_ids >= int(adjacency_np.shape[0]))):
+            raise RuntimeError(
+                "frontier value-ranking diagnostic slot ids are invalid"
+            )
+        expected_action_shape = (
+            int(value_slot_ids.size), value_action_dim
+        )
+        expected_factor_shape = expected_action_shape + (
+            value_factor_count,
+        )
+        value_legal_mask = np.asarray(
+            value_diagnostic.get("legal_action_mask", ()), dtype=np.int64
+        )
+        value_frontier_mask = np.asarray(
+            value_diagnostic.get("frontier_action_mask", ()), dtype=np.int64
+        )
+        value_message_utilities = np.asarray(
+            value_diagnostic.get("message_action_utilities", ()),
+            dtype=np.float64,
+        )
+        value_coordinate_joint_q = np.asarray(
+            value_diagnostic.get("coordinate_joint_q_values", ()),
+            dtype=np.float64,
+        )
+        value_coordinate_factor_q = np.asarray(
+            value_diagnostic.get("coordinate_factor_q_values", ()),
+            dtype=np.float64,
+        )
+        if value_slot_ids.size == 0:
+            for name, value in (
+                    ("legal mask", value_legal_mask),
+                    ("frontier mask", value_frontier_mask),
+                    ("message utility", value_message_utilities),
+                    ("coordinate joint-Q", value_coordinate_joint_q),
+                    ("coordinate factor-Q", value_coordinate_factor_q)):
+                if value.size != 0:
+                    raise RuntimeError(
+                        "empty frontier value-ranking slot population has "
+                        "nonempty {}".format(name)
+                    )
+            value_legal_mask = value_legal_mask.reshape(
+                expected_action_shape
+            )
+            value_frontier_mask = value_frontier_mask.reshape(
+                expected_action_shape
+            )
+            value_message_utilities = value_message_utilities.reshape(
+                expected_action_shape
+            )
+            value_coordinate_joint_q = value_coordinate_joint_q.reshape(
+                expected_action_shape
+            )
+            value_coordinate_factor_q = value_coordinate_factor_q.reshape(
+                expected_factor_shape
+            )
+        else:
+            if value_sampled != 1:
+                raise RuntimeError(
+                    "unsampled frontier value-ranking diagnostic has slots"
+                )
+            for name, value, expected_shape in (
+                    ("legal mask", value_legal_mask, expected_action_shape),
+                    ("frontier mask", value_frontier_mask,
+                     expected_action_shape),
+                    ("message utility", value_message_utilities,
+                     expected_action_shape),
+                    ("coordinate joint-Q", value_coordinate_joint_q,
+                     expected_action_shape),
+                    ("coordinate factor-Q", value_coordinate_factor_q,
+                     expected_factor_shape)):
+                if tuple(value.shape) != tuple(expected_shape):
+                    raise RuntimeError(
+                        "frontier value-ranking {} shape mismatch: got {}, "
+                        "expected {}".format(
+                            name, tuple(value.shape), tuple(expected_shape)
+                        )
+                    )
+            if np.any(
+                    (value_legal_mask != 0) & (value_legal_mask != 1)):
+                raise RuntimeError(
+                    "frontier value-ranking legality mask is not binary"
+                )
+            if np.any(
+                    (value_frontier_mask != 0)
+                    & (value_frontier_mask != 1)):
+                raise RuntimeError(
+                    "frontier value-ranking action mask is not binary"
+                )
+            if np.any(value_frontier_mask > value_legal_mask):
+                raise RuntimeError(
+                    "frontier value-ranking mask enabled an illegal action"
+                )
+            if np.any(value_frontier_mask.sum(axis=1) <= 0):
+                raise RuntimeError(
+                    "frontier value-ranking mask has an empty action set"
+                )
+            legal_entries = value_legal_mask.astype(bool)
+            if not np.isfinite(value_message_utilities[legal_entries]).all():
+                raise FloatingPointError(
+                    "frontier value-ranking message utility is non-finite"
+                )
+            if not np.isfinite(value_coordinate_joint_q[legal_entries]).all():
+                raise FloatingPointError(
+                    "frontier value-ranking coordinate joint-Q is non-finite"
+                )
+            factor_legal_entries = np.repeat(
+                legal_entries[:, :, None], value_factor_count, axis=2
+            )
+            if not np.isfinite(
+                    value_coordinate_factor_q[factor_legal_entries]).all():
+                raise FloatingPointError(
+                    "frontier value-ranking coordinate factor-Q is non-finite"
+                )
+        factor_members = []
+        factor_orders = []
+        for factor_id in range(learned_factor_count):
+            members = np.flatnonzero(
+                adjacency_np[:, factor_id] > 0
+            ).astype(np.int64).tolist()
+            factor_members.append(
+                "f{}:{}".format(
+                    factor_id,
+                    "|".join(str(int(slot)) for slot in members),
+                )
+            )
+            factor_orders.append(str(len(members)))
+
+        capture_events = list(step_info.get("capture_events", []))
+        q_values = _as_numpy(greedy_joint_q_value).reshape(-1)
+        if q_values.size != 1:
+            raise RuntimeError(
+                "pre-capture joint-Q diagnostic requires one environment value"
+            )
+        return {
+            "diagnostic_schema_version": 4,
+            "environment_episode_id": int(environment_episode_id),
+            "training_env_step": int(training_env_step),
+            "episode_step": int(episode_step),
+            "state_action_alignment": "action_s_t__info_s_t_plus_1",
+            "capture_target_ids": ";".join(
+                str(int(event["target_id"])) for event in capture_events
+            ),
+            "success_now": int(bool(step_info.get("success_now", False))),
+            "food_alive_statuses": ";".join(
+                str(int(bool(value)))
+                for value in step_info["food_alive_statuses"]
+            ),
+            "food_freeze_remaining": ";".join(
+                format(float(value), ".8g")
+                for value in step_info["food_freeze_remaining"]
+            ),
+            "food_positions": ";".join(
+                "{}:{}".format(int(position[0]), int(position[1]))
+                for position in food_positions
+            ),
+            "player_slot_positions": ";".join(
+                "" if position is None else "{}:{}".format(
+                    int(position[0]), int(position[1])
+                )
+                for position in player_slot_positions
+            ),
+            "min_alive_player_distance_to_food": ";".join(
+                format(value, ".8g") for value in min_distances
+            ),
+            "nearest_alive_player_slots_to_food": ";".join(nearest_slots),
+            "food_visible_player_slots": ";".join(
+                "|".join(str(int(slot)) for slot in visible_slots)
+                for visible_slots in step_info[
+                    "food_visible_player_slots"
+                ]
+            ),
+            "food_observer_counts": ";".join(
+                str(len(visible_slots))
+                for visible_slots in step_info[
+                    "food_visible_player_slots"
+                ]
+            ),
+            "joint_explore": int(action_diagnostic.get("joint_explore", -1)),
+            "epsilon": float(
+                action_diagnostic.get("epsilon", float("nan"))
+            ),
+            "greedy_actions": ";".join(
+                str(int(value))
+                for value in action_diagnostic.get("greedy_actions", [])
+            ),
+            "selected_actions": ";".join(
+                str(int(value))
+                for value in action_diagnostic.get("selected_actions", [])
+            ),
+            "random_replacement_slots": "|".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "random_replacement_slots", []
+                )
+            ),
+            "pre_capture_visible_prey_quorum_guard_applied": int(
+                action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_guard_applied", 0
+                )
+            ),
+            "pre_capture_visible_prey_quorum_protected_slots": "|".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_protected_slots", []
+                )
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_applied": int(
+                action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_applied",
+                    0,
+                )
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_eligible_slots": "|".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_eligible_slots",
+                    [],
+                )
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_constrained_slots": "|".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_constrained_slots",
+                    [],
+                )
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_conflict_slots": "|".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_conflict_slots",
+                    [],
+                )
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_reranked_slots": "|".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_reranked_slots",
+                    [],
+                )
+            ),
+            "unconstrained_greedy_actions": ";".join(
+                str(int(value)) for value in action_diagnostic.get(
+                    "unconstrained_greedy_actions", []
+                )
+            ),
+            "frontier_value_ranking_schema_version": 1,
+            "frontier_value_ranking_sampled": value_sampled,
+            "frontier_value_ranking_slot_ids": "|".join(
+                str(int(value)) for value in value_slot_ids
+            ),
+            "frontier_value_ranking_action_dim": value_action_dim,
+            "frontier_value_ranking_factor_count": value_factor_count,
+            "frontier_value_ranking_legal_action_mask": _flat_int_text(
+                value_legal_mask
+            ),
+            "frontier_value_ranking_action_mask": _flat_int_text(
+                value_frontier_mask
+            ),
+            "frontier_value_ranking_message_utilities": _flat_float_text(
+                value_message_utilities
+            ),
+            "frontier_value_ranking_coordinate_joint_q": _flat_float_text(
+                value_coordinate_joint_q
+            ),
+            "frontier_value_ranking_coordinate_factor_q": _flat_float_text(
+                value_coordinate_factor_q
+            ),
+            "greedy_joint_q_value": float(q_values[0]),
+            "greedy_message_action_margins": _flat_float_text(
+                greedy_message_action_margins
+            ),
+            "greedy_factor_q_values": _flat_float_text(
+                greedy_factor_q_values
+            ),
+            "active_factor_agent_slots": ";".join(factor_members),
+            "active_factor_orders": ";".join(factor_orders),
+        }
+
+    @staticmethod
+    def _finalize_pre_capture_window(
+            snapshots,
+            first_capture_step: int,
+            first_capture_target_id: int,
+            first_capture_participant_slots,
+            history_steps=32):
+        """Label an inclusive pre-capture window without recomputation."""
+        if not snapshots:
+            raise RuntimeError("first capture has no pre-capture snapshots")
+        first_capture_step = int(first_capture_step)
+        if int(snapshots[-1]["episode_step"]) != first_capture_step:
+            raise RuntimeError(
+                "pre-capture snapshot/action alignment missed capture step"
+            )
+        rows = []
+        if history_steps is None:
+            selected_snapshots = list(snapshots)
+        else:
+            history_steps = int(history_steps)
+            if history_steps < 0:
+                raise ValueError("pre-capture history_steps must be non-negative")
+            selected_snapshots = list(snapshots)[-(history_steps + 1):]
+        for snapshot in selected_snapshots:
+            row = dict(snapshot)
+            offset = int(row["episode_step"]) - first_capture_step
+            if offset > 0 or (
+                    history_steps is not None and offset < -history_steps):
+                raise RuntimeError("pre-capture diagnostic offset escaped window")
+            row["offset_to_first_capture"] = int(offset)
+            row["first_capture_target_id"] = int(first_capture_target_id)
+            row["first_capture_participant_slots"] = ";".join(
+                str(int(slot)) for slot in first_capture_participant_slots
+            )
+            rows.append(row)
+        return rows
+
+    def _dump_train_pre_capture_rows(self, rows: List[Dict[str, Any]]):
+        """Persist first-capture t-32..t rows without forwards or RNG draws."""
+        if not rows:
+            return
+        _append_df_csv(
+            os.path.join(
+                self._get_run_dir(),
+                "progress_train_pre_capture_32step.csv",
+            ),
+            pd.DataFrame(rows),
+        )
+
+    def _dump_train_pre_capture_prefix_rows(
+            self, rows: List[Dict[str, Any]]):
+        """Persist the full episode prefix through first capture.
+
+        Rows reuse already-computed action, Q, factor, and environment info.
+        Retaining them changes neither policy/environment forwards nor RNG.
+        """
+        if not rows:
+            return
+        _append_df_csv(
+            os.path.join(
+                self._get_run_dir(),
+                "progress_train_pre_capture_prefix.csv",
+            ),
+            pd.DataFrame(rows),
+        )
+
+    def _dump_train_post_capture_rows(self, rows: List[Dict[str, Any]]):
+        """Persist only the first-capture 24-step window for each episode.
+
+        The rows are assembled entirely from the already-computed action
+        diagnostic and environment ``info`` payload.  This diagnostic performs
+        no policy/environment forward pass and consumes no RNG.
+        """
+        if not rows:
+            return
+        _append_df_csv(
+            os.path.join(
+                self._get_run_dir(),
+                "progress_train_post_capture_24step.csv",
+            ),
+            pd.DataFrame(rows),
+        )
+
+    def _dump_joint_exploration_episode_diagnostic(
+            self, train_step: int, episode_index: int, diagnostics, env_info):
+        """Persist one trajectory-neutral row per formal training episode."""
+        if not diagnostics:
+            return
+
+        schema_versions = {int(item["schema_version"]) for item in diagnostics}
+        if schema_versions != {4}:
+            raise RuntimeError(
+                "unexpected joint exploration diagnostic schema version"
+            )
+        decision_count = len(diagnostics)
+        explore_flags = [int(item["joint_explore"]) for item in diagnostics]
+        explore_count = int(sum(explore_flags))
+        non_explore_count = int(decision_count - explore_count)
+
+        streak_lengths = []
+        streak = 0
+        for explored in explore_flags:
+            if explored:
+                if streak > 0:
+                    streak_lengths.append(streak)
+                    streak = 0
+            else:
+                streak += 1
+        if streak > 0:
+            streak_lengths.append(streak)
+
+        hist = np.sum(
+            np.asarray(
+                [item["action_histogram"] for item in diagnostics],
+                dtype=np.int64,
+            ),
+            axis=0,
+        )
+        explore_hist = np.sum(
+            np.asarray(
+                [
+                    item["action_histogram"]
+                    for item in diagnostics
+                    if int(item["joint_explore"]) == 1
+                ],
+                dtype=np.int64,
+            ),
+            axis=0,
+        ) if explore_count > 0 else np.zeros_like(hist)
+
+        non_explore_mismatch_count = int(sum(
+            int(item["non_explore_greedy_mismatch"])
+            for item in diagnostics
+        ))
+        invalid_action_count = int(sum(
+            int(item["invalid_available_action_count"])
+            for item in diagnostics
+        ))
+        dead_slot_violation_count = int(sum(
+            int(item["dead_slot_non_stay_violation_count"])
+            for item in diagnostics
+        ))
+        if non_explore_mismatch_count != 0:
+            raise RuntimeError(
+                "joint epsilon non-explore branch changed the production "
+                "greedy joint action"
+            )
+        if invalid_action_count != 0 or dead_slot_violation_count != 0:
+            raise RuntimeError(
+                "joint epsilon exploration selected an unavailable action"
+            )
+
+        selected_joint_actions = {
+            tuple(int(value) for value in item["selected_actions"])
+            for item in diagnostics
+        }
+        explored_joint_actions = {
+            tuple(int(value) for value in item["selected_actions"])
+            for item in diagnostics
+            if int(item["joint_explore"]) == 1
+        }
+        epsilon_values = np.asarray(
+            [float(item["epsilon"]) for item in diagnostics],
+            dtype=np.float64,
+        )
+        alive_counts = np.asarray(
+            [int(item["alive_slot_count"]) for item in diagnostics],
+            dtype=np.int64,
+        )
+        random_replacement_counts = np.asarray(
+            [
+                int(item.get("random_replacement_slot_count", 0))
+                for item in diagnostics
+            ],
+            dtype=np.int64,
+        )
+        bounded_applied_count = int(sum(
+            int(item.get("post_capture_explore_bounded_applied", 0))
+            for item in diagnostics
+        ))
+        pre_capture_quorum_guard_applied_count = int(sum(
+            int(item.get(
+                "pre_capture_visible_prey_quorum_guard_applied", 0
+            ))
+            for item in diagnostics
+        ))
+        pre_capture_quorum_protected_counts = np.asarray(
+            [
+                len(item.get(
+                    "pre_capture_visible_prey_quorum_protected_slots", []
+                ))
+                for item in diagnostics
+            ],
+            dtype=np.int64,
+        )
+        frontier_applied_count = int(sum(
+            int(item.get(
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard_applied",
+                0,
+            ))
+            for item in diagnostics
+        ))
+        frontier_eligible_counts = np.asarray([
+            len(item.get(
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard_eligible_slots",
+                [],
+            ))
+            for item in diagnostics
+        ], dtype=np.int64)
+        frontier_constrained_counts = np.asarray([
+            len(item.get(
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard_constrained_slots",
+                [],
+            ))
+            for item in diagnostics
+        ], dtype=np.int64)
+        frontier_conflict_counts = np.asarray([
+            len(item.get(
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard_conflict_slots",
+                [],
+            ))
+            for item in diagnostics
+        ], dtype=np.int64)
+        frontier_reranked_counts = np.asarray([
+            len(item.get(
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard_reranked_slots",
+                [],
+            ))
+            for item in diagnostics
+        ], dtype=np.int64)
+        row = {
+            "diagnostic_schema_version": 4,
+            "step": int(train_step),
+            "episode_index": int(episode_index),
+            "joint_decision_count": int(decision_count),
+            "joint_explore_flag_bits": "".join(
+                str(flag) for flag in explore_flags
+            ),
+            "final_equals_greedy_flag_bits": "".join(
+                str(int(item["final_equals_greedy"]))
+                for item in diagnostics
+            ),
+            "alive_slot_count_trace": ";".join(
+                str(int(item["alive_slot_count"]))
+                for item in diagnostics
+            ),
+            "explore_decision_count": explore_count,
+            "non_explore_decision_count": non_explore_count,
+            "empirical_explore_rate": float(explore_count / decision_count),
+            "empirical_non_explore_rate": float(non_explore_count / decision_count),
+            "epsilon_mean": float(epsilon_values.mean()),
+            "epsilon_min": float(epsilon_values.min()),
+            "epsilon_max": float(epsilon_values.max()),
+            "final_equals_greedy_count": int(sum(
+                int(item["final_equals_greedy"])
+                for item in diagnostics
+            )),
+            "explore_final_equals_greedy_count": int(sum(
+                int(item["explore_final_equals_greedy"])
+                for item in diagnostics
+            )),
+            "non_explore_greedy_mismatch_count": non_explore_mismatch_count,
+            "invalid_available_action_count": invalid_action_count,
+            "dead_slot_non_stay_violation_count": dead_slot_violation_count,
+            "alive_slot_count_min": int(alive_counts.min()),
+            "alive_slot_count_max": int(alive_counts.max()),
+            "alive_slot_count_mean": float(alive_counts.mean()),
+            "unique_joint_action_count": int(len(selected_joint_actions)),
+            "explore_unique_joint_action_count": int(len(explored_joint_actions)),
+            "explore_unique_alive_action_count_mean": float(np.mean([
+                int(item["unique_alive_action_count"])
+                for item in diagnostics
+                if int(item["joint_explore"]) == 1
+            ])) if explore_count > 0 else 0.0,
+            "post_capture_explore_bounded_applied_count": bounded_applied_count,
+            "pre_capture_visible_prey_quorum_guard_applied_count": (
+                pre_capture_quorum_guard_applied_count
+            ),
+            "pre_capture_visible_prey_quorum_protected_slot_count_sum": int(
+                pre_capture_quorum_protected_counts.sum()
+            ),
+            "pre_capture_visible_prey_quorum_protected_slot_count_max": int(
+                pre_capture_quorum_protected_counts.max()
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_applied_count": (
+                frontier_applied_count
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_eligible_slot_count_sum": int(
+                frontier_eligible_counts.sum()
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_constrained_slot_count_sum": int(
+                frontier_constrained_counts.sum()
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_conflict_slot_count_sum": int(
+                frontier_conflict_counts.sum()
+            ),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard_reranked_slot_count_sum": int(
+                frontier_reranked_counts.sum()
+            ),
+            "random_replacement_slot_count_sum": int(
+                random_replacement_counts.sum()
+            ),
+            "random_replacement_slot_count_max": int(
+                random_replacement_counts.max()
+            ),
+            "non_explore_streak_count": int(len(streak_lengths)),
+            "non_explore_streak_max": int(max(streak_lengths) if streak_lengths else 0),
+            "non_explore_streak_ge2_count": int(sum(
+                length >= 2 for length in streak_lengths
+            )),
+            "non_explore_streak_ge4_count": int(sum(
+                length >= 4 for length in streak_lengths
+            )),
+            "non_explore_streak_ge8_count": int(sum(
+                length >= 8 for length in streak_lengths
+            )),
+            "capture_events": float(env_info.get("capture_events", 0.0)),
+            "exact_matched_capture_events": float(
+                sum(
+                    int(event.get("capture_identity_matched_event_count", 0))
+                    for event in self.last_episode_step_info.get(
+                        "topology_events", []
+                    )
+                ) if isinstance(self.last_episode_step_info, dict) else 0.0
+            ),
+            "win": float(env_info.get("win_rate", 0.0)),
+            "terminal_win_bonus_event_count": float(
+                env_info.get("terminal_win_bonus_event_count", 0.0)
+            ),
+        }
+        for action_index, count in enumerate(hist.tolist()):
+            row["selected_action_{}_count".format(action_index)] = int(count)
+        for action_index, count in enumerate(explore_hist.tolist()):
+            row["explore_action_{}_count".format(action_index)] = int(count)
+
+        _append_df_csv(
+            os.path.join(
+                self._get_run_dir(),
+                "progress_train_joint_exploration_episode.csv",
+            ),
+            pd.DataFrame([row]),
+        )
 
     def eval(self):
         """评估若干回合并做日志。
@@ -842,6 +1964,8 @@ class WolfpackRunner(RecRunner):
 
         # 保存 best eval checkpoint
         self.maybe_save_best_eval(eval_summary)
+        self.last_eval_summary = dict(eval_summary)
+        self.last_eval_summary_step = int(self.total_env_steps)
 
         return eval_summary
 
@@ -856,6 +1980,7 @@ class WolfpackRunner(RecRunner):
         :return env_info: (dict) 包含有关展开数据的信息（总奖励等）。
         """
         env_info: Dict[str, Any] = {}
+        joint_exploration_diagnostics = []
         p_id = "policy_0"
         policy = self.policies[p_id]
 
@@ -1023,9 +2148,46 @@ class WolfpackRunner(RecRunner):
         capture_event_count = 0
         capture_event_field_seen = False
         first_success_step = -1
+        terminal_win_first_transition_count = 0
+        terminal_win_bonus_event_count = 0
+        terminal_win_bonus_sum = 0.0
+        terminal_win_bonus_max = 0.0
         # Number of 0->1 slot activations whose recurrent state and previous
         # action were reset. This covers both new joins and recoveries.
         activation_state_reset_count = 0
+        environment_episode_ids = np.arange(
+            int(self.num_adj_episodes_collected),
+            int(self.num_adj_episodes_collected) + int(self.num_envs),
+            dtype=np.int64,
+        )
+        episode_dynamic_slots = [
+            set() for _ in range(self.num_envs)
+        ]
+        episode_candidate_event_provenance = [
+            [] for _ in range(self.num_envs)
+        ]
+        episode_active_event_provenance = [
+            [] for _ in range(self.num_envs)
+        ]
+        episode_candidate_event_keys = [
+            set() for _ in range(self.num_envs)
+        ]
+        episode_active_event_keys = [
+            set() for _ in range(self.num_envs)
+        ]
+        episode_capture_event_contracts = [
+            {} for _ in range(self.num_envs)
+        ]
+        first_capture_step_by_env = [None for _ in range(self.num_envs)]
+        first_capture_target_by_env = [None for _ in range(self.num_envs)]
+        first_capture_participants_by_env = [None for _ in range(self.num_envs)]
+        post_capture_pursuit_active_by_env = [False for _ in range(self.num_envs)]
+        pre_capture_snapshots_by_env = [
+            [] for _ in range(self.num_envs)
+        ]
+        pre_capture_rows: List[Dict[str, Any]] = []
+        pre_capture_prefix_rows: List[Dict[str, Any]] = []
+        post_capture_rows: List[Dict[str, Any]] = []
 
         # 每次 rollout 开始先清空，避免 eval() 读到上一个 episode 的残留
         self.last_episode_step_info = None
@@ -1092,6 +2254,9 @@ class WolfpackRunner(RecRunner):
                            dtype=np.float32)
             for p_id in self.policy_ids
         }
+        episode_terminal_win_rewards = np.zeros(
+            (self.episode_length, self.num_envs, 1), dtype=np.float32
+        )
         # Real environment events used by AdjBuffer credit. These are kept
         # separate from rewards so distance shaping can never masquerade as a
         # capture event.
@@ -1119,8 +2284,9 @@ class WolfpackRunner(RecRunner):
             ),
             dtype=np.float32,
         )
-        # Canonical candidate replay metadata channels are:
-        # [behavior_score, canonical_rank, valid_mask, graph_policy_version].
+        # Candidate replay metadata channels are:
+        # [first_reachable_competitor_margin, competitor_rank, valid_mask,
+        # graph_policy_version].
         episode_capture_candidate_behavior = np.zeros(
             (
                 self.episode_length,
@@ -1251,15 +2417,307 @@ class WolfpackRunner(RecRunner):
                                                                       t_env=self.total_env_steps,
                                                                       explore=explore)
                     else:
-                        acts_batch, qtot, _, f_q = policy.get_actions(
+                        post_capture_floor = 0.0
+                        if (
+                                self.algorithm_name == "sddfg"
+                                and bool(post_capture_pursuit_active_by_env[0])):
+                            post_capture_floor = (
+                                self.post_capture_joint_greedy_floor
+                            )
+                        action_kwargs = {
+                            "t_env": self.total_env_steps,
+                            "explore": explore,
+                            "adj_input": adj_all.to(self.device),
+                            "no_sequence": False,
+                            "dones": torch.tensor(dones).to(self.device),
+                        }
+                        if self.algorithm_name == "sddfg":
+                            action_kwargs[
+                                "post_capture_joint_greedy_floor"
+                            ] = post_capture_floor
+                            action_kwargs[
+                                "post_capture_explore_max_random_agents"
+                            ] = (
+                                self.post_capture_explore_max_random_agents
+                                if post_capture_floor > 0.0 else 0
+                            )
+                            if (
+                                    (
+                                        self.pre_capture_visible_prey_quorum_guard
+                                        or self.pre_capture_visible_prey_quorum_greedy_frontier_guard
+                                    )
+                                    and post_capture_floor <= 0.0):
+                                (
+                                    local_visible_prey_mask,
+                                    local_visible_prey_offsets,
+                                ) = self._visible_prey_geometry_from_local_vector_obs(
+                                    obs_batch,
+                                    num_agents=self.num_agents,
+                                    max_food_num=int(getattr(
+                                        self.args,
+                                        "max_food_num",
+                                        0,
+                                    )),
+                                )
+                                action_kwargs[
+                                    "pre_capture_visible_prey_mask"
+                                ] = local_visible_prey_mask
+                                action_kwargs[
+                                    "pre_capture_visible_prey_offsets"
+                                ] = local_visible_prey_offsets
+                                action_kwargs[
+                                    "pre_capture_visibility_radius"
+                                ] = int(getattr(self.args, "sight_radius", 0))
+                                action_kwargs[
+                                    "pre_capture_prey_max_step"
+                                ] = 1
+                                action_kwargs[
+                                    "apply_pre_capture_visible_prey_quorum_greedy_frontier_guard"
+                                ] = bool(
+                                    self.pre_capture_visible_prey_quorum_greedy_frontier_guard
+                                )
+                        acts_batch, qtot, action_margins, f_q = policy.get_actions(
                             obs_batch[None, :],
                             rnn_states_batch.unsqueeze(0),
                             torch.tensor(avail_acts_batch).to(self.device),
-                            t_env=self.total_env_steps,
-                            explore=explore,
-                            adj_input=adj_all.to(self.device),
-                            no_sequence=False,
-                            dones=torch.tensor(dones).to(self.device))
+                            **action_kwargs)
+                        if (
+                                explore
+                                and bool(getattr(
+                                    policy,
+                                    "use_joint_epsilon_exploration",
+                                    False,
+                                ))):
+                            action_diagnostic = getattr(
+                                policy,
+                                "last_action_exploration_diagnostic",
+                                None,
+                            )
+                            if not isinstance(action_diagnostic, dict):
+                                raise RuntimeError(
+                                    "joint epsilon production action did not "
+                                    "expose its decision diagnostic"
+                                )
+                            if int(action_diagnostic.get("batch_size", 0)) != 1:
+                                raise RuntimeError(
+                                    "Wolfpack joint epsilon diagnostics require "
+                                    "one environment decision per policy call"
+                                )
+                            if int(action_diagnostic.get("schema_version", 0)) != 4:
+                                raise RuntimeError(
+                                    "Wolfpack joint epsilon production action "
+                                    "used an unexpected diagnostic schema"
+                                )
+                            bounded_expected = bool(
+                                post_capture_floor > 0.0
+                                and self.post_capture_explore_max_random_agents > 0
+                                and int(action_diagnostic.get(
+                                    "joint_explore", 0
+                                )) == 1
+                            )
+                            bounded_actual = bool(int(action_diagnostic.get(
+                                "post_capture_explore_bounded_applied", 0
+                            )))
+                            if bounded_actual != bounded_expected:
+                                raise RuntimeError(
+                                    "post-capture bounded exploration lifecycle "
+                                    "did not match the production task state"
+                                )
+                            guard_expected_enabled = bool(
+                                self.pre_capture_visible_prey_quorum_guard
+                            )
+                            guard_actual_enabled = bool(int(
+                                action_diagnostic.get(
+                                    "pre_capture_visible_prey_quorum_guard_enabled",
+                                    0,
+                                )
+                            ))
+                            if guard_actual_enabled != guard_expected_enabled:
+                                raise RuntimeError(
+                                    "pre-capture visible-prey quorum guard "
+                                    "enablement did not match runner config"
+                                )
+                            frontier_expected_enabled = bool(
+                                self.pre_capture_visible_prey_quorum_greedy_frontier_guard
+                                and post_capture_floor <= 0.0
+                            )
+                            frontier_actual_enabled = bool(int(
+                                action_diagnostic.get(
+                                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_enabled",
+                                    0,
+                                )
+                            ))
+                            if frontier_actual_enabled != frontier_expected_enabled:
+                                raise RuntimeError(
+                                    "pre-capture greedy frontier guard "
+                                    "enablement did not match runner config"
+                                )
+                            frontier_eligible_slots = tuple(int(value) for value in (
+                                action_diagnostic.get(
+                                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_eligible_slots",
+                                    (),
+                                )
+                            ))
+                            frontier_constrained_slots = tuple(int(value) for value in (
+                                action_diagnostic.get(
+                                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_constrained_slots",
+                                    (),
+                                )
+                            ))
+                            frontier_conflict_slots = tuple(int(value) for value in (
+                                action_diagnostic.get(
+                                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_conflict_slots",
+                                    (),
+                                )
+                            ))
+                            frontier_reranked_slots = tuple(int(value) for value in (
+                                action_diagnostic.get(
+                                    "pre_capture_visible_prey_quorum_greedy_frontier_guard_reranked_slots",
+                                    (),
+                                )
+                            ))
+                            if not set(frontier_reranked_slots).issubset(
+                                    set(frontier_constrained_slots)):
+                                raise RuntimeError(
+                                    "pre-capture greedy frontier guard reranked "
+                                    "an unconstrained slot"
+                                )
+                            if not set(frontier_conflict_slots).issubset(
+                                    set(frontier_eligible_slots)):
+                                raise RuntimeError(
+                                    "pre-capture greedy frontier conflict escaped "
+                                    "the eligible population"
+                                )
+                            if post_capture_floor > 0.0 and (
+                                    frontier_eligible_slots
+                                    or frontier_constrained_slots
+                                    or frontier_conflict_slots
+                                    or frontier_reranked_slots):
+                                raise RuntimeError(
+                                    "pre-capture greedy frontier guard escaped "
+                                    "its lifecycle"
+                                )
+                            raw_greedy = tuple(int(value) for value in (
+                                action_diagnostic.get(
+                                    "unconstrained_greedy_actions", ()
+                                )
+                            ))
+                            final_greedy = tuple(int(value) for value in (
+                                action_diagnostic.get("greedy_actions", ())
+                            ))
+                            expected_reranked_slots = tuple(
+                                slot for slot, (raw_action, final_action) in enumerate(
+                                    zip(raw_greedy, final_greedy)
+                                )
+                                if raw_action != final_action
+                            )
+                            if (
+                                    len(raw_greedy) != self.num_agents
+                                    or len(final_greedy) != self.num_agents
+                                    or frontier_reranked_slots
+                                    != expected_reranked_slots):
+                                raise RuntimeError(
+                                    "pre-capture greedy frontier rerank "
+                                    "diagnostic is inconsistent"
+                                )
+                            protected_slots = tuple(int(value) for value in (
+                                action_diagnostic.get(
+                                    "pre_capture_visible_prey_quorum_protected_slots",
+                                    (),
+                                )
+                            ))
+                            guard_applied = bool(int(action_diagnostic.get(
+                                "pre_capture_visible_prey_quorum_guard_applied",
+                                0,
+                            )))
+                            if bounded_expected and (
+                                    guard_applied or protected_slots):
+                                raise RuntimeError(
+                                    "pre/post-capture exploration guards "
+                                    "were applied simultaneously"
+                                )
+                            if guard_applied != bool(protected_slots):
+                                raise RuntimeError(
+                                    "pre-capture visible-prey quorum guard "
+                                    "diagnostic is internally inconsistent"
+                                )
+                            if protected_slots and post_capture_floor > 0.0:
+                                raise RuntimeError(
+                                    "pre-capture visible-prey quorum guard "
+                                    "escaped its lifecycle"
+                                )
+                            expected_protected_slots = ()
+                            local_visible_mask = action_kwargs.get(
+                                "pre_capture_visible_prey_mask"
+                            )
+                            if (
+                                    guard_expected_enabled
+                                    and post_capture_floor <= 0.0
+                                    and int(action_diagnostic.get(
+                                        "joint_explore", 0
+                                    )) == 1):
+                                if local_visible_mask is None:
+                                    raise RuntimeError(
+                                        "pre-capture visible-prey quorum guard "
+                                        "lost its local observation mask"
+                                    )
+                                visible_counts = np.asarray(
+                                    local_visible_mask, dtype=np.int64
+                                ).sum(axis=0)
+                                exact_quorum_columns = np.flatnonzero(
+                                    visible_counts == 2
+                                )
+                                if exact_quorum_columns.size:
+                                    expected_protected_slots = tuple(
+                                        np.flatnonzero(np.any(
+                                            np.asarray(
+                                                local_visible_mask,
+                                                dtype=bool,
+                                            )[:, exact_quorum_columns],
+                                            axis=1,
+                                        )).astype(np.int64).tolist()
+                                    )
+                            if protected_slots != expected_protected_slots:
+                                raise RuntimeError(
+                                    "pre-capture visible-prey quorum guard "
+                                    "protected unexpected slots"
+                                )
+                            if bounded_expected:
+                                expected_random_slots = min(
+                                    int(action_diagnostic.get(
+                                        "alive_slot_count", 0
+                                    )),
+                                    self.post_capture_explore_max_random_agents,
+                                )
+                                if int(action_diagnostic.get(
+                                        "random_replacement_slot_count", -1
+                                )) != expected_random_slots:
+                                    raise RuntimeError(
+                                        "post-capture explore branch replaced "
+                                        "an unexpected number of alive slots"
+                                    )
+                            elif (
+                                    int(action_diagnostic.get(
+                                        "joint_explore", 0
+                                    )) == 1
+                                    and post_capture_floor <= 0.0
+                                    and guard_expected_enabled):
+                                expected_random_slots = (
+                                    int(action_diagnostic.get(
+                                        "alive_slot_count", 0
+                                    )) - len(expected_protected_slots)
+                                )
+                                if int(action_diagnostic.get(
+                                        "random_replacement_slot_count", -1
+                                )) != expected_random_slots:
+                                    raise RuntimeError(
+                                        "pre-capture guarded explore branch "
+                                        "replaced an unexpected number of "
+                                        "alive slots"
+                                    )
+                            joint_exploration_diagnostics.append(
+                                dict(action_diagnostic)
+                            )
                     if self.use_vfunction:
                         f_v = policy.get_v_values(rnn_states_batch.unsqueeze(0), states_batch[None, :],
                                                   adj_all.to(self.device), no_sequence=False,
@@ -1364,6 +2822,13 @@ class WolfpackRunner(RecRunner):
             for env_i, step_info in enumerate(step_info_dicts):
                 if not isinstance(step_info, dict):
                     continue
+                episode_dynamic_slots[env_i].update(
+                    int(slot)
+                    for slot in (
+                        list(step_info.get("joined_slots", []))
+                        + list(step_info.get("recovered_slots", []))
+                    )
+                )
                 if "capture_count" in step_info:
                     capture_event_field_seen = True
                 try:
@@ -1376,6 +2841,118 @@ class WolfpackRunner(RecRunner):
                 episode_success_now[t, env_i, 0] = float(
                     bool(step_info.get("success_now", False))
                 )
+
+                food_alive_statuses = step_info.get(
+                    "food_alive_statuses",
+                    None,
+                )
+                if food_alive_statuses is not None:
+                    food_alive_statuses = [
+                        bool(value) for value in food_alive_statuses
+                    ]
+                    post_capture_pursuit_active_by_env[env_i] = bool(
+                        _is_post_capture_pursuit_active(food_alive_statuses)
+                    )
+
+                capture_events = list(step_info.get("capture_events", []))
+                episode_step = int(step_info.get("episode_step", t + 1))
+                action_diagnostic = getattr(
+                    policy, "last_action_exploration_diagnostic", None
+                )
+                if not isinstance(action_diagnostic, dict):
+                    action_diagnostic = {}
+
+                is_first_capture_transition = bool(
+                    first_capture_step_by_env[env_i] is None
+                    and capture_events
+                )
+                if (
+                        training_episode
+                        and not warmup
+                        and self.algorithm_name == "sddfg"
+                        and first_capture_step_by_env[env_i] is None):
+                    snapshots = pre_capture_snapshots_by_env[env_i]
+                    snapshots.append(self._build_pre_capture_transition_row(
+                        environment_episode_id=int(
+                            environment_episode_ids[env_i]
+                        ),
+                        training_env_step=int(
+                            self.total_env_steps + self.num_envs
+                        ),
+                        episode_step=episode_step,
+                        step_info=step_info,
+                        action_diagnostic=action_diagnostic,
+                        greedy_joint_q_value=qtot,
+                        greedy_message_action_margins=action_margins,
+                        greedy_factor_q_values=f_q,
+                        adjacency=adj_all,
+                        learned_factor_count=self.num_factor,
+                    ))
+                if first_capture_step_by_env[env_i] is None and capture_events:
+                    first_capture_step_by_env[env_i] = episode_step
+                    first_capture_target_by_env[env_i] = int(
+                        capture_events[0]["target_id"]
+                    )
+                    first_capture_participants_by_env[env_i] = list(
+                        capture_events[0].get("participant_slots", [])
+                    )
+                    if (
+                            training_episode
+                            and not warmup
+                            and self.algorithm_name == "sddfg"
+                            and is_first_capture_transition):
+                        pre_capture_rows.extend(
+                            self._finalize_pre_capture_window(
+                                pre_capture_snapshots_by_env[env_i],
+                                first_capture_step=episode_step,
+                                first_capture_target_id=(
+                                    first_capture_target_by_env[env_i]
+                                ),
+                                first_capture_participant_slots=(
+                                    first_capture_participants_by_env[env_i]
+                                    or []
+                                ),
+                            )
+                        )
+                        pre_capture_prefix_rows.extend(
+                            self._finalize_pre_capture_window(
+                                pre_capture_snapshots_by_env[env_i],
+                                first_capture_step=episode_step,
+                                first_capture_target_id=(
+                                    first_capture_target_by_env[env_i]
+                                ),
+                                first_capture_participant_slots=(
+                                    first_capture_participants_by_env[env_i]
+                                    or []
+                                ),
+                                history_steps=None,
+                            )
+                        )
+
+                first_capture_step = first_capture_step_by_env[env_i]
+                if (
+                        training_episode
+                        and not warmup
+                        and first_capture_step is not None
+                        and episode_step <= int(first_capture_step) + 24):
+                    post_capture_rows.append(self._build_post_capture_row(
+                        environment_episode_id=int(
+                            environment_episode_ids[env_i]
+                        ),
+                        training_env_step=int(
+                            self.total_env_steps + self.num_envs
+                        ),
+                        episode_step=episode_step,
+                        first_capture_step=int(first_capture_step),
+                        first_capture_target_id=int(
+                            first_capture_target_by_env[env_i]
+                        ),
+                        first_capture_participant_slots=(
+                            first_capture_participants_by_env[env_i] or []
+                        ),
+                        step_info=step_info,
+                        action_diagnostic=action_diagnostic,
+                    ))
 
             info_dict = step_info_dicts[0] if step_info_dicts else {}
             has_fresh_info = isinstance(info_dict, dict) and bool(info_dict)
@@ -1423,6 +3000,36 @@ class WolfpackRunner(RecRunner):
                     team_rewards_traj.append(0.0)
 
             if has_fresh_info:
+                reward_diagnostic = terminal_win_diagnostic_fields(info_dict)
+                first_success_now = int(
+                    reward_diagnostic["first_success_now"]
+                )
+                terminal_win_reward = float(
+                    reward_diagnostic["terminal_win_reward"]
+                )
+                episode_terminal_win_rewards[t, env_i, 0] = terminal_win_reward
+                expected_win_reward = float(self.args.reward_win)
+                reward_tolerance = 64.0 * float(np.finfo(np.float32).eps) * max(
+                    1.0,
+                    abs(expected_win_reward),
+                    abs(terminal_win_reward),
+                )
+                if (
+                        first_success_now
+                        and abs(terminal_win_reward - expected_win_reward)
+                        > reward_tolerance):
+                    raise RuntimeError(
+                        "Wolfpack first success did not emit configured "
+                        "terminal win reward"
+                    )
+                terminal_win_first_transition_count += first_success_now
+                if abs(terminal_win_reward) > reward_tolerance:
+                    terminal_win_bonus_event_count += 1
+                    terminal_win_bonus_sum += terminal_win_reward
+                    terminal_win_bonus_max = max(
+                        terminal_win_bonus_max,
+                        abs(terminal_win_reward),
+                    )
                 capture_event_count += int(info_dict.get("capture_count", 0))
                 if (
                     first_success_step < 0
@@ -1441,7 +3048,6 @@ class WolfpackRunner(RecRunner):
                 left_count = int(info_dict.get("left_count", 0))
                 joined_count = int(info_dict.get("joined_count", 0))
                 recovered_count = int(info_dict.get("recovered_count", 0))
-
                 activated_count = int(joined_masks[0].sum())
                 expected_activated_count = joined_count + recovered_count
                 if activated_count != expected_activated_count:
@@ -1482,6 +3088,12 @@ class WolfpackRunner(RecRunner):
                         for event in info_dict.get("capture_events", [])
                     ],
                     "success_now": bool(info_dict.get("success_now", False)),
+                    "first_success_now": bool(info_dict["first_success_now"]),
+                    "base_team_reward": float(info_dict["base_team_reward"]),
+                    "terminal_win_reward": float(
+                        info_dict["terminal_win_reward"]
+                    ),
+                    "team_reward": float(info_dict["team_reward"]),
                     "left_slots": list(info_dict.get("left_slots", [])),
                     "joined_slots": list(info_dict.get("joined_slots", [])),
                     "recovered_slots": list(info_dict.get("recovered_slots", [])),
@@ -1563,6 +3175,144 @@ class WolfpackRunner(RecRunner):
                     episode_capture_identity_candidates[t, :, 0] = (
                         identity_match["candidate_factor_count"]
                     )
+                    event_records_by_env = identity_match[
+                        "candidate_only_event_records"
+                    ]
+                    if len(event_records_by_env) != self.num_envs:
+                        raise RuntimeError(
+                            "candidate event provenance environment axis "
+                            "does not match the rollout"
+                        )
+                    for env_i, event_records in enumerate(
+                            event_records_by_env):
+                        for event_record in event_records:
+                            event_id = int(event_record["event_id"])
+                            participant_slots = tuple(
+                                int(slot)
+                                for slot in event_record["participant_slots"]
+                            )
+                            event_contract = (
+                                int(event_record["target_id"]),
+                                int(t),
+                                participant_slots,
+                            )
+                            prior_contract = (
+                                episode_capture_event_contracts[env_i].get(
+                                    event_id
+                                )
+                            )
+                            if (
+                                    prior_contract is not None
+                                    and prior_contract != event_contract):
+                                raise RuntimeError(
+                                    "capture event_id was reused with "
+                                    "conflicting prey, step, or participants "
+                                    "inside one environment episode"
+                                )
+                            episode_capture_event_contracts[env_i][
+                                event_id
+                            ] = event_contract
+                            event_key = (
+                                event_id,
+                                int(event_record["target_id"]),
+                                int(event_record["candidate_index"]),
+                            )
+                            if event_key in episode_candidate_event_keys[env_i]:
+                                raise RuntimeError(
+                                    "candidate capture event identity was "
+                                    "duplicated inside one environment episode"
+                                )
+                            episode_candidate_event_keys[env_i].add(event_key)
+                            static_dynamic_class = (
+                                "dynamic"
+                                if any(
+                                    slot in episode_dynamic_slots[env_i]
+                                    for slot in participant_slots
+                                )
+                                else "static"
+                            )
+                            contextual_record = dict(event_record)
+                            contextual_record.update({
+                                "environment_episode_id": int(
+                                    environment_episode_ids[env_i]
+                                ),
+                                "capture_step": int(t),
+                                "static_dynamic_class": (
+                                    static_dynamic_class
+                                ),
+                            })
+                            episode_candidate_event_provenance[env_i].append(
+                                contextual_record
+                            )
+                    matched_event_records_by_env = identity_match[
+                        "matched_event_records"
+                    ]
+                    if len(matched_event_records_by_env) != self.num_envs:
+                        raise RuntimeError(
+                            "matched event provenance environment axis does "
+                            "not match the rollout"
+                        )
+                    for env_i, event_records in enumerate(
+                            matched_event_records_by_env):
+                        for event_record in event_records:
+                            event_id = int(event_record["event_id"])
+                            participant_slots = tuple(
+                                int(slot)
+                                for slot in event_record["participant_slots"]
+                            )
+                            event_contract = (
+                                int(event_record["target_id"]),
+                                int(t),
+                                participant_slots,
+                            )
+                            prior_contract = (
+                                episode_capture_event_contracts[env_i].get(
+                                    event_id
+                                )
+                            )
+                            if (
+                                    prior_contract is not None
+                                    and prior_contract != event_contract):
+                                raise RuntimeError(
+                                    "capture event_id was reused with "
+                                    "conflicting prey, step, or participants "
+                                    "inside one environment episode"
+                                )
+                            episode_capture_event_contracts[env_i][
+                                event_id
+                            ] = event_contract
+                            event_key = (
+                                event_id,
+                                int(event_record["target_id"]),
+                                int(event_record["factor_index"]),
+                            )
+                            if event_key in episode_active_event_keys[env_i]:
+                                raise RuntimeError(
+                                    "active capture event factor was "
+                                    "duplicated inside one environment episode"
+                                )
+                            episode_active_event_keys[env_i].add(event_key)
+                            static_dynamic_class = (
+                                "dynamic"
+                                if any(
+                                    slot in episode_dynamic_slots[env_i]
+                                    for slot in participant_slots
+                                )
+                                else "static"
+                            )
+                            contextual_record = dict(event_record)
+                            contextual_record.update({
+                                "environment_episode_id": int(
+                                    environment_episode_ids[env_i]
+                                ),
+                                "capture_step": int(t),
+                                "static_dynamic_class": (
+                                    static_dynamic_class
+                                ),
+                            })
+                            episode_active_event_provenance[env_i].append(
+                                contextual_record
+                            )
                     if topology_events_traj:
                         topology_events_traj[-1][
                             "capture_identity_matched_event_count"
@@ -1729,17 +3479,33 @@ class WolfpackRunner(RecRunner):
         if explore:
             self.num_episodes_collected += self.num_envs
 
-            self.buffer.insert(self.num_envs,  # push all episodes collected in this rollout step to the buffer
-                               episode_obs,
-                               episode_share_obs,
-                               episode_acts,
-                               episode_rewards,
-                               episode_dones,
-                               episode_dones_env,
-                               episode_avail_acts,
-                               episode_adj,
-                               episode_prob_adj,
-                               )
+            idx_range = self.buffer.insert(
+                self.num_envs,  # push all episodes collected in this rollout step to the buffer
+                episode_obs,
+                episode_share_obs,
+                episode_acts,
+                episode_rewards,
+                episode_dones,
+                episode_dones_env,
+                episode_avail_acts,
+                episode_adj,
+                episode_prob_adj,
+            )
+            policy_buffer = self.buffer.policy_buffers[p_id]
+            policy_buffer.terminal_win_rewards[:, idx_range] = (
+                episode_terminal_win_rewards.copy()
+            )
+            replay_reward_stats = policy_buffer.reward_normalization_diagnostics()
+            env_info["replay_reward_normalization_mean"] = float(
+                replay_reward_stats["mean_reward"]
+            )
+            env_info["replay_reward_normalization_std"] = float(
+                replay_reward_stats["std_reward"]
+            )
+            env_info["terminal_bonus_normalized_delta_at_insert"] = float(
+                float(self.args.reward_win)
+                / replay_reward_stats["std_reward"]
+            )
 
             if (
                 self.algorithm_name in self._BATCHED_FACTOR_GRAPH_ALGOS
@@ -1793,6 +3559,22 @@ class WolfpackRunner(RecRunner):
                                              ),
                                              capture_identity_candidates=(
                                                  episode_capture_identity_candidates
+                                             ),
+                                             capture_candidate_event_provenance=(
+                                                 episode_candidate_event_provenance
+                                             ),
+                                             capture_active_event_provenance=(
+                                                 episode_active_event_provenance
+                                             ),
+                                             environment_episode_ids=(
+                                                 environment_episode_ids
+                                             ),
+                                             behavior_policy_versions=(
+                                                 int(getattr(
+                                                     self.adj_network,
+                                                     "candidate_policy_version",
+                                                     0,
+                                                 ))
                                              ))
                 self.adj_buffer.compute_advantage(idx)
 
@@ -1877,6 +3659,31 @@ class WolfpackRunner(RecRunner):
         env_info.setdefault("win_rate", 0)
         env_info["capture_events"] = float(capture_event_count)
         env_info["first_success_step"] = float(first_success_step)
+        if (
+                float(self.args.reward_win) > 0.0
+                and terminal_win_bonus_event_count
+                != terminal_win_first_transition_count):
+            raise RuntimeError(
+                "Wolfpack terminal win bonus count did not match first-success "
+                "transition count"
+            )
+        env_info["terminal_win_first_transition_count"] = float(
+            terminal_win_first_transition_count
+        )
+        env_info["terminal_win_bonus_event_count"] = float(
+            terminal_win_bonus_event_count
+        )
+        env_info["terminal_win_bonus_sum"] = float(terminal_win_bonus_sum)
+        env_info["terminal_win_bonus_max"] = float(terminal_win_bonus_max)
+        env_info["warmup_terminal_win_first_transition_count"] = float(
+            getattr(self, "warmup_terminal_win_first_transition_count", 0)
+        )
+        env_info["warmup_terminal_win_bonus_event_count"] = float(
+            getattr(self, "warmup_terminal_win_bonus_event_count", 0)
+        )
+        env_info["warmup_terminal_win_bonus_sum"] = float(
+            getattr(self, "warmup_terminal_win_bonus_sum", 0.0)
+        )
         env_info["partial_capture_without_win"] = float(
             capture_event_count > 0 and env_info["win_rate"] < 0.5
         )
@@ -1910,10 +3717,34 @@ class WolfpackRunner(RecRunner):
         )
 
         env_info['average_episode_rewards'] = np.sum(episode_rewards[p_id][:, 0, 0, 0])
+        if (
+                training_episode
+                and (not warmup)
+                and bool(getattr(
+                    policy,
+                    "use_joint_epsilon_exploration",
+                    False,
+                ))):
+            if len(joint_exploration_diagnostics) != int(t):
+                raise RuntimeError(
+                    "joint epsilon diagnostic count did not match formal "
+                    "training episode length"
+                )
+            self._dump_joint_exploration_episode_diagnostic(
+                train_step=int(self.total_env_steps),
+                episode_index=int(self.num_episodes_collected),
+                diagnostics=joint_exploration_diagnostics,
+                env_info=env_info,
+            )
         # ===== 日志新增：训练阶段也低频导出逐步轨迹 CSV =====
         # eval 阶段已经由 eval() 调用 _dump_eval_episode_step_tables；
         # 这里仅对训练 episode 按 log_interval 导出，避免文件过大。
         if training_episode and (not warmup):
+            self._dump_train_pre_capture_rows(pre_capture_rows)
+            self._dump_train_pre_capture_prefix_rows(
+                pre_capture_prefix_rows
+            )
+            self._dump_train_post_capture_rows(post_capture_rows)
             try:
                 should_dump_train_traj = (
                     self.total_env_steps > 0 and
@@ -1992,6 +3823,13 @@ class WolfpackRunner(RecRunner):
             p0 = self.policies[self.policy_ids[0]]
             if hasattr(p0, "exploration"):
                 schedule_info["epsilon"] = float(p0.exploration.eval(self.total_env_steps))
+                schedule_info["joint_epsilon_exploration_enabled"] = float(
+                    bool(getattr(
+                        p0,
+                        "use_joint_epsilon_exploration",
+                        False,
+                    ))
+                )
         except Exception:
             pass
 
@@ -2266,6 +4104,9 @@ class WolfpackRunner(RecRunner):
                 "adj_ppo_early_stop_triggered",
                 "adj_ppo_last_epoch_clip_ratio",
                 "adj_ppo_last_epoch_factor_clip_ratio",
+                "adj_ppo_last_epoch_control_clip_ratio",
+                "adj_ppo_last_epoch_control_factor_clip_ratio",
+                "adj_ppo_control_uses_trusted_population",
                 "adj_ppo_clip_stop_ratio",
                 "adj_ppo_factor_clip_stop_ratio",
                 "adj_ppo_min_epochs",
@@ -2283,6 +4124,9 @@ class WolfpackRunner(RecRunner):
                 "adj_recent_episode_window_config",
                 "adj_dynamic_recent_window_enabled",
                 "adj_recent_window_shrunk",
+                "adj_recent_window_graph_control_ratio",
+                "adj_recent_window_factor_control_ratio",
+                "adj_recent_window_control_uses_trusted_population",
                 "adj_recent_window_recovered",
                 "adj_recent_window_emergency_shrunk",
                 "adj_recent_window_high_stale_count",
@@ -2399,6 +4243,16 @@ class WolfpackRunner(RecRunner):
             "capture_events": [],
             "first_success_step": [],
             "partial_capture_without_win": [],
+            "terminal_win_first_transition_count": [],
+            "terminal_win_bonus_event_count": [],
+            "terminal_win_bonus_sum": [],
+            "terminal_win_bonus_max": [],
+            "warmup_terminal_win_first_transition_count": [],
+            "warmup_terminal_win_bonus_event_count": [],
+            "warmup_terminal_win_bonus_sum": [],
+            "replay_reward_normalization_mean": [],
+            "replay_reward_normalization_std": [],
+            "terminal_bonus_normalized_delta_at_insert": [],
 
             # episode 末尾人数
             "num_players": [],
@@ -2505,41 +4359,144 @@ class WolfpackRunner(RecRunner):
             "capture_candidate_identity_positive_loss_contribution": [],
             "capture_candidate_identity_negative_loss_contribution": [],
             "capture_candidate_identity_target_count": [],
+            "capture_candidate_identity_valid_transition_count": [],
+            "capture_candidate_identity_target_transition_count": [],
+            "capture_candidate_identity_unsatisfied_target_count": [],
+            "capture_candidate_identity_positive_unsatisfied_target_count": [],
+            "capture_candidate_identity_negative_unsatisfied_target_count": [],
+            "capture_candidate_identity_target_transition_fraction": [],
             "capture_candidate_identity_positive_mass": [],
             "capture_candidate_identity_negative_mass": [],
-            "capture_candidate_identity_positive_score_mean": [],
-            "capture_candidate_identity_negative_score_mean": [],
-            "capture_candidate_identity_positive_probability_mean": [],
-            "capture_candidate_identity_negative_probability_mean": [],
-            "capture_candidate_identity_positive_legacy_bounded_score_mean": [],
-            "capture_candidate_identity_negative_legacy_bounded_score_mean": [],
+            "capture_candidate_identity_positive_margin_mean": [],
+            "capture_candidate_identity_negative_margin_mean": [],
+            "capture_candidate_identity_positive_signed_margin_mean": [],
+            "capture_candidate_identity_negative_signed_margin_mean": [],
             "capture_candidate_identity_loss_definition_version": [],
+            "capture_candidate_identity_loss_normalization_version": [],
+            "capture_candidate_identity_gradient_projection_version": [],
+            "capture_candidate_identity_actual_update_guard_version": [],
+            "capture_candidate_identity_optimizer_state_sync_version": [],
+            "capture_candidate_identity_gradient_norm": [],
+            "capture_candidate_identity_base_gradient_norm": [],
+            "capture_candidate_identity_base_gradient_cosine": [],
+            "capture_candidate_identity_gradient_conflict": [],
+            "capture_candidate_identity_projected_gradient_dot": [],
+            "capture_candidate_identity_total_gradient_norm_ratio": [],
+            "capture_candidate_identity_base_gradient_removed_norm_fraction": [],
+            "capture_candidate_identity_clipped_gradient_dot": [],
+            "capture_candidate_identity_actual_update_descent_dot_before": [],
+            "capture_candidate_identity_actual_update_descent_dot_after": [],
+            "capture_candidate_identity_actual_update_corrected": [],
+            "capture_candidate_identity_actual_update_norm": [],
+            "capture_candidate_identity_actual_update_correction_norm": [],
+            "capture_candidate_identity_actual_update_correction_norm_ratio": [],
+            "capture_candidate_identity_optimizer_state_sync_applied": [],
+            "capture_candidate_identity_optimizer_state_sync_parameter_count": [],
+            "capture_candidate_identity_optimizer_state_update_equation_version": [],
+            "capture_candidate_identity_optimizer_state_raw_reconstruction_error": [],
+            "capture_candidate_identity_optimizer_state_safe_reconstruction_error": [],
+            "capture_candidate_identity_optimizer_state_raw_reconstruction_error_ratio": [],
+            "capture_candidate_identity_optimizer_state_safe_reconstruction_error_ratio": [],
+            "capture_candidate_identity_optimizer_state_reconstruction_tolerance": [],
+            "capture_candidate_identity_optimizer_state_exp_avg_change_norm": [],
+            "capture_candidate_identity_loss_optimizer_change": [],
+            "capture_candidate_identity_lifecycle_version": [],
+            "capture_candidate_identity_lifecycle_horizon": [],
+            "capture_candidate_identity_lifecycle_cache_size": [],
+            "capture_candidate_identity_lifecycle_observation_archive_size": [],
+            "capture_candidate_identity_lifecycle_new_count": [],
+            "capture_candidate_identity_lifecycle_behavioral_progress_transition_count": [],
+            "capture_candidate_identity_lifecycle_no_progress_skipped_transition_count": [],
+            "capture_candidate_identity_lifecycle_duplicate_prevented_count": [],
+            "capture_candidate_identity_lifecycle_expired_count": [],
+            "capture_candidate_identity_lifecycle_protected_target_count": [],
+            "capture_candidate_identity_lifecycle_gradient_norm": [],
+            "capture_candidate_identity_lifecycle_base_gradient_cosine": [],
+            "capture_candidate_identity_lifecycle_gradient_conflict": [],
+            "capture_candidate_identity_lifecycle_projected_gradient_dot": [],
+            "capture_candidate_identity_lifecycle_actual_update_descent_dot_before": [],
+            "capture_candidate_identity_lifecycle_actual_update_descent_dot_after": [],
+            "capture_candidate_identity_lifecycle_actual_update_corrected": [],
+            "capture_candidate_identity_lifecycle_update_rejected": [],
+            "capture_candidate_identity_lifecycle_violation_count": [],
+            "capture_candidate_identity_lifecycle_attempted_loss_optimizer_change": [],
+            "capture_candidate_identity_lifecycle_loss_optimizer_change": [],
+            "capture_candidate_identity_lifecycle_state_sync_applied": [],
+            "capture_candidate_identity_lifecycle_age_mean": [],
+            "capture_candidate_identity_lifecycle_constraint_count": [],
+            "capture_candidate_identity_lifecycle_active_constraint_count": [],
+            "capture_candidate_identity_lifecycle_min_constraint_dot_before": [],
+            "capture_candidate_identity_lifecycle_min_constraint_dot_after": [],
+            "capture_candidate_identity_lifecycle_projection_fallback": [],
+            "capture_candidate_identity_lifecycle_superseded_constraint_count": [],
+            "capture_candidate_identity_lifecycle_actual_min_constraint_dot_before": [],
+            "capture_candidate_identity_lifecycle_actual_min_constraint_dot_after": [],
+            "capture_candidate_identity_lifecycle_actual_negative_constraint_count_before": [],
+            "capture_candidate_identity_lifecycle_actual_negative_constraint_count_after": [],
+            "capture_candidate_identity_lifecycle_actual_projection_corrected": [],
+            "capture_candidate_identity_lifecycle_actual_projection_correction_norm_ratio": [],
+            "capture_candidate_identity_lifecycle_nonlinear_backtrack_count": [],
+            "capture_candidate_identity_lifecycle_current_candidate_nonlinear_violation": [],
+            "capture_candidate_identity_lifecycle_target_bearing_update": [],
+            "capture_candidate_identity_lifecycle_policy_version_advanced": [],
+            "capture_candidate_identity_lifecycle_clock": [],
+            "capture_candidate_identity_lifecycle_1_update_retention_count": [],
+            "capture_candidate_identity_lifecycle_1_update_signed_margin_retention_fraction": [],
+            "capture_candidate_identity_lifecycle_1_update_rank_retention_fraction": [],
+            "capture_candidate_identity_lifecycle_1_update_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_1_update_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_1_update_positive_eligible_count": [],
+            "capture_candidate_identity_lifecycle_1_update_positive_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_1_update_positive_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_1_update_negative_eligible_count": [],
+            "capture_candidate_identity_lifecycle_1_update_negative_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_1_update_negative_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_5_update_retention_count": [],
+            "capture_candidate_identity_lifecycle_5_update_signed_margin_retention_fraction": [],
+            "capture_candidate_identity_lifecycle_5_update_rank_retention_fraction": [],
+            "capture_candidate_identity_lifecycle_5_update_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_5_update_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_5_update_positive_eligible_count": [],
+            "capture_candidate_identity_lifecycle_5_update_positive_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_5_update_positive_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_5_update_negative_eligible_count": [],
+            "capture_candidate_identity_lifecycle_5_update_negative_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_5_update_negative_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_10_update_retention_count": [],
+            "capture_candidate_identity_lifecycle_10_update_signed_margin_retention_fraction": [],
+            "capture_candidate_identity_lifecycle_10_update_rank_retention_fraction": [],
+            "capture_candidate_identity_lifecycle_10_update_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_10_update_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_10_update_positive_eligible_count": [],
+            "capture_candidate_identity_lifecycle_10_update_positive_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_10_update_positive_rank_held_count": [],
+            "capture_candidate_identity_lifecycle_10_update_negative_eligible_count": [],
+            "capture_candidate_identity_lifecycle_10_update_negative_signed_margin_held_count": [],
+            "capture_candidate_identity_lifecycle_10_update_negative_rank_held_count": [],
+            "capture_candidate_identity_positive_optimizer_signed_margin_change_mean": [],
+            "capture_candidate_identity_negative_optimizer_signed_margin_change_mean": [],
+            "capture_candidate_identity_positive_optimizer_rank_improved_fraction": [],
+            "capture_candidate_identity_negative_optimizer_rank_reduced_fraction": [],
             "capture_candidate_identity_score_semantics_version": [],
-            "capture_candidate_identity_positive_log_score_mean": [],
-            "capture_candidate_identity_negative_log_score_mean": [],
-            "capture_candidate_identity_positive_log_probability_mean": [],
-            "capture_candidate_identity_negative_log_probability_mean": [],
-            "capture_candidate_identity_valid_score_mean": [],
-            "capture_candidate_identity_valid_score_min": [],
-            "capture_candidate_identity_valid_score_max": [],
-            "capture_candidate_identity_behavior_score_mean": [],
+            "capture_candidate_identity_valid_margin_mean": [],
+            "capture_candidate_identity_valid_margin_min": [],
+            "capture_candidate_identity_valid_margin_max": [],
+            "capture_candidate_identity_behavior_margin_mean": [],
             "capture_candidate_identity_behavior_rank_mean": [],
-            "capture_candidate_identity_positive_behavior_score_mean": [],
-            "capture_candidate_identity_negative_behavior_score_mean": [],
-            "capture_candidate_identity_positive_behavior_probability_mean": [],
-            "capture_candidate_identity_negative_behavior_probability_mean": [],
+            "capture_candidate_identity_positive_behavior_margin_mean": [],
+            "capture_candidate_identity_negative_behavior_margin_mean": [],
             "capture_candidate_identity_positive_behavior_rank_mean": [],
             "capture_candidate_identity_negative_behavior_rank_mean": [],
             "capture_candidate_identity_positive_current_rank_mean": [],
             "capture_candidate_identity_negative_current_rank_mean": [],
-            "capture_candidate_identity_positive_log_score_change_mean": [],
-            "capture_candidate_identity_negative_log_score_change_mean": [],
-            "capture_candidate_identity_positive_log_probability_change_mean": [],
-            "capture_candidate_identity_negative_log_probability_change_mean": [],
-            "capture_candidate_identity_positive_score_improved_fraction": [],
-            "capture_candidate_identity_negative_score_reduced_fraction": [],
-            "capture_candidate_identity_positive_probability_improved_fraction": [],
-            "capture_candidate_identity_negative_probability_reduced_fraction": [],
+            "capture_candidate_identity_positive_margin_change_mean": [],
+            "capture_candidate_identity_negative_margin_change_mean": [],
+            "capture_candidate_identity_positive_signed_margin_change_mean": [],
+            "capture_candidate_identity_negative_signed_margin_change_mean": [],
+            "capture_candidate_identity_positive_margin_improved_fraction": [],
+            "capture_candidate_identity_negative_margin_reduced_fraction": [],
+            "capture_candidate_identity_positive_boundary_crossed_fraction": [],
+            "capture_candidate_identity_negative_boundary_respected_fraction": [],
             "capture_candidate_identity_positive_rank_improved_fraction": [],
             "capture_candidate_identity_negative_rank_reduced_fraction": [],
             "capture_candidate_identity_behavior_valid_fraction": [],
@@ -2696,6 +4653,10 @@ class WolfpackRunner(RecRunner):
             "adj_ppo_early_stop_triggered": [],
             "adj_ppo_last_epoch_clip_ratio": [],
             "adj_ppo_last_epoch_factor_clip_ratio": [],
+            "adj_ppo_last_epoch_control_clip_ratio": [],
+            "adj_ppo_last_epoch_control_factor_clip_ratio": [],
+            "adj_ppo_control_uses_trusted_population": [],
+            "adj_control_runtime_contract_valid": [],
             "adj_ppo_clip_stop_ratio": [],
             "adj_ppo_factor_clip_stop_ratio": [],
             "adj_ppo_min_epochs": [],
@@ -2713,6 +4674,9 @@ class WolfpackRunner(RecRunner):
             "adj_recent_episode_window_config": [],
             "adj_dynamic_recent_window_enabled": [],
             "adj_recent_window_shrunk": [],
+            "adj_recent_window_graph_control_ratio": [],
+            "adj_recent_window_factor_control_ratio": [],
+            "adj_recent_window_control_uses_trusted_population": [],
             "adj_recent_window_recovered": [],
             "adj_recent_window_emergency_shrunk": [],
             "adj_recent_window_high_stale_count": [],

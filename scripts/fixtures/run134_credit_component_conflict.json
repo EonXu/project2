@@ -1,0 +1,51 @@
+{
+  "run_id": "run134",
+  "env_step": 145600,
+  "protected_identity": "0-1",
+  "ema_alpha": 0.05,
+  "pair_observations_per_transaction": 2344,
+  "triplet_observations_per_transaction": 1756,
+  "candidate_evidence_identities": ["0-4", "2-3"],
+  "transactions": [
+    {
+      "seq": 694,
+      "obs": 0,
+      "pair_margin_delta": -1.6444469690322876,
+      "triplet_margin_delta": 0.0,
+      "gate_margin_delta": 0.0,
+      "all_continuous_margin_delta": -1.2539280652999878,
+      "baseline_competitor": "0-5",
+      "pair_component_competitor": "0-1-5"
+    },
+    {
+      "seq": 694,
+      "obs": 1,
+      "pair_margin_delta": -1.650119960308075,
+      "triplet_margin_delta": -5.960464477539063e-08,
+      "gate_margin_delta": 0.0,
+      "all_continuous_margin_delta": -1.2596008777618408,
+      "baseline_competitor": "0-5",
+      "pair_component_competitor": "0-1-5"
+    },
+    {
+      "seq": 695,
+      "obs": 0,
+      "pair_margin_delta": -1.644579529762268,
+      "triplet_margin_delta": -1.5908160209655762,
+      "gate_margin_delta": 0.0,
+      "all_continuous_margin_delta": -1.6475777626037598,
+      "baseline_competitor": "0-5",
+      "pair_component_competitor": "0-1-5"
+    },
+    {
+      "seq": 695,
+      "obs": 1,
+      "pair_margin_delta": -1.650242269039154,
+      "triplet_margin_delta": -1.5964789986610413,
+      "gate_margin_delta": 0.0,
+      "all_continuous_margin_delta": -1.6532406210899353,
+      "baseline_competitor": "0-5",
+      "pair_component_competitor": "0-1-5"
+    }
+  ]
+}

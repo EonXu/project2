@@ -7,6 +7,12 @@ import time
 import os
 from .assets.Agent import DQNAgent
 from numpy.random import RandomState
+from utils.wolfpack_reward import (
+    WOLFPACK_DISTANCE_SHAPING_SCALE,
+    capture_quorum_balanced_alive_prey_coverage_cost,
+    coverage_potential_rewards,
+    terminal_win_reward_components,
+)
 
 
 """
@@ -181,6 +187,14 @@ class Generator(object):
 class WolfpackPenaltyOpen(gym.Env):
     metadata = {'render.modes': ['human']}
 
+    def _team_reward_components(self, individual_rewards, success_now):
+        return terminal_win_reward_components(
+            individual_rewards=individual_rewards,
+            success_now=success_now,
+            episode_success_before=self.episode_success,
+            reward_win=self.reward_win,
+        )
+
     def _make_food_agent(self, idx):
         agent = DQNAgent(
             agent_id=idx,
@@ -209,7 +223,8 @@ class WolfpackPenaltyOpen(gym.Env):
                  prey_with_gpu=False, close_penalty=0.1,
                  intra_episode_dynamic=False, shock_steps="", shock_remove_num=0,
                  shock_join_delay=10, shock_join_num=0, shock_recover_delay=30,
-                 dynamic_min_agents=2, continue_after_success=False):
+                 dynamic_min_agents=2, continue_after_success=False,
+                 reward_win=0.0, use_multi_prey_coverage_shaping=False):
 
         # ====== 基本网格/观测与动作配置 ======
         self.grid_height = grid_height
@@ -232,6 +247,12 @@ class WolfpackPenaltyOpen(gym.Env):
         self.shock_recover_delay = int(shock_recover_delay)
         self.dynamic_min_agents = int(dynamic_min_agents)
         self.continue_after_success = bool(continue_after_success)
+        self.reward_win = float(reward_win)
+        if not np.isfinite(self.reward_win) or self.reward_win < 0.0:
+            raise ValueError("reward_win must be finite and non-negative")
+        self.use_multi_prey_coverage_shaping = bool(
+            use_multi_prey_coverage_shaping
+        )
 
         # ====== 回合内动态事件参数校验 ======
         # 所有张量仍使用 max_player_num 作为固定容量；这里只改变槽位是否有效。
@@ -258,12 +279,14 @@ class WolfpackPenaltyOpen(gym.Env):
         # ====== 观测空间（vector 版本）======
         if obs_type == "vector":
             # 单个 agent 的部分可观测向量构成（固定维度，slot 对齐，便于 DDFG 训练）
-            self.unit_obs_dim = 2 + 4 + 2 * (self.max_player_num - 1) + 6 * self.max_food_num + 4 + 1
+            # The simultaneous-prey objective depends on each prey's remaining
+            # freeze window, so expose one normalized countdown per prey slot.
+            self.unit_obs_dim = 2 + 4 + 2 * (self.max_player_num - 1) + 7 * self.max_food_num + 4 + 1
 
             self.observation_space = [[self.unit_obs_dim] for _ in range(self.max_player_num)]
 
         # 全局状态维度（固定长度 state_dim，share_obs 会复制 N 份）
-        self.state_dim = 7 * self.max_player_num + 7 * self.max_food_num + 1
+        self.state_dim = 7 * self.max_player_num + 8 * self.max_food_num + 1
         
         self.share_observation_space = [[self.state_dim] for _ in range(self.max_player_num)]
 
@@ -341,6 +364,7 @@ class WolfpackPenaltyOpen(gym.Env):
         self.a_to_idx = None
         self.idx_to_a = None
         self.prev_dist_to_food = None
+        self.prev_team_coverage_cost = None
 
         self.player_obs_type = [obs_type for _ in range(self.num_players)]
         self.food_obs_type = ["partial_obs" for _ in range(self.max_food_num)]
@@ -474,12 +498,8 @@ class WolfpackPenaltyOpen(gym.Env):
                 self.RGB_grid[coord[0]][coord[1]] = [255, 0, 0]
             self.RGB_padded_grid[coord[0] + self.pads][coord[1] + self.pads] = [255, 0, 0]
 
-        # 初始化“距离 prey”的塑形基线（slot 级别；只对 alive prey 计算最近距离）
-        self.prev_dist_to_food = [None] * self.max_player_num
-        for rid in range(self.num_players):
-            slot = self.valid_indices.index(rid)
-            px, py = self.player_positions[rid]
-            self.prev_dist_to_food[slot] = self._min_dist_to_alive_food(px, py)
+        # 初始化距离塑形基线。新机制只改变训练 reward，不改变 observation。
+        self._reset_distance_shaping_baseline()
 
         self.remaining_timesteps = self.max_time_steps
 
@@ -531,12 +551,8 @@ class WolfpackPenaltyOpen(gym.Env):
                 self.food_positions[idx] = coords[j]
                 self.food_orientation[idx] = 0
 
-        # 更新距离塑形基线（仅对有效槽位）
-        self.prev_dist_to_food = [None] * self.max_player_num
-        for rid in range(self.num_players):
-            slot = self.valid_indices.index(rid)
-            px, py = self.player_positions[rid]
-            self.prev_dist_to_food[slot] = self._min_dist_to_alive_food(px, py)
+        # 复活会改变 alive-prey 集合；禁止把该不连续变化记作 shaping。
+        self._reset_distance_shaping_baseline()
 
     def update_status(self):
         """推进 prey 的冻结计时器（<=0 时可在 revive() 中复活）。"""
@@ -612,7 +628,9 @@ class WolfpackPenaltyOpen(gym.Env):
     def update_food_status(self):
         """协作捕获 + 单狼惩罚 + 距离塑形（只对 alive prey 计算距离）。
         奖励构成（slot 级别）：
-          1) 距离塑形：0.01 * (prev_dist - cur_dist)，只对 alive prey 取最近距离；
+          1) 距离塑形：启用 coverage 时，先最大化具有捕获 quorum 的
+             alive prey 数，再最大化被覆盖 prey 数，最后最小化总代价；
+             否则保留 legacy per-wolf nearest prey；
           2) 单狼惩罚：若只有 1 只狼在 coopRadius 内贴近 prey，则该狼 -close_penalty；
           3) 协作奖励：若有 k>=2 只狼在 coopRadius 内，则捕获 prey：
              - 捕获事件的总奖励固定为 groupMultiplier（不随 k 增长）；
@@ -623,20 +641,43 @@ class WolfpackPenaltyOpen(gym.Env):
         self.last_capture_count = 0
         self.last_capture_events = []
 
-        # 1) 距离塑形（slot）
+        # 1) 距离塑形（slot）。Coverage potential 保持 sum-of-agent-distance
+        # 的量纲，并在 active slots 间均分；trainer 使用其 team sum。
         cur_dist_to_food = [None] * self.max_player_num
         for rid in range(self.num_players):
             slot = self.valid_indices.index(rid)
             px, py = self.player_positions[rid]
             cur_dist_to_food[slot] = self._min_dist_to_alive_food(px, py)
 
-        shaped = []
-        for prev_d, cur_d in zip(self.prev_dist_to_food, cur_dist_to_food):
-            if prev_d is None or cur_d is None:
-                shaped.append(0.0)
-            else:
-                shaped.append(0.01 * (prev_d - cur_d))
-        self.player_points = shaped
+        if self.use_multi_prey_coverage_shaping:
+            current_coverage_cost = self._current_team_coverage_cost()
+            if self.prev_team_coverage_cost is None:
+                raise RuntimeError(
+                    "Wolfpack coverage shaping baseline is not initialized"
+                )
+            active_slots = [
+                slot for slot, rid in enumerate(self.valid_indices)
+                if rid >= 0
+            ]
+            self.player_points = coverage_potential_rewards(
+                previous_cost=self.prev_team_coverage_cost,
+                current_cost=current_coverage_cost,
+                active_slots=active_slots,
+                max_player_num=self.max_player_num,
+                scale=WOLFPACK_DISTANCE_SHAPING_SCALE,
+            ).tolist()
+            self.prev_team_coverage_cost = current_coverage_cost
+        else:
+            shaped = []
+            for prev_d, cur_d in zip(
+                    self.prev_dist_to_food, cur_dist_to_food):
+                if prev_d is None or cur_d is None:
+                    shaped.append(0.0)
+                else:
+                    shaped.append(
+                        WOLFPACK_DISTANCE_SHAPING_SCALE * (prev_d - cur_d)
+                    )
+            self.player_points = shaped
         self.prev_dist_to_food = cur_dist_to_food
 
         # 2) 捕获/惩罚（按 prey 遍历，每个 prey 每步最多处理一次）
@@ -938,12 +979,9 @@ class WolfpackPenaltyOpen(gym.Env):
                 "recovered_slots": [],
             }
 
-        # open 后重置距离塑形基线（避免槽位变化导致 prev_dist 错位）
-        self.prev_dist_to_food = [None] * self.max_player_num
-        for rid in range(self.num_players):
-            slot = self.valid_indices.index(rid)
-            px, py = self.player_positions[rid]
-            self.prev_dist_to_food[slot] = self._min_dist_to_alive_food(px, py)
+        # 成员变化或捕获会改变 potential 的定义域；从下一状态重建基线，
+        # 避免 topology/capture discontinuity 伪装成距离 shaping。
+        self._reset_distance_shaping_baseline()
 
         # 6) 下一观测（玩家侧）
         obs = np.asarray([self.observation_computation(self.obs_type, agent_id=i)
@@ -959,6 +997,12 @@ class WolfpackPenaltyOpen(gym.Env):
 
         # 7) done / masks / avail / share_obs
         success = (not any(self.food_alive_statuses))  # 所有 prey 当前都被捕获/冻结
+        (
+            base_team_reward,
+            terminal_win_reward,
+            team_reward_scalar,
+            first_success_now,
+        ) = self._team_reward_components(individual_rewards, success)
         self.episode_success = self.episode_success or success
         time_limit = (self.remaining_timesteps <= 0)
         # 动态恢复实验不能在 prey 暂时全部冻结时提前截断，否则后续恢复事件不会发生。
@@ -971,8 +1015,6 @@ class WolfpackPenaltyOpen(gym.Env):
         share_obs = np.tile(self.get_state().astype(np.float32), (self.max_player_num, 1))
 
         # ========== team reward：把所有智能体 reward 加起来 ==========
-        team_reward_scalar = float(np.sum(individual_rewards))  # 标量：全队本步总回报
-
         # 团队奖励是 transition-level 标量，必须广播到所有固定槽位。
         # Trainer 当前读取 slot 0 的共享奖励；若按 next active mask 屏蔽，slot 0
         # 恰好退出时会错误地把整个团队奖励变为 0。
@@ -998,6 +1040,8 @@ class WolfpackPenaltyOpen(gym.Env):
             "num_players": int(self.num_players),
             "active_masks": active_masks.copy(),
             "individual_rewards": individual_rewards.copy(),
+            "base_team_reward": base_team_reward,
+            "terminal_win_reward": terminal_win_reward,
             "team_reward": team_reward_scalar,
             "capture_count": int(self.last_capture_count),
             "capture_events": [
@@ -1010,6 +1054,7 @@ class WolfpackPenaltyOpen(gym.Env):
                 for event in self.last_capture_events
             ],
             "success_now": bool(success),
+            "first_success_now": first_success_now,
             "topology_changed": topology_changed,
             "left_slots": list(event_info["left_slots"]),
             "joined_slots": list(event_info["joined_slots"]),
@@ -1019,6 +1064,57 @@ class WolfpackPenaltyOpen(gym.Env):
             "recovered_count": len(event_info["recovered_slots"]),
             "pending_recovery_count": len(self.pending_recovery),
             "episode_step": int(self.episode_step),
+            # Trajectory-neutral task-state provenance for post-capture
+            # diagnostics.  Keep fixed prey-slot order and fixed player-slot
+            # order so the runner can measure whether the behaviour switches
+            # to the still-unfrozen prey during the 24-step window without an
+            # extra environment or policy forward pass.
+            "food_alive_statuses": [
+                bool(value) for value in self.food_alive_statuses
+            ],
+            "food_freeze_remaining": [
+                float(self._normalized_food_freeze_remaining(fid))
+                for fid in range(self.max_food_num)
+            ],
+            "food_positions": [
+                [int(position[0]), int(position[1])]
+                for position in self.food_positions
+            ],
+            "player_slot_positions": [
+                (
+                    [
+                        int(self.player_positions[self.valid_indices[slot]][0]),
+                        int(self.player_positions[self.valid_indices[slot]][1]),
+                    ]
+                    if int(self.valid_indices[slot]) >= 0 else None
+                )
+                for slot in range(self.max_player_num)
+            ],
+            "food_visible_player_slots": [
+                [
+                    int(slot)
+                    for slot in range(self.max_player_num)
+                    if (
+                        bool(self.food_alive_statuses[fid])
+                        and int(self.valid_indices[slot]) >= 0
+                        and (
+                            abs(
+                                int(self.player_positions[
+                                    self.valid_indices[slot]
+                                ][0])
+                                - int(self.food_positions[fid][0])
+                            )
+                            + abs(
+                                int(self.player_positions[
+                                    self.valid_indices[slot]
+                                ][1])
+                                - int(self.food_positions[fid][1])
+                            )
+                        ) <= int(self.sight_radius)
+                    )
+                ]
+                for fid in range(self.max_food_num)
+            ],
         }
         infos = [dict(common_info) for _ in range(self.max_player_num)]
 
@@ -1053,6 +1149,27 @@ class WolfpackPenaltyOpen(gym.Env):
         if not alive:
             return 0.0
         return float(min([abs(px - fx) + abs(py - fy) for fx, fy in alive]))
+
+    def _current_team_coverage_cost(self):
+        """Return the reward-only capture-feasible coverage potential."""
+        alive_food_positions = [
+            self.food_positions[fid]
+            for fid in range(self.max_food_num)
+            if self.food_alive_statuses[fid]
+        ]
+        return capture_quorum_balanced_alive_prey_coverage_cost(
+            player_positions=self.player_positions,
+            food_positions=alive_food_positions,
+        )
+
+    def _reset_distance_shaping_baseline(self):
+        """Reset both legacy and coverage baselines without consuming RNG."""
+        self.prev_dist_to_food = [None] * self.max_player_num
+        for rid in range(self.num_players):
+            slot = self.valid_indices.index(rid)
+            px, py = self.player_positions[rid]
+            self.prev_dist_to_food[slot] = self._min_dist_to_alive_food(px, py)
+        self.prev_team_coverage_cost = self._current_team_coverage_cost()
 
     def _observation_player_vector_partial(self, agent_id: int):
         """玩家（wolf）的部分可观测 vector 观测。"""
@@ -1089,6 +1206,7 @@ class WolfpackPenaltyOpen(gym.Env):
 
         # prey slots
         for fid in range(self.max_food_num):
+            freeze_remaining = self._normalized_food_freeze_remaining(fid)
             if self.food_alive_statuses[fid]:
                 fx, fy = self.food_positions[fid]
                 dx, dy = fx - px, fy - py
@@ -1100,6 +1218,7 @@ class WolfpackPenaltyOpen(gym.Env):
                     obs.extend([-1.0, -1.0, 0.0, 0.0, 0.0, 0.0])
             else:
                 obs.extend([-1.0, -1.0, 0.0, 0.0, 0.0, 0.0])
+            obs.append(freeze_remaining)
 
         # obstacles N,E,S,W
         nbrs = [(px - 1, py), (px, py + 1), (px + 1, py), (px, py - 1)]
@@ -1135,6 +1254,7 @@ class WolfpackPenaltyOpen(gym.Env):
                 s.append(1.0)
             else:
                 s.extend([-1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            s.append(self._normalized_food_freeze_remaining(fid))
 
         s.append(float(self.remaining_timesteps) / float(self.max_time_steps))
 
@@ -1142,6 +1262,13 @@ class WolfpackPenaltyOpen(gym.Env):
         if out.size != self.state_dim:
             raise RuntimeError(f"state_dim mismatch: got {out.size} expected {self.state_dim}")
         return out
+
+    def _normalized_food_freeze_remaining(self, food_id: int):
+        """Return the task-relevant freeze window on a stable [0, 1] scale."""
+        if self.food_alive_statuses[food_id] or self.food_freeze_rate <= 0:
+            return 0.0
+        remaining = float(self.food_frozen_time[food_id])
+        return float(np.clip(remaining / float(self.food_freeze_rate), 0.0, 1.0))
 
     def get_avail_actions(self):
         """返回 (N, n_actions) 的可用动作掩码。

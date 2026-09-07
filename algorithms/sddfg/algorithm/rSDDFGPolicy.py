@@ -155,6 +155,39 @@ def _gather_last_dim(values, indices):
     ]
     return selected.unsqueeze(-1)
 
+
+def _finite_message_action_margins(message_utilities):
+    """Return best-vs-runner-up message-utility margins per agent.
+
+    The values are a diagnostic of the already-computed max-sum messages, not
+    an additional policy evaluation and not an exact counterfactual joint-Q
+    margin.  A slot with fewer than two finite legal actions has no defined
+    ranking margin and is reported as NaN.
+    """
+    if message_utilities.dim() != 3:
+        raise RuntimeError(
+            "message action margin expects [batch, agent, action] utilities"
+        )
+    if int(message_utilities.shape[-1]) < 2:
+        return torch.full(
+            message_utilities.shape[:-1],
+            float("nan"),
+            dtype=message_utilities.dtype,
+            device=message_utilities.device,
+        )
+    safe_utilities = torch.where(
+        torch.isnan(message_utilities),
+        torch.full_like(message_utilities, -float("inf")),
+        message_utilities,
+    )
+    top_two = torch.topk(safe_utilities, k=2, dim=-1).values
+    margins = top_two[..., 0] - top_two[..., 1]
+    return torch.where(
+        torch.isfinite(margins),
+        margins,
+        torch.full_like(margins, float("nan")),
+    )
+
 from algorithms.sddfg.algorithm.agent_q_function import AgentQFunction
 from algorithms.sddfg.algorithm.agent_v_function import AgentVFunction
 # from algorithms.sddfg.algorithm.adj_generator import Adj_Generator
@@ -163,6 +196,13 @@ from utils.util import get_dim_from_space, is_discrete, is_multidiscrete, make_o
     avail_choose, to_torch, to_numpy
 from algorithms.base.mlp_policy import MLPPolicy
 from algorithms.sddfg.algorithm.rnn import RNNBase
+from utils.joint_exploration import (
+    bound_joint_random_replacements,
+    build_exact_visible_prey_quorum_frontier_action_mask,
+    epsilon_random_mask,
+    protect_exact_visible_prey_quorum_random_replacements,
+    sample_action_indices,
+)
 
 
 class R_SDDFGPolicy(MLPPolicy):
@@ -190,6 +230,23 @@ class R_SDDFGPolicy(MLPPolicy):
         self.lamda = self.args.lamda
         self.num_rank = self.args.num_rank
         self.rng = np.random.RandomState(int(getattr(self.args, "seed", 0)) + 310000)
+        self.use_joint_epsilon_exploration = bool(getattr(
+            self.args,
+            "use_joint_epsilon_exploration",
+            False,
+        ))
+        self.pre_capture_visible_prey_quorum_guard = bool(getattr(
+            self.args,
+            "pre_capture_visible_prey_quorum_guard",
+            False,
+        ))
+        self.pre_capture_visible_prey_quorum_greedy_frontier_guard = bool(
+            getattr(
+                self.args,
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard",
+                False,
+            )
+        )
         if self.args.prev_act_inp:
             # this is only local information so the agent can act decentralized
             self.rnn_network_input_dim = self.obs_dim + self.act_dim
@@ -231,23 +288,16 @@ class R_SDDFGPolicy(MLPPolicy):
                                                      self.args.epsilon_anneal_time, decay="linear")
 
     def _sample_action_indices_np(self, available_actions, batch_size, act_dim):
-        if available_actions is None:
-            return self.rng.randint(0, int(act_dim), size=int(batch_size)).astype(np.int64)
-
         if torch.is_tensor(available_actions):
             aa = available_actions.detach().cpu().numpy()
         else:
-            aa = np.asarray(available_actions)
-
-        aa = aa.reshape(int(batch_size), int(act_dim))
-
-        out = np.zeros(int(batch_size), dtype=np.int64)
-        for b in range(int(batch_size)):
-            valid = np.flatnonzero(aa[b] > 0.5)
-            if valid.size == 0:
-                valid = np.arange(int(act_dim), dtype=np.int64)
-            out[b] = int(self.rng.choice(valid))
-        return out
+            aa = available_actions
+        return sample_action_indices(
+            self.rng,
+            aa,
+            batch_size,
+            act_dim,
+        )
 
     def _sample_onehot_np(self, available_actions, batch_size, act_dim):
         action_idx = self._sample_action_indices_np(available_actions, batch_size, act_dim)
@@ -614,12 +664,19 @@ class R_SDDFGPolicy(MLPPolicy):
         # import pdb;pdb.set_trace()
         return values_f
 
-    def greedy(self, adj, q_batch, idx_node_order, available_actions, num_edges, batch_size):
+    def greedy(self, adj, q_batch, idx_node_order, available_actions,
+               num_edges, batch_size, greedy_action_mask=None,
+               record_greedy_frontier_actions=True,
+               greedy_value_diagnostic_slot_mask=None):
         """ Finds the maximum Q-values and corresponding greedy actions for given utilities and payoffs.
             (Algorithm 3 in Boehmer et al., 2020)"""
         # All relevant tensors should be double to reduce accumulating precision loss
         # batch_size = 2
         # available_actions = available_actions.repeat(2,1,1)
+        # This diagnostic is rollout-only and must have exactly the lifetime
+        # of this greedy call.  Clearing it here also protects direct callers
+        # (including learner fixtures) from observing stale rollout data.
+        self.last_greedy_value_diagnostic = None
         lamda = self.lamda
         adj_f = torch.full([batch_size, self.num_factor, self.highest_orders], self.n_agents, dtype=torch.int64).to(
             self.device)
@@ -657,6 +714,12 @@ class R_SDDFGPolicy(MLPPolicy):
         best_f_value = torch.empty(batch_size, self.num_factor, 1, dtype=torch.float64).fill_(-float('inf')).to(
             **self.tpdv)
         best_actions = torch.empty(batch_size, self.n_agents, 1, dtype=torch.int64).to(self.device)  # [1,8,1]
+        best_message_utilities = torch.full(
+            (batch_size, self.n_agents, self.act_dim),
+            float("nan"),
+            dtype=best_value.dtype,
+            device=best_value.device,
+        )
         # Without edges (or iterations), CG would be the same as VDN: mean(f_i)
         utils_Q = best_value.new_zeros(batch_size, self.num_factor, self.act_dim, self.act_dim, self.act_dim).to(
             **self.tpdv)  # [1,5,5]
@@ -731,14 +794,285 @@ class R_SDDFGPolicy(MLPPolicy):
                         best_f_value[change] = f_value[change]
                     best_value[change] = value[change]
                     best_actions[change] = actions[change]
-                    # best_margin_value[change] = margin_value[change]
+                    best_message_utilities[change] = utils_a[change]
         # Return the greedy actions and the corresponding message output averaged across agents
         if not self.args.msg_anytime or num_edges == 0 or self.args.msg_iterations <= 0:
             _, best_actions = utils_a.max(dim=-1, keepdim=True)
-        return best_actions, best_value, None, best_f_value
+            best_message_utilities = utils_a
+        best_margin_value = _finite_message_action_margins(
+            best_message_utilities
+        )
+        unconstrained_actions = best_actions.clone()
+        if greedy_value_diagnostic_slot_mask is not None:
+            if int(batch_size) != 1:
+                raise RuntimeError(
+                    "frontier value-ranking diagnostics are rollout-only"
+                )
+            diagnostic_slots = np.asarray(
+                greedy_value_diagnostic_slot_mask, dtype=np.int64
+            ).reshape(-1)
+            if diagnostic_slots.size != self.n_agents:
+                raise RuntimeError(
+                    "frontier value-ranking diagnostic slot mask has the "
+                    "wrong width"
+                )
+            if np.any((diagnostic_slots != 0) & (diagnostic_slots != 1)):
+                raise RuntimeError(
+                    "frontier value-ranking diagnostic slot mask is not "
+                    "binary"
+                )
+            if greedy_action_mask is None and np.any(diagnostic_slots):
+                raise RuntimeError(
+                    "frontier value-ranking diagnostics require the exact "
+                    "frontier action mask"
+                )
+
+            if available_actions is None:
+                diagnostic_legal = torch.ones(
+                    (1, self.n_agents, self.act_dim),
+                    dtype=torch.bool,
+                    device=best_message_utilities.device,
+                )
+            else:
+                diagnostic_legal = available_actions > 0
+                if diagnostic_legal.dim() == 2:
+                    diagnostic_legal = diagnostic_legal.unsqueeze(0)
+                diagnostic_legal = diagnostic_legal.to(
+                    device=best_message_utilities.device,
+                    dtype=torch.bool,
+                )
+            expected_action_shape = (
+                1, int(self.n_agents), int(self.act_dim)
+            )
+            if tuple(diagnostic_legal.shape) != expected_action_shape:
+                raise RuntimeError(
+                    "frontier value-ranking action legality shape mismatch"
+                )
+
+            diagnostic_safe = torch.as_tensor(
+                greedy_action_mask,
+                dtype=torch.bool,
+                device=best_message_utilities.device,
+            )
+            if diagnostic_safe.dim() == 2:
+                diagnostic_safe = diagnostic_safe.unsqueeze(0)
+            if tuple(diagnostic_safe.shape) != expected_action_shape:
+                raise RuntimeError(
+                    "frontier value-ranking frontier-mask shape mismatch"
+                )
+            if torch.any(diagnostic_safe & ~diagnostic_legal):
+                raise RuntimeError(
+                    "frontier value-ranking mask enabled an unavailable action"
+                )
+
+            slot_ids = np.flatnonzero(diagnostic_slots).astype(np.int64)
+            diagnostic_legal_np = diagnostic_legal[
+                0
+            ].long().detach().cpu().numpy().astype(bool)
+            message_values = np.full(
+                (slot_ids.size, self.act_dim), np.nan, dtype=np.float64
+            )
+            coordinate_joint_values = np.full_like(
+                message_values, np.nan
+            )
+            coordinate_factor_values = np.full(
+                (slot_ids.size, self.act_dim, self.num_factor),
+                np.nan,
+                dtype=np.float64,
+            )
+            slot_index_tensor = torch.as_tensor(
+                slot_ids,
+                dtype=torch.long,
+                device=best_message_utilities.device,
+            )
+            for diagnostic_index, slot in enumerate(slot_ids.tolist()):
+                legal_action_ids = np.flatnonzero(
+                    diagnostic_legal_np[slot]
+                ).astype(np.int64)
+                if int(legal_action_ids.size) <= 0:
+                    raise RuntimeError(
+                        "frontier value-ranking slot has no legal action"
+                    )
+                legal_action_tensor = torch.as_tensor(
+                    legal_action_ids,
+                    dtype=torch.long,
+                    device=best_message_utilities.device,
+                )
+                legal_message_values = best_message_utilities[
+                    0, slot, legal_action_tensor
+                ]
+                if not torch.all(torch.isfinite(legal_message_values)):
+                    raise FloatingPointError(
+                        "frontier value-ranking message utility is non-finite"
+                    )
+                slot_coordinate_joint = []
+                slot_coordinate_factors = []
+                for action in legal_action_ids.tolist():
+                    counterfactual_actions = unconstrained_actions.clone()
+                    counterfactual_actions[0, slot, 0] = action
+                    coordinate_joint = self.q_values(
+                        in_q_batch,
+                        counterfactual_actions,
+                        idx_node_order,
+                        batch_size,
+                    ).reshape(-1)
+                    coordinate_factors = self.q_local_values(
+                        f_q,
+                        counterfactual_actions,
+                        idx_node_order,
+                    ).reshape(-1)
+                    if int(coordinate_joint.numel()) != 1:
+                        raise RuntimeError(
+                            "frontier coordinate joint-Q is not scalar"
+                        )
+                    if int(coordinate_factors.numel()) != int(
+                            self.num_factor):
+                        raise RuntimeError(
+                            "frontier coordinate factor-Q width mismatch"
+                        )
+                    if not torch.all(torch.isfinite(coordinate_joint)):
+                        raise FloatingPointError(
+                            "frontier coordinate joint-Q is non-finite"
+                        )
+                    if not torch.all(torch.isfinite(coordinate_factors)):
+                        raise FloatingPointError(
+                            "frontier coordinate factor-Q is non-finite"
+                        )
+                    slot_coordinate_joint.append(coordinate_joint[0])
+                    slot_coordinate_factors.append(coordinate_factors)
+                message_values[
+                    diagnostic_index, legal_action_ids
+                ] = legal_message_values.detach().cpu().numpy()
+                coordinate_joint_values[
+                    diagnostic_index, legal_action_ids
+                ] = torch.stack(
+                    slot_coordinate_joint, dim=0
+                ).detach().cpu().numpy()
+                coordinate_factor_values[
+                    diagnostic_index, legal_action_ids
+                ] = torch.stack(
+                    slot_coordinate_factors, dim=0
+                ).detach().cpu().numpy()
+
+            self.last_greedy_value_diagnostic = {
+                "schema_version": 1,
+                "sampled": 1,
+                "slot_ids": slot_ids.tolist(),
+                "action_dim": int(self.act_dim),
+                "factor_count": int(self.num_factor),
+                "legal_action_mask": diagnostic_legal[
+                    0, slot_index_tensor
+                ].long().detach().cpu().numpy().tolist(),
+                "frontier_action_mask": diagnostic_safe[
+                    0, slot_index_tensor
+                ].long().detach().cpu().numpy().tolist(),
+                "message_action_utilities": message_values.tolist(),
+                "coordinate_joint_q_values": (
+                    coordinate_joint_values.tolist()
+                ),
+                "coordinate_factor_q_values": (
+                    coordinate_factor_values.tolist()
+                ),
+            }
+        if greedy_action_mask is not None:
+            safe_mask = torch.as_tensor(
+                greedy_action_mask,
+                dtype=torch.bool,
+                device=best_message_utilities.device,
+            )
+            if safe_mask.dim() == 2:
+                safe_mask = safe_mask.unsqueeze(0)
+            expected_shape = (
+                int(batch_size), int(self.n_agents), int(self.act_dim)
+            )
+            if tuple(safe_mask.shape) != expected_shape:
+                raise RuntimeError(
+                    "greedy frontier action mask shape mismatch: got {}, "
+                    "expected {}".format(
+                        tuple(safe_mask.shape), expected_shape
+                    )
+                )
+            if torch.any(torch.sum(safe_mask.long(), dim=-1) <= 0):
+                raise RuntimeError(
+                    "greedy frontier action mask removed every action"
+                )
+            safe_utilities = best_message_utilities.masked_fill(
+                ~safe_mask,
+                -float("inf"),
+            )
+            if torch.any(~torch.isfinite(
+                    torch.max(safe_utilities, dim=-1)[0]
+            )):
+                raise RuntimeError(
+                    "greedy frontier action mask has no finite utility"
+                )
+            best_actions = torch.max(
+                safe_utilities, dim=-1, keepdim=True
+            )[1]
+            if torch.any(best_actions != unconstrained_actions):
+                best_value = self.q_values(
+                    in_q_batch,
+                    best_actions,
+                    idx_node_order,
+                    batch_size,
+                )
+                if batch_size == 1:
+                    best_f_value = self.q_local_values(
+                        f_q, best_actions, idx_node_order
+                    )
+        if greedy_action_mask is not None:
+            changed = (
+                best_actions != unconstrained_actions
+            ).reshape(int(batch_size), int(self.n_agents), -1).any(dim=-1)
+            self.last_greedy_frontier_batch_diagnostic = {
+                "state_count": int(batch_size),
+                "reranked_state_count": int(
+                    changed.any(dim=1).long().sum().detach().cpu().item()
+                ),
+                "reranked_slot_count": int(
+                    changed.long().sum().detach().cpu().item()
+                ),
+            }
+            if record_greedy_frontier_actions:
+                self.last_greedy_frontier_diagnostic = {
+                    "unconstrained_actions": to_numpy(
+                        unconstrained_actions
+                    ).reshape(-1).astype(np.int64).tolist(),
+                    "constrained_actions": to_numpy(
+                        best_actions
+                    ).reshape(-1).astype(np.int64).tolist(),
+                }
+            else:
+                self.last_greedy_frontier_diagnostic = None
+        else:
+            # This policy instance is shared by rollout diagnostics and
+            # learner/Q-target calls.  A later unmasked batch must not inherit
+            # the preceding rollout's frontier diagnostic: apart from being
+            # semantically false, that stale six-slot record can make the
+            # batched path look as though a rollout-only mask escaped into
+            # training.  Keep the diagnostic lifetime identical to the mask
+            # application lifetime, even when greedy() is called directly.
+            self.last_greedy_frontier_diagnostic = None
+            self.last_greedy_frontier_batch_diagnostic = None
+        return best_actions, best_value, best_margin_value, best_f_value
 
     def get_actions(self, obs_batch, rnn_q_states_batch, available_actions=None, t_env=None, explore=False,
-                    adj_input=None, no_sequence=False, dones=None):
+                    adj_input=None, no_sequence=False, dones=None,
+                    post_capture_joint_greedy_floor=0.0,
+                    post_capture_explore_max_random_agents=0,
+                    pre_capture_visible_prey_mask=None,
+                    pre_capture_visible_prey_offsets=None,
+                    pre_capture_visibility_radius=0,
+                    pre_capture_prey_max_step=1,
+                    apply_pre_capture_visible_prey_quorum_greedy_frontier_guard=False,
+                    precomputed_greedy_frontier_action_mask=None):
+        # This is consumed by the Wolfpack runner immediately after this call.
+        # It records already-computed exploration decisions only: no extra RNG
+        # draws and no additional policy forward are allowed in this diagnostic.
+        self.last_action_exploration_diagnostic = None
+        self.last_greedy_frontier_diagnostic = None
+        self.last_greedy_frontier_batch_diagnostic = None
+        self.last_greedy_value_diagnostic = None
         if len(obs_batch.shape) == 3:
             batch_size = obs_batch.shape[0]
         else:
@@ -747,21 +1081,352 @@ class R_SDDFGPolicy(MLPPolicy):
         q_batch, idx_node_order, adj, num_edges = self.get_rnn_batch(to_torch(obs_batch).to(**self.tpdv),
                                                                      rnn_q_states_batch.to(**self.tpdv), adj_input,
                                                                      batch_size, no_sequence, dones)
-        actions, best_value, best_margin_value, best_f_value = self.greedy(adj, q_batch, idx_node_order,
-                                                                           available_actions, num_edges, batch_size)
+        greedy_action_mask = None
+        frontier_eligible = np.zeros(self.n_agents, dtype=np.int64)
+        frontier_constrained = np.zeros(self.n_agents, dtype=np.int64)
+        frontier_conflicts = np.zeros(self.n_agents, dtype=np.int64)
+        frontier_configured = bool(getattr(
+            self,
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard",
+            False,
+        ))
+        frontier_enabled = bool(
+            apply_pre_capture_visible_prey_quorum_greedy_frontier_guard
+        )
+        target_frontier_enabled = (
+            precomputed_greedy_frontier_action_mask is not None
+        )
+        if frontier_enabled and target_frontier_enabled:
+            raise RuntimeError(
+                "rollout and replay-target frontier masks are mutually "
+                "exclusive"
+            )
+        if target_frontier_enabled:
+            if not frontier_configured:
+                raise RuntimeError(
+                    "replay-target frontier mask requires the configured "
+                    "production frontier policy"
+                )
+            if explore:
+                raise RuntimeError(
+                    "replay-target frontier mask cannot drive exploration"
+                )
+            target_mask = np.asarray(
+                precomputed_greedy_frontier_action_mask
+            )
+            expected_target_shape = (
+                int(batch_size), int(self.n_agents), int(self.act_dim)
+            )
+            if target_mask.shape != expected_target_shape:
+                raise RuntimeError(
+                    "replay-target frontier mask shape is {}, expected {}"
+                    .format(target_mask.shape, expected_target_shape)
+                )
+            if not np.isin(target_mask, (0, 1, False, True)).all():
+                raise RuntimeError(
+                    "replay-target frontier mask must be binary"
+                )
+            if np.any(target_mask.sum(axis=2) <= 0):
+                raise RuntimeError(
+                    "replay-target frontier mask removed every action"
+                )
+            if available_actions is not None:
+                if torch.is_tensor(available_actions):
+                    target_available = (
+                        available_actions.detach().cpu().numpy()
+                    )
+                else:
+                    target_available = np.asarray(available_actions)
+                target_available = target_available.reshape(
+                    expected_target_shape
+                )
+                if np.any(
+                        (target_mask > 0)
+                        & ~(target_available > 0.5)):
+                    raise RuntimeError(
+                        "replay-target frontier mask enabled an unavailable "
+                        "action"
+                    )
+            greedy_action_mask = target_mask.astype(np.int64, copy=False)
+        if frontier_enabled and not frontier_configured:
+            raise RuntimeError(
+                "pre-capture greedy frontier guard was requested by the "
+                "caller but is disabled in the policy contract"
+            )
+        if frontier_enabled and post_capture_joint_greedy_floor > 0.0:
+            raise RuntimeError(
+                "pre-capture greedy frontier guard cannot run in the "
+                "post-capture lifecycle"
+            )
+        if frontier_enabled and int(batch_size) != 1:
+            raise RuntimeError(
+                "pre-capture greedy frontier guard requires one rollout "
+                "environment per policy call"
+            )
+        if frontier_enabled:
+            if (
+                    pre_capture_visible_prey_mask is None
+                    or pre_capture_visible_prey_offsets is None):
+                raise RuntimeError(
+                    "enabled pre-capture greedy frontier guard requires "
+                    "local-observation prey geometry"
+                )
+            if available_actions is None:
+                available_np = np.ones(
+                    (self.n_agents, self.act_dim), dtype=np.float32
+                )
+            elif torch.is_tensor(available_actions):
+                available_np = available_actions.detach().cpu().numpy().reshape(
+                    self.n_agents, self.act_dim
+                )
+            else:
+                available_np = np.asarray(available_actions).reshape(
+                    self.n_agents, self.act_dim
+                )
+            if dones is None:
+                frontier_alive = np.ones(self.n_agents, dtype=bool)
+            elif torch.is_tensor(dones):
+                frontier_alive = ~dones.detach().cpu().numpy().reshape(
+                    self.n_agents
+                ).astype(bool)
+            else:
+                frontier_alive = ~np.asarray(dones).reshape(
+                    self.n_agents
+                ).astype(bool)
+            (
+                greedy_action_mask,
+                frontier_eligible,
+                frontier_constrained,
+                frontier_conflicts,
+            ) = build_exact_visible_prey_quorum_frontier_action_mask(
+                alive_mask=frontier_alive,
+                visible_prey_mask=pre_capture_visible_prey_mask,
+                visible_prey_offsets=pre_capture_visible_prey_offsets,
+                available_actions=available_np,
+                sight_radius=int(pre_capture_visibility_radius),
+                prey_max_step=int(pre_capture_prey_max_step),
+                capture_quorum=2,
+            )
+        actions, best_value, best_margin_value, best_f_value = self.greedy(
+            adj,
+            q_batch,
+            idx_node_order,
+            available_actions,
+            num_edges,
+            batch_size,
+            greedy_action_mask=greedy_action_mask,
+            record_greedy_frontier_actions=(
+                int(batch_size) == 1 and not target_frontier_enabled
+            ),
+            greedy_value_diagnostic_slot_mask=(
+                frontier_eligible
+                if (
+                    explore
+                    and int(batch_size) == 1
+                    and not target_frontier_enabled
+                    and frontier_enabled
+                    and t_env is not None
+                    and int(t_env) % 8 == 0
+                ) else None
+            ),
+        )
+
+        if int(batch_size) == 1 and not target_frontier_enabled:
+            frontier_diag = self.last_greedy_frontier_diagnostic or {}
+            unconstrained_greedy_actions = np.asarray(
+                frontier_diag.get(
+                    "unconstrained_actions", to_numpy(actions)
+                ),
+                dtype=np.int64,
+            ).reshape(-1)
+            constrained_greedy_actions = np.asarray(
+                frontier_diag.get(
+                    "constrained_actions", to_numpy(actions)
+                ),
+                dtype=np.int64,
+            ).reshape(-1)
+            if (
+                    unconstrained_greedy_actions.size != self.n_agents
+                    or constrained_greedy_actions.size != self.n_agents):
+                raise RuntimeError(
+                    "greedy frontier diagnostic action count does not "
+                    "match the rollout policy slots"
+                )
+            frontier_reranked = np.flatnonzero(
+                unconstrained_greedy_actions
+                != constrained_greedy_actions
+            ).astype(np.int64)
+            invalid_frontier_reranks = frontier_reranked[
+                ~frontier_constrained[frontier_reranked].astype(bool)
+            ]
+            if invalid_frontier_reranks.size > 0:
+                raise RuntimeError(
+                    "greedy frontier guard reranked an unconstrained slot"
+                )
+        else:
+            if frontier_enabled or self.last_greedy_frontier_diagnostic:
+                raise RuntimeError(
+                    "greedy frontier diagnostics escaped into a learner "
+                    "batch"
+                )
+            if target_frontier_enabled:
+                batch_diagnostic = getattr(
+                    self, "last_greedy_frontier_batch_diagnostic", None
+                )
+                if not isinstance(batch_diagnostic, dict):
+                    raise RuntimeError(
+                        "replay-target frontier selection lost its batch "
+                        "diagnostic"
+                    )
+                if int(batch_diagnostic.get("state_count", -1)) != int(
+                        batch_size):
+                    raise RuntimeError(
+                        "replay-target frontier diagnostic state count "
+                        "mismatch"
+                    )
+            elif self.last_greedy_frontier_batch_diagnostic is not None:
+                raise RuntimeError(
+                    "frontier batch diagnostic escaped an unmasked learner "
+                    "call"
+                )
+            # Learner/Q-target calls return the original batched tensor and
+            # must not synchronize thousands of actions back to CPU merely
+            # for rollout-only diagnostics.
+            unconstrained_greedy_actions = None
+            constrained_greedy_actions = None
+            frontier_reranked = np.empty(0, dtype=np.int64)
+
+        if (
+                explore
+                and self.use_joint_epsilon_exploration
+                and int(batch_size) != 1):
+            raise RuntimeError(
+                "joint epsilon action execution requires one rollout "
+                "environment per policy call"
+            )
 
         actions = actions.squeeze()
         # mask the available actions by giving -inf q values to unavailable actions
+        joint_take_random = None
+        base_epsilon = float(self.exploration.eval(t_env)) if explore else 0.0
+        post_capture_joint_greedy_floor = float(
+            post_capture_joint_greedy_floor
+        )
+        if not np.isfinite(post_capture_joint_greedy_floor) or not (
+                0.0 <= post_capture_joint_greedy_floor < 1.0):
+            raise ValueError(
+                "post-capture joint greedy floor must be finite in [0, 1)"
+            )
+        epsilon = min(
+            base_epsilon,
+            1.0 - post_capture_joint_greedy_floor,
+        )
+        if explore and self.use_joint_epsilon_exploration:
+            joint_take_random = epsilon_random_mask(
+                self.rng,
+                epsilon,
+                self.n_agents,
+                joint_decision=True,
+            )
+        post_capture_explore_max_random_agents = int(
+            post_capture_explore_max_random_agents
+        )
+        if post_capture_explore_max_random_agents < 0:
+            raise ValueError(
+                "post-capture explore max random agents must be non-negative"
+            )
+        effective_joint_take_random = joint_take_random
+        joint_explore = None
+        pre_capture_quorum_guard_applied = False
+        pre_capture_quorum_protected = np.zeros(
+            self.n_agents, dtype=np.int64
+        )
+        if joint_take_random is not None:
+            joint_take_random_arr = np.asarray(
+                joint_take_random, dtype=np.int64
+            ).reshape(self.n_agents)
+            if not np.all(
+                    joint_take_random_arr == joint_take_random_arr[0]):
+                raise RuntimeError(
+                    "joint epsilon exploration drew more than one branch "
+                    "flag for a joint decision"
+                )
+            joint_explore = bool(joint_take_random_arr[0])
+            if (
+                    joint_explore
+                    and post_capture_joint_greedy_floor > 0.0
+                    and post_capture_explore_max_random_agents > 0):
+                if dones is None:
+                    alive_mask = np.ones(self.n_agents, dtype=bool)
+                elif torch.is_tensor(dones):
+                    alive_mask = ~dones.detach().cpu().numpy().reshape(
+                        self.n_agents
+                    ).astype(bool)
+                else:
+                    alive_mask = ~np.asarray(dones).reshape(
+                        self.n_agents
+                    ).astype(bool)
+                effective_joint_take_random = (
+                    bound_joint_random_replacements(
+                        self.rng,
+                        joint_take_random_arr,
+                        alive_mask,
+                        post_capture_explore_max_random_agents,
+                    )
+                )
+            elif (
+                    post_capture_joint_greedy_floor <= 0.0
+                    and bool(getattr(
+                        self,
+                        "pre_capture_visible_prey_quorum_guard",
+                        False,
+                    ))):
+                if pre_capture_visible_prey_mask is None:
+                    raise RuntimeError(
+                        "enabled pre-capture visible-prey quorum guard "
+                        "requires local-observation visibility"
+                    )
+                if dones is None:
+                    alive_mask = np.ones(self.n_agents, dtype=bool)
+                elif torch.is_tensor(dones):
+                    alive_mask = ~dones.detach().cpu().numpy().reshape(
+                        self.n_agents
+                    ).astype(bool)
+                else:
+                    alive_mask = ~np.asarray(dones).reshape(
+                        self.n_agents
+                    ).astype(bool)
+                (
+                    effective_joint_take_random,
+                    pre_capture_quorum_protected,
+                ) = protect_exact_visible_prey_quorum_random_replacements(
+                    joint_random_mask=joint_take_random_arr,
+                    alive_mask=alive_mask,
+                    visible_prey_mask=pre_capture_visible_prey_mask,
+                    capture_quorum=2,
+                )
+                pre_capture_quorum_guard_applied = bool(
+                    joint_explore
+                    and np.any(pre_capture_quorum_protected)
+                )
         if self.multidiscrete:
             onehot_actions = []
             for i in range(len(self.act_dim)):
                 greedy_action = actions[i]
                 if explore:
-                    eps = self.exploration.eval(t_env)
-                    rand_number = self.rng.rand(self.n_agents)
+                    eps = epsilon
+                    take_random = (
+                        effective_joint_take_random
+                        if joint_take_random is not None
+                        else epsilon_random_mask(
+                            self.rng,
+                            eps,
+                            self.n_agents,
+                            joint_decision=False,
+                        )
+                    )
                     # random actions sample uniformly from action space
                     random_action = self.rng.randint(0, self.act_dim[i], size=self.n_agents)
-                    take_random = (rand_number < eps).astype(int)
                     action = (1 - take_random) * to_numpy(greedy_action) + take_random * random_action
                     onehot_action = make_onehot(action, self.act_dim[i])
                 else:
@@ -774,21 +1439,198 @@ class R_SDDFGPolicy(MLPPolicy):
 
         else:
             if explore:
-                eps = self.exploration.eval(t_env)
-                rand_numbers = self.rng.rand(self.n_agents)
+                eps = epsilon
+                take_random = (
+                    effective_joint_take_random
+                    if joint_take_random is not None
+                    else epsilon_random_mask(
+                        self.rng,
+                        eps,
+                        self.n_agents,
+                        joint_decision=False,
+                    )
+                )
+                greedy_actions = to_numpy(actions) if torch.is_tensor(actions) else np.asarray(actions)
+                greedy_actions = greedy_actions.reshape(self.n_agents).astype(np.int64)
+
                 random_actions = self._sample_action_indices_np(
                     available_actions,
                     self.n_agents,
                     self.act_dim
                 )
-
-                take_random = (rand_numbers < eps).astype(np.int64)
-
-                greedy_actions = to_numpy(actions) if torch.is_tensor(actions) else np.asarray(actions)
-                greedy_actions = greedy_actions.reshape(self.n_agents).astype(np.int64)
-
                 actions = (1 - take_random) * greedy_actions + take_random * random_actions
                 onehot_actions = make_onehot(actions, self.act_dim)
+
+                if joint_take_random is not None:
+                    take_random_arr = np.asarray(take_random, dtype=np.int64).reshape(
+                        self.n_agents
+                    )
+
+                    selected_actions = np.asarray(actions, dtype=np.int64).reshape(
+                        self.n_agents
+                    )
+                    if available_actions is None:
+                        available_np = np.ones(
+                            (self.n_agents, self.act_dim), dtype=np.float32
+                        )
+                    elif torch.is_tensor(available_actions):
+                        available_np = (
+                            available_actions.detach().cpu().numpy().reshape(
+                                self.n_agents, self.act_dim
+                            )
+                        )
+                    else:
+                        available_np = np.asarray(available_actions).reshape(
+                            self.n_agents, self.act_dim
+                        )
+
+                    legal_selected = available_np[
+                        np.arange(self.n_agents), selected_actions
+                    ] > 0.5
+                    if dones is None:
+                        dead_slots = np.zeros(self.n_agents, dtype=bool)
+                    elif torch.is_tensor(dones):
+                        dead_slots = dones.detach().cpu().numpy().reshape(
+                            self.n_agents
+                        ).astype(bool)
+                    else:
+                        dead_slots = np.asarray(dones).reshape(
+                            self.n_agents
+                        ).astype(bool)
+                    dead_expected_actions = np.argmax(available_np, axis=1)
+                    dead_slot_violations = dead_slots & (
+                        selected_actions != dead_expected_actions
+                    )
+                    alive_slots = ~dead_slots
+                    alive_selected_actions = selected_actions[alive_slots]
+                    action_histogram = np.bincount(
+                        alive_selected_actions,
+                        minlength=self.act_dim,
+                    ).astype(np.int64)
+                    final_equals_greedy = bool(
+                        np.array_equal(selected_actions, greedy_actions)
+                    )
+                    self.last_action_exploration_diagnostic = {
+                        "schema_version": 4,
+                        "frontier_value_ranking_diagnostic": (
+                            self.last_greedy_value_diagnostic
+                            if self.last_greedy_value_diagnostic is not None
+                            else {
+                                "schema_version": 1,
+                                "sampled": 0,
+                                "slot_ids": [],
+                                "action_dim": int(self.act_dim),
+                                # Lightweight policy-path fixtures deliberately
+                                # bypass __init__ and therefore have no factor
+                                # graph.  An unsampled value diagnostic carries
+                                # no factor-shaped payload, so zero is the only
+                                # truthful width for that path.  Fully
+                                # initialized production policies still expose
+                                # their exact factor width here; sampled records
+                                # continue to require self.num_factor in
+                                # greedy() and are validated strictly by the
+                                # Wolfpack runner.
+                                "factor_count": int(getattr(
+                                    self, "num_factor", 0
+                                )),
+                                "legal_action_mask": [],
+                                "frontier_action_mask": [],
+                                "message_action_utilities": [],
+                                "coordinate_joint_q_values": [],
+                                "coordinate_factor_q_values": [],
+                            }
+                        ),
+                        "batch_size": int(batch_size),
+                        "joint_explore": int(joint_explore),
+                        "epsilon": float(eps),
+                        "base_epsilon": float(base_epsilon),
+                        "post_capture_joint_greedy_floor": float(
+                            post_capture_joint_greedy_floor
+                        ),
+                        "post_capture_greedy_floor_applied": int(
+                            epsilon < base_epsilon
+                        ),
+                        "post_capture_explore_max_random_agents": int(
+                            post_capture_explore_max_random_agents
+                        ),
+                        "post_capture_explore_bounded_applied": int(
+                            bool(joint_explore)
+                            and post_capture_joint_greedy_floor > 0.0
+                            and post_capture_explore_max_random_agents > 0
+                        ),
+                        "pre_capture_visible_prey_quorum_guard_enabled": int(
+                            bool(getattr(
+                                self,
+                                "pre_capture_visible_prey_quorum_guard",
+                                False,
+                            ))
+                        ),
+                        "pre_capture_visible_prey_quorum_greedy_frontier_guard_enabled": int(
+                            frontier_enabled
+                        ),
+                        "pre_capture_visible_prey_quorum_greedy_frontier_guard_eligible_slots": (
+                            np.flatnonzero(frontier_eligible).astype(
+                                np.int64
+                            ).tolist()
+                        ),
+                        "pre_capture_visible_prey_quorum_greedy_frontier_guard_constrained_slots": (
+                            np.flatnonzero(frontier_constrained).astype(
+                                np.int64
+                            ).tolist()
+                        ),
+                        "pre_capture_visible_prey_quorum_greedy_frontier_guard_conflict_slots": (
+                            np.flatnonzero(frontier_conflicts).astype(
+                                np.int64
+                            ).tolist()
+                        ),
+                        "pre_capture_visible_prey_quorum_greedy_frontier_guard_reranked_slots": (
+                            frontier_reranked.tolist()
+                        ),
+                        "pre_capture_visible_prey_quorum_greedy_frontier_guard_applied": int(
+                            frontier_reranked.size > 0
+                        ),
+                        "unconstrained_greedy_actions": (
+                            unconstrained_greedy_actions.tolist()
+                        ),
+                        "pre_capture_visible_prey_quorum_guard_applied": int(
+                            pre_capture_quorum_guard_applied
+                        ),
+                        "pre_capture_visible_prey_quorum_protected_slots": (
+                            np.flatnonzero(
+                                pre_capture_quorum_protected
+                            ).astype(np.int64).tolist()
+                        ),
+                        "random_replacement_slot_count": int(
+                            np.count_nonzero(take_random_arr & alive_slots)
+                        ),
+                        "random_replacement_slots": np.flatnonzero(
+                            take_random_arr & alive_slots
+                        ).astype(np.int64).tolist(),
+                        "final_equals_greedy": int(final_equals_greedy),
+                        "non_explore_greedy_mismatch": int(
+                            (not joint_explore) and (not final_equals_greedy)
+                        ),
+                        "explore_final_equals_greedy": int(
+                            joint_explore and final_equals_greedy
+                        ),
+                        "invalid_available_action_count": int(
+                            np.count_nonzero(~legal_selected)
+                        ),
+                        "dead_slot_count": int(
+                            np.count_nonzero(dead_slots)
+                        ),
+                        "dead_slot_non_stay_violation_count": int(
+                            np.count_nonzero(dead_slot_violations)
+                        ),
+                        "alive_slot_count": int(np.count_nonzero(alive_slots)),
+                        "unique_alive_action_count": int(
+                            np.unique(alive_selected_actions).size
+                            if alive_selected_actions.size > 0 else 0
+                        ),
+                        "action_histogram": action_histogram.tolist(),
+                        "greedy_actions": greedy_actions.tolist(),
+                        "selected_actions": selected_actions.tolist(),
+                    }
             else:
                 onehot_actions = make_onehot(actions, self.act_dim)
 

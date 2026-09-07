@@ -132,6 +132,40 @@ def get_config():
                         help="Number of buffer transitions to train on at once")
     parser.add_argument('--gamma', type=float, default=0.99,
                         help="Discount factor for env")
+    parser.add_argument(
+        '--q_n_step',
+        type=int,
+        default=1,
+        help=(
+            "Terminal-gated finite-horizon TD return used by SDDFG recurrent "
+            "Q learning. Values above 1 apply the full return only to "
+            "transitions whose reachable window contains a real terminal-win "
+            "marker; all other transitions retain exact one-step TD. The "
+            "default 1 preserves historical one-step behavior."
+        ),
+    )
+    parser.add_argument(
+        '--q_terminal_replay_lane',
+        action='store_true',
+        default=False,
+        help=(
+            "For SDDFG terminal-gated Q learning, preserve every uniform "
+            "batch and, once per train interval, append one terminal-win "
+            "episode only when the uniform draw missed all such episodes. "
+            "Only its terminal-gated transitions contribute to the loss."
+        ),
+    )
+    parser.add_argument(
+        '--q_terminal_replay_loss_weight',
+        type=float,
+        default=0.10,
+        help=(
+            "Per-transition optimizer weight for the appended terminal-"
+            "credit replay lane. Uniform replay, including natural terminal "
+            "samples, remains weight 1.0. The formal 0.10 default is the "
+            "run159 regression fix for repeated high-error auxiliary MSE."
+        ),
+    )
     parser.add_argument("--gae_lambda", type=float, default=0.95,
                         help='gae lambda parameter (default: 0.95)')
     parser.add_argument("--use_max_grad_norm",
@@ -1322,6 +1356,56 @@ def get_config():
                         help="Ending value for epsilon, for eps-greedy exploration")
     parser.add_argument('--epsilon_anneal_time', type=int, default=1000000,
                         help="Number of episodes until epsilon reaches epsilon_finish")
+    parser.add_argument(
+        '--use_joint_epsilon_exploration',
+        action='store_true',
+        default=False,
+        help=(
+            "Apply epsilon once per coordinated joint decision instead of "
+            "independently replacing each agent after the joint solver."
+        ),
+    )
+    parser.add_argument(
+        '--post_capture_joint_greedy_floor',
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum full-greedy joint-branch probability while at least one "
+            "prey is frozen and another prey remains active. Zero disables "
+            "the post-capture override."
+        ),
+    )
+    parser.add_argument(
+        '--post_capture_explore_max_random_agents',
+        type=int,
+        default=0,
+        help=(
+            "Maximum alive-agent random replacements on a post-capture joint "
+            "explore branch. Zero preserves legacy all-alive replacement."
+        ),
+    )
+    parser.add_argument(
+        '--pre_capture_visible_prey_quorum_guard',
+        action='store_true',
+        default=False,
+        help=(
+            "On a pre-capture joint-explore branch, keep the greedy actions "
+            "of agents whose current local observations form an exact "
+            "two-wolf prey quorum. Other alive slots retain their sampled "
+            "random actions."
+        ),
+    )
+    parser.add_argument(
+        '--pre_capture_visible_prey_quorum_greedy_frontier_guard',
+        action='store_true',
+        default=False,
+        help=(
+            "Before the first capture, rerank only locally observed "
+            "exact-quorum frontier slots over actions that maximize robust "
+            "one-step prey visibility. The rerank uses existing max-sum "
+            "utilities and consumes no RNG."
+        ),
+    )
     parser.add_argument('--adj_anneal_time', type=int, default=500000,
                         help="Number of episodes until epsilon reaches epsilon_finish")
     parser.add_argument('--disount_step', type=int, default=500000,

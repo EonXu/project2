@@ -304,8 +304,17 @@ class R_DDFG:
         train_info['policy_grad_norm'] = _to_float(grad_norm)
         return train_info, new_priorities, idxes
 
-    def train_adj_on_batch(self, batch, use_adj_init, use_same_share_obs=None):
+    def train_adj_on_batch(
+            self,
+            batch,
+            use_adj_init,
+            use_same_share_obs=None,
+            adj_update_round=None):
         """See parent class."""
+
+        # DDFG has no candidate lifecycle; accept the runner's update-round
+        # identity solely to keep the shared training entrypoint compatible.
+        del adj_update_round
 
         if len(batch) >= 20:
             obs_batch, share_obs_batch, dones_batch, \

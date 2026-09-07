@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils.pair_credit import (
     compute_capture_anchored_pair_credit,
+    compute_outcome_conditioned_pair_credit,
     compute_capture_to_win_outcome_gate,
     compute_capture_to_win_triplet_outcome_advantage,
     scale_capture_to_win_outcome_credit,
@@ -96,6 +97,12 @@ def _pair_credit(adj, rewards, captures, dones):
         current_adj=adj,
         valid_factor=valid_factor,
         factor_size=factor_size,
+        active_agent_count=np.full(captures.shape, 4, dtype=np.int64),
+        selected_factor_behavior_probability=np.where(
+            valid_factor,
+            np.float32(0.5),
+            np.float32(0.0),
+        ),
         capture_counts=captures,
         capture_factor_match=(
             (factor_size == 3).astype(np.float32)
@@ -218,6 +225,54 @@ def test_episode_outcome_is_normalized_across_all_capture_triplets():
     assert np.isclose(np.abs(advantage[:, 1, :]).sum(), 0.5)
 
 
+def test_pair_credit_is_outcome_centered_and_episode_normalized():
+    score = np.zeros((3, 2, 3), dtype=np.float32)
+    # Successful episode: five strict-future pair labels with uneven scores.
+    score[0, 0, 0:3] = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    score[2, 0, 0:2] = np.array([4.0, 5.0], dtype=np.float32)
+    # Failed episode: one eligible label. Each episode must still contribute
+    # one centered terminal-outcome label rather than one label per factor.
+    score[1, 1, 2] = 2.0
+    result = compute_outcome_conditioned_pair_credit(
+        pair_transition_score=score,
+        episode_success=np.array([1, 0], dtype=bool),
+    )
+    credit = result["credit"]
+    assert np.isclose(credit[:, 0, :].sum(), 0.5)
+    assert np.isclose(credit[:, 1, :].sum(), -0.5)
+    assert np.isclose(credit.sum(), 0.0)
+    assert np.all(credit[score == 0.0] == 0.0)
+    assert result["evidence_episode_count"] == 2
+
+
+def test_pair_credit_single_outcome_class_is_zero():
+    score = np.zeros((2, 3, 2), dtype=np.float32)
+    score[0, :, 0] = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    for episode_success in (
+            np.zeros(3, dtype=bool),
+            np.ones(3, dtype=bool)):
+        result = compute_outcome_conditioned_pair_credit(
+            pair_transition_score=score,
+            episode_success=episode_success,
+        )
+        assert np.count_nonzero(result["credit"]) == 0
+        assert result["centered_sum"] == 0.0
+
+
+def test_pair_credit_rejects_invalid_support_scores():
+    score = np.zeros((2, 2, 2), dtype=np.float32)
+    score[0, 0, 0] = -1.0
+    try:
+        compute_outcome_conditioned_pair_credit(
+            pair_transition_score=score,
+            episode_success=np.array([1, 0], dtype=bool),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("negative pair evidence must fail loudly")
+
+
 def main():
     tests = [
         test_success_and_failure_capture_episodes_are_centered,
@@ -229,6 +284,9 @@ def main():
         test_signed_log_denominators_use_capture_triplets_only,
         test_signed_credit_scaling_preserves_failed_capture_branch,
         test_episode_outcome_is_normalized_across_all_capture_triplets,
+        test_pair_credit_is_outcome_centered_and_episode_normalized,
+        test_pair_credit_single_outcome_class_is_zero,
+        test_pair_credit_rejects_invalid_support_scores,
     ]
     for test in tests:
         test()

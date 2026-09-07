@@ -1,4 +1,6 @@
 import os, sys
+import hashlib
+import json
 os.environ.setdefault("PYTHONHASHSEED", "0")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -20,9 +22,35 @@ import torch
 from config import get_config
 from utils.util import get_cent_act_dim, get_dim_from_space
 from runner.wolfpack_runner import WolfpackRunner as Runner
+from runner import base_runner as base_runner_module
+from utils.wolfpack_reward import (
+    WOLFPACK_DISTANCE_SHAPING_SCALE,
+    WOLFPACK_LEGACY_DISTANCE_MODE,
+    WOLFPACK_MULTI_PREY_COVERAGE_MODE,
+    WOLFPACK_REWARD_SHAPING_CONTRACT_VERSION,
+)
 
 import envs.Wolfpack
 from envs.env_wrappers import ShareDummyVecEnv, ShareSubprocVecEnv
+
+
+_EXPECTED_PAIR_EXACT_SCORE_RECORDING_CONTRACT_VERSION = 2
+
+
+def _validate_pair_exact_score_recording_contract():
+    actual = getattr(
+        base_runner_module,
+        "PAIR_EXACT_SCORE_RECORDING_CONTRACT_VERSION",
+        None,
+    )
+    expected = _EXPECTED_PAIR_EXACT_SCORE_RECORDING_CONTRACT_VERSION
+    if actual != expected:
+        raise RuntimeError(
+            "stale runner/base_runner.py exact-score recording contract: "
+            "expected={}, actual={}; synchronize runner/base_runner.py and "
+            "scripts/debug_pair_optimizer_transaction_diagnostics.py before "
+            "starting training".format(expected, actual)
+        )
 
 def set_global_seeds(seed: int, cuda_deterministic: bool = True):
     seed = int(seed)
@@ -85,6 +113,206 @@ def get_run_csv_path(run_dir, filename):
 
     return os.path.join(run_dir, filename)
 
+
+def persist_source_manifest(run_dir, all_args):
+    """Copy and verify the launch-time per-file source manifest."""
+    source_path = os.environ.get("SDDFG_SOURCE_MANIFEST_PATH", "")
+    expected_sha256 = os.environ.get(
+        "SDDFG_SOURCE_MANIFEST_SHA256",
+        "",
+    )
+    all_args.source_manifest_sha256 = expected_sha256 or "unavailable"
+    all_args.source_manifest_file = "unavailable"
+    if not source_path:
+        return
+    if not os.path.isfile(source_path):
+        raise RuntimeError(
+            "declared SDDFG source manifest does not exist: {}".format(
+                source_path
+            )
+        )
+    with open(source_path, "rb") as manifest_file:
+        manifest_bytes = manifest_file.read()
+    actual_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if expected_sha256 and actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            "SDDFG source manifest hash changed between launch and run setup"
+        )
+    destination = os.path.join(str(run_dir), "source_manifest.sha256")
+    temporary = destination + ".tmp"
+    with open(temporary, "wb") as manifest_file:
+        manifest_file.write(manifest_bytes)
+        manifest_file.flush()
+        os.fsync(manifest_file.fileno())
+    os.replace(temporary, destination)
+    all_args.source_manifest_sha256 = actual_sha256
+    all_args.source_manifest_file = os.path.basename(destination)
+
+
+def _finite_json_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def write_terminal_summary(runner, all_args, total_num_steps):
+    """Atomically write a compact, non-empty terminal run summary."""
+    last_eval = {}
+    for key, value in getattr(runner, "last_eval_summary", {}).items():
+        finite_value = _finite_json_float(value)
+        if finite_value is not None:
+            last_eval[str(key)] = finite_value
+    if bool(getattr(all_args, "use_eval", False)) and not last_eval:
+        raise RuntimeError(
+            "terminal run summary requires the final evaluation metrics"
+        )
+    best = {}
+    for output_key, attribute_name in (
+            ("reward", "best_eval_reward"),
+            ("reward_step", "best_eval_reward_step"),
+            ("win_rate", "best_eval_win_rate"),
+            ("win_reward", "best_eval_win_reward"),
+            ("win_step", "best_eval_win_step")):
+        finite_value = _finite_json_float(getattr(
+            runner,
+            attribute_name,
+            None,
+        ))
+        if finite_value is not None:
+            best[output_key] = finite_value
+
+    payload = {
+        "summary_schema_version": 1,
+        "resolved_run_id": str(getattr(
+            all_args,
+            "resolved_run_id",
+            "unavailable",
+        )),
+        "resolved_run_dir": str(getattr(
+            all_args,
+            "resolved_run_dir",
+            "unavailable",
+        )),
+        "algorithm": str(all_args.algorithm_name),
+        "experiment": str(all_args.experiment_name),
+        "seed": int(all_args.seed),
+        "actual_env_steps": int(total_num_steps),
+        "target_env_steps": int(all_args.num_env_steps),
+        "training_complete": int(total_num_steps) >= int(all_args.num_env_steps),
+        "checkpoint_kind": "terminal",
+        "last_eval_step": int(getattr(
+            runner,
+            "last_eval_summary_step",
+            -1,
+        )),
+        "last_eval": last_eval,
+        "best_eval": best,
+        "source_manifest_file": str(getattr(
+            all_args,
+            "source_manifest_file",
+            "unavailable",
+        )),
+        "source_manifest_sha256": str(getattr(
+            all_args,
+            "source_manifest_sha256",
+            "unavailable",
+        )),
+    }
+    if str(all_args.algorithm_name) == "sddfg":
+        payload["algorithm_definitions"] = {
+            "candidate_objective_version": 12,
+            "candidate_normalization_version": 3,
+            "candidate_lifecycle_version": 10,
+        }
+        payload["policy_exploration"] = {
+            "contract_version": 6,
+            "joint_epsilon_exploration_enabled": bool(getattr(
+                all_args,
+                "use_joint_epsilon_exploration",
+                False,
+            )),
+            "epsilon_start": float(all_args.epsilon_start),
+            "epsilon_finish": float(all_args.epsilon_finish),
+            "epsilon_anneal_time": int(all_args.epsilon_anneal_time),
+            "post_capture_joint_greedy_floor": float(getattr(
+                all_args,
+                "post_capture_joint_greedy_floor",
+                0.0,
+            )),
+            "post_capture_explore_max_random_agents": int(getattr(
+                all_args,
+                "post_capture_explore_max_random_agents",
+                0,
+            )),
+            "pre_capture_visible_prey_quorum_guard": bool(getattr(
+                all_args,
+                "pre_capture_visible_prey_quorum_guard",
+                False,
+            )),
+            "pre_capture_visible_prey_quorum_greedy_frontier_guard": bool(
+                getattr(
+                    all_args,
+                    "pre_capture_visible_prey_quorum_greedy_frontier_guard",
+                    False,
+                )
+            ),
+        }
+        payload["q_target"] = {
+            "contract_version": 5,
+            "n_step": int(getattr(all_args, "q_n_step", 1)),
+            "n_step_mode": (
+                "one_step"
+                if int(getattr(all_args, "q_n_step", 1)) == 1
+                else "terminal_gated"
+            ),
+            "terminal_replay_lane": bool(getattr(
+                all_args,
+                "q_terminal_replay_lane",
+                False,
+            )),
+            "terminal_replay_loss_weight": float(getattr(
+                all_args,
+                "q_terminal_replay_loss_weight",
+                0.10,
+            )),
+            "gamma": float(all_args.gamma),
+            "pre_capture_frontier_policy_aligned": bool(getattr(
+                all_args,
+                "pre_capture_visible_prey_quorum_greedy_frontier_guard",
+                False,
+            )),
+        }
+        coverage_enabled = bool(getattr(
+            all_args,
+            "use_multi_prey_coverage_shaping",
+            False,
+        ))
+        payload["reward_shaping"] = {
+            "contract_version": WOLFPACK_REWARD_SHAPING_CONTRACT_VERSION,
+            "mode": (
+                WOLFPACK_MULTI_PREY_COVERAGE_MODE
+                if coverage_enabled else WOLFPACK_LEGACY_DISTANCE_MODE
+            ),
+            "distance_scale": WOLFPACK_DISTANCE_SHAPING_SCALE,
+        }
+    summary_path = os.path.join(str(runner.log_dir), "summary.json")
+    temporary = summary_path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as summary_file:
+        json.dump(
+            payload,
+            summary_file,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        summary_file.write("\n")
+        summary_file.flush()
+        os.fsync(summary_file.fileno())
+    os.replace(temporary, summary_path)
+
 """
 与 train_*.py 一致的多进程封装：
 - 通过 seed + rank * 1000 区分每个并行环境；
@@ -133,6 +361,10 @@ def make_train_env(all_args):
                 shock_recover_delay=all_args.shock_recover_delay,
                 dynamic_min_agents=all_args.dynamic_min_agents,
                 continue_after_success=all_args.continue_after_success,
+                reward_win=all_args.reward_win,
+                use_multi_prey_coverage_shaping=(
+                    all_args.use_multi_prey_coverage_shaping
+                ),
             )
 
             env = gym.make(all_args.wolfpack_id, **wolf_kwargs)
@@ -189,6 +421,10 @@ def make_eval_env(all_args):
                 shock_recover_delay=all_args.shock_recover_delay,
                 dynamic_min_agents=all_args.dynamic_min_agents,
                 continue_after_success=all_args.continue_after_success,
+                reward_win=all_args.reward_win,
+                use_multi_prey_coverage_shaping=(
+                    all_args.use_multi_prey_coverage_shaping
+                ),
             )
 
             env = gym.make(all_args.wolfpack_id, **wolf_kwargs)
@@ -237,6 +473,15 @@ def parse_args(args, parser):
     parser.add_argument("--group_multiplier", type=float, default=2.0, help="协作奖励乘子")
     parser.add_argument("--food_freeze_rate", type=int, default=200, help="食物被围捕后冻结步长")
     parser.add_argument("--close_penalty", type=float, default=1.0, help="单狼贴近惩罚")
+    parser.add_argument(
+        "--use_multi_prey_coverage_shaping",
+        action="store_true",
+        default=False,
+        help=(
+            "Use reward-only balanced alive-prey coverage potential instead "
+            "of independent nearest-prey distance shaping"
+        ),
+    )
 
     # open 环境：回合内增减玩家的几何分布参数
     parser.add_argument("--add_rate", type=float, default=0.0,
@@ -566,6 +811,24 @@ def parse_args(args, parser):
             "uses capture_count and ignores team reward."
         ),
     )
+    add_missing_option(
+        "--pair_bounded_pending_evidence",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the default-off pair-specific immutable bounded pending "
+            "mechanism."
+        ),
+    )
+    add_missing_option(
+        "--pair_pending_max_adj_updates",
+        type=int,
+        default=0,
+        help=(
+            "Maximum adjacency-update age after ordinary replay eviction for "
+            "strict pair pending evidence; zero preserves the legacy path."
+        ),
+    )
 
     all_args, unknown_args = parser.parse_known_args(args)
     if unknown_args:
@@ -657,6 +920,7 @@ def _init_adj(all_args, num_agents: int, num_factor: int):
     return adj
 
 def main(args):
+    _validate_pair_exact_score_recording_contract()
     parser = get_config()
     all_args = parse_args(args, parser)
 
@@ -730,6 +994,17 @@ def main(args):
         run_dir = run_dir / curr_run
         if not run_dir.exists():
             os.makedirs(str(run_dir))
+
+    all_args.resolved_run_id = str(run_dir.name)
+    all_args.resolved_run_dir = str(run_dir)
+    persist_source_manifest(run_dir, all_args)
+    print(
+        "[RUN] resolved_run_id={}; resolved_run_dir={}".format(
+            all_args.resolved_run_id,
+            all_args.resolved_run_dir,
+        ),
+        flush=True,
+    )
 
     setproctitle.setproctitle(str(all_args.algorithm_name) + "-" + str(
         all_args.env_name) + "-" + str(all_args.experiment_name) + "@" + str(all_args.user_name))
@@ -867,6 +1142,14 @@ def main(args):
     while total_num_steps < all_args.num_env_steps:
         total_num_steps = runner.run()
 
+    # Periodic saving can leave the exported model tens of thousands of
+    # environment steps behind the policy used by the final evaluation. Save
+    # the exact terminal parameters and all adjacency Adam states after the
+    # last training episode.
+    if all_args.use_save:
+        runner.save_terminal_checkpoint()
+        runner.last_save_T = runner.total_env_steps
+
     env.close()
     if all_args.use_eval and (eval_env is not env):
         eval_env.close()
@@ -874,9 +1157,8 @@ def main(args):
     if all_args.use_wandb:
         run.finish()
     else:
-        runner.writter.export_scalars_to_json(
-            str(runner.log_dir + '/summary.json'))
         runner.writter.close()
+        write_terminal_summary(runner, all_args, total_num_steps)
 
 if __name__ == "__main__":
     main(sys.argv[1:])

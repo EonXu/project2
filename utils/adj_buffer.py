@@ -7,6 +7,8 @@ from .pair_credit import (
     CAPTURE_OUTCOME_DIAGNOSTIC_WIDTH,
     canonical_capture_factor_catalog,
     compute_capture_anchored_pair_credit,
+    partition_pair_contrast_optimizer_chunks,
+    scale_optimizer_cohort_pair_credit,
     compute_capture_to_win_outcome_gate,
     compute_capture_to_win_triplet_outcome_advantage,
     scale_capture_to_win_outcome_credit,
@@ -18,10 +20,1078 @@ from .graph_sampling import (
     select_outcome_contrast_complete_episodes,
     write_graph_advantage_sequence,
 )
+from .pair_pending import (
+    PAIR_EVIDENCE_AVAILABLE_IN_REPLAY,
+    PAIR_EVIDENCE_COMMITTED,
+    PAIR_EVIDENCE_PENDING,
+    PairPendingEvidenceStore,
+    merge_generation_event_pair_scores,
+    pair_pending_entry_key,
+    reconstruct_pending_pair_mass,
+)
 
 
 def _cast(x):
     return x.transpose(2, 0, 1, 3)
+
+
+def summarize_pair_evidence_episode_funnel(
+        occupied_episode_mask,
+        successful_episode_mask,
+        active_capture_episode_mask,
+        candidate_capture_episode_mask,
+        pair_evidence_episode_mask):
+    """Count the replay episode funnel before signed pair support selection.
+
+    These counts are deliberately computed from boolean episode provenance,
+    before support eligibility, replay augmentation, or optimizer sampling.
+    They are read-only diagnostics: in particular, they must never be used to
+    relax support reuse or to manufacture a missing signed class.
+    """
+    named_masks = (
+        ("occupied", occupied_episode_mask),
+        ("successful", successful_episode_mask),
+        ("active capture", active_capture_episode_mask),
+        ("candidate capture", candidate_capture_episode_mask),
+        ("pair evidence", pair_evidence_episode_mask),
+    )
+    normalized = {}
+    reference_shape = None
+    for name, mask in named_masks:
+        values = np.asarray(mask)
+        if values.ndim != 1:
+            raise ValueError(
+                "{} episode mask must be one-dimensional".format(name)
+            )
+        if reference_shape is None:
+            reference_shape = values.shape
+        elif values.shape != reference_shape:
+            raise ValueError(
+                "pair evidence funnel episode masks have different shapes"
+            )
+        normalized[name] = values.astype(bool, copy=False)
+
+    occupied = normalized["occupied"]
+    successful = normalized["successful"] & occupied
+    active_capture = normalized["active capture"] & occupied
+    candidate_capture = normalized["candidate capture"] & occupied
+    capture = active_capture | candidate_capture
+    pair_evidence = normalized["pair evidence"] & occupied
+    pair_positive = pair_evidence & successful
+    pair_negative = pair_evidence & ~successful & occupied
+    successful_capture = capture & successful
+    successful_capture_without_pair = (
+        successful_capture & ~pair_evidence
+    )
+    pair_without_capture = pair_evidence & ~capture
+    # A successful capture without strict pair evidence must fall into one of
+    # two source-grounded branches.  An episode with any exact active capture
+    # identity is attributed to the active branch; otherwise a representable
+    # candidate-only capture is the earliest missing link.  This precedence
+    # makes the reject-reason partition mutually exclusive even when one
+    # episode contains multiple capture events from both branches.
+    gap_active_without_strict_pair = (
+        successful_capture_without_pair & active_capture
+    )
+    gap_candidate_only_not_active = (
+        successful_capture_without_pair
+        & candidate_capture
+        & ~active_capture
+    )
+    gap_unclassified = (
+        successful_capture_without_pair
+        & ~gap_active_without_strict_pair
+        & ~gap_candidate_only_not_active
+    )
+
+    occupied_count = int(np.sum(occupied))
+    pair_evidence_count = int(np.sum(pair_evidence))
+    pair_positive_count = int(np.sum(pair_positive))
+    pair_negative_count = int(np.sum(pair_negative))
+    if pair_positive_count + pair_negative_count != pair_evidence_count:
+        raise RuntimeError(
+            "signed pair evidence episode counts do not reconstruct total"
+        )
+    if pair_evidence_count > occupied_count:
+        raise RuntimeError(
+            "pair evidence episode count exceeds occupied replay population"
+        )
+    gap_count = int(np.sum(successful_capture_without_pair))
+    gap_partition_count = int(
+        np.sum(gap_active_without_strict_pair)
+        + np.sum(gap_candidate_only_not_active)
+        + np.sum(gap_unclassified)
+    )
+    if gap_partition_count != gap_count:
+        raise RuntimeError(
+            "successful-capture pair-evidence reject reasons do not "
+            "reconstruct the gap population"
+        )
+    if np.any(gap_unclassified):
+        raise RuntimeError(
+            "successful capture without pair evidence has neither an active "
+            "nor a candidate-only exact identity"
+        )
+
+    return {
+        "version": 2.0,
+        "occupied_episode_count": occupied_count,
+        "successful_episode_count": int(np.sum(successful)),
+        "capture_episode_count": int(np.sum(capture)),
+        "successful_capture_episode_count": int(
+            np.sum(successful_capture)
+        ),
+        "successful_active_capture_episode_count": int(
+            np.sum(successful & active_capture)
+        ),
+        "successful_candidate_capture_episode_count": int(
+            np.sum(successful & candidate_capture)
+        ),
+        "pair_evidence_episode_count": pair_evidence_count,
+        "pair_positive_episode_count": pair_positive_count,
+        "pair_negative_episode_count": pair_negative_count,
+        "successful_capture_without_pair_evidence_episode_count": int(
+            np.sum(successful_capture_without_pair)
+        ),
+        "pair_evidence_without_capture_episode_count": int(
+            np.sum(pair_without_capture)
+        ),
+        "successful_capture_gap_candidate_only_not_active_episode_count": int(
+            np.sum(gap_candidate_only_not_active)
+        ),
+        "successful_capture_gap_active_without_strict_pair_episode_count": int(
+            np.sum(gap_active_without_strict_pair)
+        ),
+        "successful_capture_gap_unclassified_episode_count": int(
+            np.sum(gap_unclassified)
+        ),
+        "successful_capture_gap_reject_reason_contract_valid": 1.0,
+        "contract_valid": 1.0,
+    }
+
+
+def summarize_successful_candidate_capture_context(
+        successful_episode_mask,
+        pair_evidence_episode_mask,
+        active_capture_episode_mask,
+        candidate_capture_weights,
+        candidate_behavior,
+        capture_transition_mask,
+        terminal_transition_mask):
+    """Summarize exact successful candidate-only identities without mutation.
+
+    This diagnostic closes the earliest run104 funnel gap at behavior time.  It
+    reports the stored first-reachable competitor margin/rank for exact
+    candidate-only capture identities and the distance from the last capture to
+    episode termination.  It neither changes candidate targets nor treats a
+    candidate-only event as strict pair evidence.
+    """
+    successful = np.asarray(successful_episode_mask, dtype=bool)
+    pair_evidence = np.asarray(pair_evidence_episode_mask, dtype=bool)
+    active_capture = np.asarray(active_capture_episode_mask, dtype=bool)
+    weights = np.asarray(candidate_capture_weights, dtype=np.float32)
+    behavior = np.asarray(candidate_behavior, dtype=np.float32)
+    capture_transition = np.asarray(capture_transition_mask, dtype=bool)
+    terminal_transition = np.asarray(terminal_transition_mask, dtype=bool)
+    if successful.ndim != 1:
+        raise ValueError("successful episode mask must be one-dimensional")
+    if pair_evidence.shape != successful.shape:
+        raise ValueError("pair evidence episode mask shape mismatch")
+    if active_capture.shape != successful.shape:
+        raise ValueError("active capture episode mask shape mismatch")
+    if weights.ndim != 3:
+        raise ValueError(
+            "candidate capture weights must have shape [time, episode, identity]"
+        )
+    if behavior.shape != weights.shape + (4,):
+        raise ValueError(
+            "candidate behavior shape {} does not match capture weights {}"
+            .format(behavior.shape, weights.shape)
+        )
+    if capture_transition.shape != weights.shape[:2]:
+        raise ValueError("capture transition mask shape mismatch")
+    if terminal_transition.shape != weights.shape[:2]:
+        raise ValueError("terminal transition mask shape mismatch")
+    if successful.shape != (weights.shape[1],):
+        raise ValueError("episode masks do not match candidate replay axis")
+    if (
+            not np.isfinite(weights).all()
+            or np.any(weights < 0.0)
+            or not np.isfinite(behavior).all()):
+        raise ValueError(
+            "candidate capture context must be finite and non-negative"
+        )
+
+    candidate_episode = np.any(weights > 0.0, axis=(0, 2))
+    successful_gap = successful & candidate_episode & ~pair_evidence
+    candidate_only_gap = successful_gap & ~active_capture
+    target_mask = (
+        (weights > 0.0)
+        & candidate_only_gap[None, :, None]
+    )
+    target_weight = np.where(target_mask, weights, 0.0)
+    identity_mass = float(target_weight.sum())
+    identity_count = int(np.sum(target_mask))
+    behavior_margin = behavior[..., 0]
+    behavior_rank = behavior[..., 1]
+    behavior_valid = behavior[..., 2]
+    if np.any(target_mask & (behavior_valid <= 0.0)):
+        raise RuntimeError(
+            "successful candidate-only capture targets invalid behavior metadata"
+        )
+    if np.any(target_mask & (behavior_rank < 1.0)):
+        raise RuntimeError(
+            "successful candidate-only capture has no canonical behavior rank"
+        )
+
+    def _weighted_mean(values):
+        if identity_mass <= 0.0:
+            return 0.0
+        return float((values * target_weight).sum() / identity_mass)
+
+    def _masked_min(values):
+        return float(values[target_mask].min()) if identity_count > 0 else 0.0
+
+    def _masked_max(values):
+        return float(values[target_mask].max()) if identity_count > 0 else 0.0
+
+    terminal_capture_count = 0
+    last_capture_to_terminal = []
+    for episode in np.flatnonzero(successful_gap):
+        capture_steps = np.flatnonzero(capture_transition[:, episode])
+        terminal_steps = np.flatnonzero(terminal_transition[:, episode])
+        if capture_steps.size == 0:
+            raise RuntimeError(
+                "successful capture gap episode has no capture transition"
+            )
+        last_capture = int(capture_steps[-1])
+        reachable_terminal = terminal_steps[terminal_steps >= last_capture]
+        if reachable_terminal.size == 0:
+            raise RuntimeError(
+                "completed successful capture episode has no terminal "
+                "transition at or after its last capture"
+            )
+        terminal_step = int(reachable_terminal[0])
+        distance = terminal_step - last_capture
+        last_capture_to_terminal.append(float(distance))
+        if distance == 0:
+            terminal_capture_count += 1
+    distances = np.asarray(last_capture_to_terminal, dtype=np.float32)
+
+    return {
+        "successful_candidate_gap_episode_count": int(
+            np.sum(candidate_only_gap)
+        ),
+        "successful_candidate_gap_identity_count": identity_count,
+        "successful_candidate_gap_identity_mass": identity_mass,
+        "successful_candidate_gap_behavior_margin_mean": _weighted_mean(
+            behavior_margin
+        ),
+        "successful_candidate_gap_behavior_margin_min": _masked_min(
+            behavior_margin
+        ),
+        "successful_candidate_gap_behavior_margin_max": _masked_max(
+            behavior_margin
+        ),
+        "successful_candidate_gap_behavior_rank_mean": _weighted_mean(
+            behavior_rank
+        ),
+        "successful_candidate_gap_behavior_rank_min": _masked_min(
+            behavior_rank
+        ),
+        "successful_candidate_gap_behavior_rank_max": _masked_max(
+            behavior_rank
+        ),
+        "successful_candidate_gap_behavior_boundary_crossed_fraction": (
+            _weighted_mean((behavior_margin > 0.0).astype(np.float32))
+        ),
+        "successful_candidate_gap_behavior_rank1_fraction": (
+            _weighted_mean((behavior_rank <= 1.0).astype(np.float32))
+        ),
+        "successful_capture_gap_terminal_capture_episode_count": int(
+            terminal_capture_count
+        ),
+        "successful_capture_gap_last_capture_to_terminal_step_mean": (
+            float(distances.mean()) if distances.size > 0 else 0.0
+        ),
+        "successful_capture_gap_last_capture_to_terminal_step_min": (
+            float(distances.min()) if distances.size > 0 else 0.0
+        ),
+        "successful_capture_gap_last_capture_to_terminal_step_max": (
+            float(distances.max()) if distances.size > 0 else 0.0
+        ),
+        "successful_candidate_gap_context_contract_valid": 1.0,
+    }
+
+
+def build_pair_evidence_episode_diagnostic_rows(
+        episode_generation,
+        selected_episode_indices,
+        base_episode_indices,
+        supplemented_episode_indices,
+        outcome_support_used,
+        successful_episode_mask,
+        active_capture_episode_mask,
+        candidate_capture_weights,
+        candidate_behavior,
+        pair_evidence_transition_mask,
+        capture_transition_mask,
+        terminal_transition_mask,
+        capture_identity_candidate_count,
+        recency_age,
+        num_agents,
+        configured_pair_window,
+        outcome_class_complete,
+        pair_class_complete,
+        active_capture_event_provenance=None,
+        require_active_capture_event_provenance=False):
+    """Build read-only per-episode provenance rows for the replay funnel.
+
+    Every occupied replay generation is emitted exactly once per adjacency
+    update.  The reject reason describes the earliest source-backed gap only;
+    it never changes selection, targets, or support eligibility.
+    """
+    generations = np.asarray(episode_generation, dtype=np.int64)
+    selected = np.asarray(selected_episode_indices, dtype=np.int64).reshape(-1)
+    base = np.asarray(base_episode_indices, dtype=np.int64).reshape(-1)
+    supplemented = np.asarray(
+        supplemented_episode_indices,
+        dtype=np.int64,
+    ).reshape(-1)
+    support_used = np.asarray(outcome_support_used, dtype=bool)
+    successful = np.asarray(successful_episode_mask, dtype=bool)
+    active_capture = np.asarray(active_capture_episode_mask, dtype=bool)
+    candidate_weights = np.asarray(
+        candidate_capture_weights,
+        dtype=np.float32,
+    )
+    behavior = np.asarray(candidate_behavior, dtype=np.float32)
+    pair_transition = np.asarray(
+        pair_evidence_transition_mask,
+        dtype=bool,
+    )
+    capture_transition = np.asarray(capture_transition_mask, dtype=bool)
+    terminal_transition = np.asarray(terminal_transition_mask, dtype=bool)
+    identity_candidate_count = np.asarray(
+        capture_identity_candidate_count,
+        dtype=np.float32,
+    )
+    ages = np.asarray(recency_age, dtype=np.int64)
+
+    if active_capture_event_provenance is None:
+        if (
+                bool(require_active_capture_event_provenance)
+                and np.any(active_capture & (generations >= 0))):
+            raise RuntimeError(
+                "active capture episode diagnostic is missing exact event "
+                "provenance"
+            )
+        active_event_provenance = [
+            tuple() for _ in range(int(generations.size))
+        ]
+    else:
+        if (
+                not isinstance(active_capture_event_provenance, (list, tuple))
+                or len(active_capture_event_provenance)
+                != int(generations.size)):
+            raise ValueError(
+                "active capture event provenance does not match replay "
+                "episode axis"
+            )
+        active_event_provenance = active_capture_event_provenance
+
+    if generations.ndim != 1:
+        raise ValueError("episode generation must be one-dimensional")
+    episode_count = int(generations.size)
+    for name, values in (
+            ("outcome support used", support_used),
+            ("successful", successful),
+            ("active capture", active_capture),
+            ("recency age", ages)):
+        if values.shape != (episode_count,):
+            raise ValueError(
+                "{} episode diagnostic shape mismatch".format(name)
+            )
+    if candidate_weights.ndim != 3:
+        raise ValueError(
+            "candidate capture weights must be [time, episode, identity]"
+        )
+    if candidate_weights.shape[1] != episode_count:
+        raise ValueError("candidate capture replay episode axis mismatch")
+    if behavior.shape != candidate_weights.shape + (4,):
+        raise ValueError("candidate behavior replay shape mismatch")
+    transition_shape = candidate_weights.shape[:2]
+    for name, values in (
+            ("pair evidence", pair_transition),
+            ("capture", capture_transition),
+            ("terminal", terminal_transition),
+            ("capture identity candidate", identity_candidate_count)):
+        if values.shape != transition_shape:
+            raise ValueError(
+                "{} transition diagnostic shape mismatch".format(name)
+            )
+    if (
+            not np.isfinite(candidate_weights).all()
+            or np.any(candidate_weights < 0.0)
+            or not np.isfinite(behavior).all()
+            or not np.isfinite(identity_candidate_count).all()
+            or np.any(identity_candidate_count < 0.0)):
+        raise ValueError("episode funnel provenance must be finite")
+    for name, indices in (
+            ("selected", selected),
+            ("base", base),
+            ("supplemented", supplemented)):
+        if (
+                indices.size
+                and (
+                    np.any(indices < 0)
+                    or np.any(indices >= episode_count)
+                    or np.unique(indices).size != indices.size)):
+            raise ValueError(
+                "{} episode indices are invalid or duplicated".format(name)
+            )
+    if np.intersect1d(base, supplemented).size:
+        raise RuntimeError(
+            "base and supplemented episode provenance overlap"
+        )
+    if set(selected.tolist()) != set(
+            np.concatenate([base, supplemented]).tolist()
+    ):
+        raise RuntimeError(
+            "selected episodes do not reconstruct base plus support"
+        )
+
+    selected_ordinal = {
+        int(slot): int(ordinal)
+        for ordinal, slot in enumerate(selected.tolist())
+    }
+    base_set = set(int(slot) for slot in base.tolist())
+    supplemented_set = set(int(slot) for slot in supplemented.tolist())
+    candidate_catalog = canonical_capture_factor_catalog(
+        int(num_agents),
+        3,
+    )
+    if len(candidate_catalog) != candidate_weights.shape[2]:
+        raise RuntimeError(
+            "candidate identity catalog does not match replay width"
+        )
+
+    rows = []
+    occupied_slots = np.flatnonzero(generations >= 0)
+    for slot_value in occupied_slots:
+        slot = int(slot_value)
+        pair_steps = np.flatnonzero(pair_transition[:, slot])
+        capture_steps = np.flatnonzero(capture_transition[:, slot])
+        terminal_steps = np.flatnonzero(terminal_transition[:, slot])
+        candidate_mask = candidate_weights[:, slot, :] > 0.0
+        candidate_indices = np.flatnonzero(
+            np.any(candidate_mask, axis=0)
+        ).astype(np.int64, copy=False)
+        candidate_episode = bool(candidate_indices.size)
+        active_episode = bool(active_capture[slot])
+        active_records = active_event_provenance[slot]
+        if not isinstance(active_records, (list, tuple)):
+            raise TypeError(
+                "active capture event provenance for one episode must be a "
+                "list or tuple"
+            )
+        if bool(active_records) and not active_episode:
+            raise RuntimeError(
+                "active capture episode flag does not match exact event "
+                "provenance"
+            )
+        if (
+                active_episode
+                and not bool(active_records)
+                and bool(require_active_capture_event_provenance)):
+            raise RuntimeError(
+                "active capture episode diagnostic is missing exact event "
+                "provenance"
+            )
+        normalized_active_records = []
+        active_logical_keys = set()
+        for record in active_records:
+            if not isinstance(record, dict):
+                raise TypeError(
+                    "active capture event provenance record must be a dict"
+                )
+            required_fields = (
+                "environment_episode_id",
+                "event_id",
+                "target_id",
+                "participant_slots",
+                "factor_index",
+                "factor_identity",
+                "factor_order",
+                "identity_event_weight",
+                "factor_slot_weight",
+                "capture_step",
+                "static_dynamic_class",
+            )
+            missing = [
+                field for field in required_fields if field not in record
+            ]
+            if missing:
+                raise RuntimeError(
+                    "active capture event provenance is missing {}".format(
+                        ",".join(missing)
+                    )
+                )
+            environment_episode_id = int(record["environment_episode_id"])
+            event_id = int(record["event_id"])
+            target_id = int(record["target_id"])
+            factor_index = int(record["factor_index"])
+            factor_order = int(record["factor_order"])
+            capture_step = int(record["capture_step"])
+            factor_identity = str(record["factor_identity"])
+            identity_nodes = tuple(
+                int(node) for node in factor_identity.split("-") if node != ""
+            )
+            participant_slots = tuple(
+                sorted(int(node) for node in record["participant_slots"])
+            )
+            static_dynamic_class = str(record["static_dynamic_class"])
+            identity_event_weight = float(record["identity_event_weight"])
+            factor_slot_weight = float(record["factor_slot_weight"])
+            if (
+                    environment_episode_id < 0
+                    or event_id < 0
+                    or target_id < 0
+                    or factor_index < 0
+                    or factor_order not in (2, 3)
+                    or len(identity_nodes) != factor_order
+                    or tuple(sorted(identity_nodes)) != identity_nodes
+                    or factor_identity != "-".join(
+                        str(node) for node in identity_nodes
+                    )
+                    or not set(identity_nodes).issubset(participant_slots)
+                    or capture_step < 0
+                    or capture_step >= int(capture_transition.shape[0])
+                    or not bool(capture_transition[capture_step, slot])
+                    or static_dynamic_class not in ("static", "dynamic")
+                    or not np.isfinite(identity_event_weight)
+                    or identity_event_weight <= 0.0
+                    or not np.isfinite(factor_slot_weight)
+                    or factor_slot_weight <= 0.0):
+                raise RuntimeError(
+                    "active capture event provenance contains an invalid "
+                    "episode diagnostic value"
+                )
+            logical_key = (
+                environment_episode_id,
+                event_id,
+                target_id,
+                capture_step,
+                factor_index,
+            )
+            if logical_key in active_logical_keys:
+                raise RuntimeError(
+                    "active capture event provenance duplicates one event "
+                    "factor"
+                )
+            active_logical_keys.add(logical_key)
+            normalized_active_records.append({
+                "environment_episode_id": environment_episode_id,
+                "event_id": event_id,
+                "target_id": target_id,
+                "factor_identity": factor_identity,
+                "factor_index": factor_index,
+                "capture_step": capture_step,
+                "static_dynamic_class": static_dynamic_class,
+            })
+        normalized_active_records.sort(key=lambda record: (
+            record["capture_step"],
+            record["event_id"],
+            record["factor_index"],
+            record["factor_identity"],
+        ))
+        active_environment_ids = sorted(set(
+            record["environment_episode_id"]
+            for record in normalized_active_records
+        ))
+        active_event_ids = sorted(set(
+            record["event_id"] for record in normalized_active_records
+        ))
+        active_target_ids = sorted(set(
+            record["target_id"] for record in normalized_active_records
+        ))
+        active_factor_identities = []
+        active_identity_classes = []
+        for record in normalized_active_records:
+            identity = record["factor_identity"]
+            identity_class = "{}:{}".format(
+                identity,
+                record["static_dynamic_class"],
+            )
+            if identity not in active_factor_identities:
+                active_factor_identities.append(identity)
+            if identity_class not in active_identity_classes:
+                active_identity_classes.append(identity_class)
+        if len(active_environment_ids) > 1:
+            raise RuntimeError(
+                "one replay episode contains multiple environment episode "
+                "identities"
+            )
+        capture_episode = bool(capture_steps.size)
+        success_episode = bool(successful[slot])
+        pair_episode = bool(pair_steps.size)
+        successful_capture_gap = bool(
+            success_episode and capture_episode and not pair_episode
+        )
+        if successful_capture_gap and active_episode:
+            reject_reason = "ACTIVE_CAPTURE_NO_STRICT_PRIOR_PAIR"
+        elif (
+                successful_capture_gap
+                and candidate_episode
+                and not active_episode):
+            reject_reason = "CANDIDATE_ONLY_NOT_ACTIVE"
+        elif successful_capture_gap:
+            raise RuntimeError(
+                "successful capture gap has no source-backed reject reason"
+            )
+        else:
+            reject_reason = "NOT_A_SUCCESSFUL_CAPTURE_GAP"
+
+        first_capture = int(capture_steps[0]) if capture_steps.size else -1
+        last_capture = int(capture_steps[-1]) if capture_steps.size else -1
+        terminal_step = int(terminal_steps[0]) if terminal_steps.size else -1
+        capture_to_terminal = (
+            terminal_step - last_capture
+            if last_capture >= 0 and terminal_step >= last_capture
+            else -1
+        )
+        if successful_capture_gap and capture_to_terminal < 0:
+            raise RuntimeError(
+                "completed successful capture gap has invalid terminal timing"
+            )
+
+        target_mask = candidate_mask
+        target_weight = np.where(
+            target_mask,
+            candidate_weights[:, slot, :],
+            0.0,
+        )
+        target_mass = float(target_weight.sum())
+        target_count = int(np.sum(target_mask))
+        margin = behavior[:, slot, :, 0]
+        rank = behavior[:, slot, :, 1]
+        valid = behavior[:, slot, :, 2]
+        if np.any(target_mask & (valid <= 0.0)):
+            raise RuntimeError(
+                "episode diagnostic found invalid candidate metadata"
+            )
+        if np.any(target_mask & (rank < 1.0)):
+            raise RuntimeError(
+                "episode diagnostic found invalid candidate rank"
+            )
+        weighted_margin = (
+            float((margin * target_weight).sum() / target_mass)
+            if target_mass > 0.0 else 0.0
+        )
+        weighted_rank = (
+            float((rank * target_weight).sum() / target_mass)
+            if target_mass > 0.0 else 0.0
+        )
+        identity_strings = [
+            "-".join(str(int(node)) for node in candidate_catalog[index])
+            for index in candidate_indices.tolist()
+        ]
+        identity_orders = [
+            len(candidate_catalog[index])
+            for index in candidate_indices.tolist()
+        ]
+        rows.append({
+            "diagnostic_version": 2,
+            "replay_slot_index": slot,
+            "episode_generation": int(generations[slot]),
+            "episode_recency_age": int(ages[slot]),
+            "selected_for_training": int(slot in selected_ordinal),
+            "selected_episode_ordinal": int(
+                selected_ordinal.get(slot, -1)
+            ),
+            "base_selected": int(slot in base_set),
+            "support_selected": int(slot in supplemented_set),
+            "outcome_support_used": int(support_used[slot]),
+            "outcome_class_complete": int(bool(outcome_class_complete)),
+            "pair_class_complete": int(bool(pair_class_complete)),
+            "outcome_success": int(success_episode),
+            "capture_episode": int(capture_episode),
+            "active_capture_episode": int(active_episode),
+            "candidate_capture_episode": int(candidate_episode),
+            "successful_capture_without_pair_evidence": int(
+                successful_capture_gap
+            ),
+            "pair_evidence_episode": int(pair_episode),
+            "pair_evidence_sign": int(
+                1 if pair_episode and success_episode
+                else -1 if pair_episode else 0
+            ),
+            "reject_reason": reject_reason,
+            "capture_transition_count": int(capture_steps.size),
+            "first_capture_step": first_capture,
+            "last_capture_step": last_capture,
+            "terminal_step": terminal_step,
+            "last_capture_to_terminal_step": int(capture_to_terminal),
+            "terminal_capture": int(
+                capture_to_terminal == 0 and capture_episode
+            ),
+            "strict_pair_evidence_anchor_count": int(pair_steps.size),
+            "first_strict_pair_evidence_anchor_step": int(
+                pair_steps[0] if pair_steps.size else -1
+            ),
+            "last_strict_pair_evidence_anchor_step": int(
+                pair_steps[-1] if pair_steps.size else -1
+            ),
+            "configured_strict_pair_window": int(configured_pair_window),
+            "capture_identity_candidate_count": float(
+                identity_candidate_count[:, slot].sum()
+            ),
+            "candidate_identity_count": int(candidate_indices.size),
+            "candidate_target_transition_count": target_count,
+            "candidate_identity_mass": target_mass,
+            "candidate_identity_indices": ";".join(
+                str(int(index)) for index in candidate_indices.tolist()
+            ),
+            "candidate_factor_identities": ";".join(identity_strings),
+            "candidate_factor_order_min": int(
+                min(identity_orders) if identity_orders else 0
+            ),
+            "candidate_factor_order_max": int(
+                max(identity_orders) if identity_orders else 0
+            ),
+            "participant_slots_available": int(bool(identity_strings)),
+            "participant_slots": ";".join(identity_strings),
+            "candidate_behavior_margin_mean": weighted_margin,
+            "candidate_behavior_rank_mean": weighted_rank,
+            # Event-level active-capture provenance is already part of the
+            # replay's immutable single-use evidence state.  Expose it here
+            # read-only so a retained promotion can be joined to later exact
+            # behavior.  Scalar event/prey fields remain unavailable when an
+            # episode contains more than one distinct capture event.
+            "environment_episode_id_available": int(
+                len(active_environment_ids) == 1
+            ),
+            "environment_episode_id": int(
+                active_environment_ids[0]
+                if len(active_environment_ids) == 1 else -1
+            ),
+            "capture_event_id_available": int(len(active_event_ids) == 1),
+            "capture_event_id": int(
+                active_event_ids[0] if len(active_event_ids) == 1 else -1
+            ),
+            "capture_prey_id_available": int(len(active_target_ids) == 1),
+            "capture_prey_id": int(
+                active_target_ids[0] if len(active_target_ids) == 1 else -1
+            ),
+            "matched_active_factor_identity_available": int(
+                bool(active_factor_identities)
+            ),
+            "matched_active_factor_identity": ";".join(
+                active_factor_identities
+            ),
+            "static_dynamic_identity_available": int(
+                bool(active_identity_classes)
+            ),
+            "static_dynamic_identity": ";".join(active_identity_classes),
+            "future_evidence_transition_step_available": 0,
+            "future_evidence_transition_step": -1,
+            "row_contract_valid": 1,
+        })
+    if len(rows) != int(occupied_slots.size):
+        raise RuntimeError(
+            "episode funnel rows do not cover occupied replay generations"
+        )
+    if len({
+            int(row["episode_generation"]) for row in rows
+    }) != len(rows):
+        raise RuntimeError(
+            "episode funnel rows contain duplicate replay generations"
+        )
+    return rows
+
+
+CANDIDATE_EVIDENCE_PROVENANCE_DIAGNOSTIC_VERSION = 1
+CANDIDATE_EVIDENCE_PROVENANCE_DRAFT_FIELDS = (
+    "diagnostic_version",
+    "replay_slot_index",
+    "replay_generation",
+    "environment_episode_id",
+    "episode_ordinal",
+    "capture_event_id",
+    "prey_id",
+    "capture_step",
+    "terminal_step",
+    "capture_to_terminal_distance",
+    "outcome_success",
+    "candidate_index",
+    "candidate_identity",
+    "candidate_order",
+    "participant_slots",
+    "participant_count",
+    "static_dynamic_class",
+    "target_sign",
+    "raw_event_quality",
+    "identity_event_weight",
+    "identity_allocated_quality",
+    "candidate_coefficient",
+    "final_target_mass",
+    "target_bearing_transition_count",
+    "base_selected",
+    "support_selected",
+    "behavior_policy_version",
+    "quality_reconstruction_error",
+    "provenance_complete",
+    "identity_contract_valid",
+    "quality_contract_valid",
+)
+
+
+def build_candidate_evidence_provenance_rows(
+        event_records_by_episode,
+        replay_slot_indices,
+        replay_generations,
+        environment_episode_ids,
+        base_selected,
+        support_selected,
+        outcome_success,
+        episode_outcome_advantage,
+        capture_event_mass_per_episode,
+        candidate_coefficient,
+        candidate_identity_delta,
+        candidate_behavior,
+        terminal_steps):
+    """Build detached event-level rows that reconstruct candidate targets.
+
+    One row is one real capture event times one canonical candidate identity.
+    The helper consumes already-materialized NumPy diagnostics only; it never
+    mutates replay or participates in target/loss construction.
+    """
+    episode_count = len(event_records_by_episode)
+    vector_inputs = (
+        ("replay_slot_indices", replay_slot_indices),
+        ("replay_generations", replay_generations),
+        ("environment_episode_ids", environment_episode_ids),
+        ("base_selected", base_selected),
+        ("support_selected", support_selected),
+        ("outcome_success", outcome_success),
+        ("episode_outcome_advantage", episode_outcome_advantage),
+        ("capture_event_mass_per_episode", capture_event_mass_per_episode),
+        ("terminal_steps", terminal_steps),
+    )
+    vectors = {}
+    for name, values in vector_inputs:
+        array = np.asarray(values).reshape(-1)
+        if array.shape != (episode_count,):
+            raise ValueError(
+                "{} must have shape {}, got {}".format(
+                    name,
+                    (episode_count,),
+                    array.shape,
+                )
+            )
+        vectors[name] = array
+    delta = np.asarray(candidate_identity_delta, dtype=np.float32)
+    behavior = np.asarray(candidate_behavior, dtype=np.float32)
+    if delta.ndim != 3:
+        raise ValueError(
+            "candidate_identity_delta must have shape "
+            "[time, episode, candidate]"
+        )
+    if (
+            behavior.shape != delta.shape + (4,)
+            or delta.shape[1] != episode_count):
+        raise ValueError(
+            "candidate behavior/provenance populations do not match"
+        )
+    if (
+            not np.isfinite(delta).all()
+            or not np.isfinite(behavior).all()):
+        raise FloatingPointError(
+            "candidate evidence provenance inputs must be finite"
+        )
+    coefficient = float(candidate_coefficient)
+    if not np.isfinite(coefficient) or coefficient < 0.0:
+        raise ValueError(
+            "candidate evidence coefficient must be finite and non-negative"
+        )
+
+    rows = []
+    reconstructed_delta = np.zeros_like(delta, dtype=np.float32)
+    event_row_groups = {}
+    for episode_ordinal, event_records in enumerate(
+            event_records_by_episode):
+        if not isinstance(event_records, (list, tuple)):
+            raise TypeError(
+                "candidate event records must be grouped by episode"
+            )
+        event_mass = float(
+            vectors["capture_event_mass_per_episode"][episode_ordinal]
+        )
+        outcome_advantage = float(
+            vectors["episode_outcome_advantage"][episode_ordinal]
+        )
+        if event_mass < 0.0 or not np.isfinite(event_mass):
+            raise ValueError("candidate event mass must be finite and non-negative")
+        if not np.isfinite(outcome_advantage):
+            raise ValueError("candidate outcome advantage must be finite")
+        if not event_records or outcome_advantage == 0.0:
+            continue
+        if event_mass <= 0.0:
+            raise RuntimeError(
+                "candidate evidence event has no episode event-mass "
+                "denominator"
+            )
+        raw_event_quality = abs(outcome_advantage) / event_mass
+        target_sign = 1 if outcome_advantage > 0.0 else -1
+        terminal_step = int(vectors["terminal_steps"][episode_ordinal])
+        replay_slot = int(
+            vectors["replay_slot_indices"][episode_ordinal]
+        )
+        replay_generation = int(
+            vectors["replay_generations"][episode_ordinal]
+        )
+        environment_episode_id = int(
+            vectors["environment_episode_ids"][episode_ordinal]
+        )
+        if (
+                replay_slot < 0
+                or replay_generation < 0
+                or environment_episode_id < 0
+                or terminal_step < 0):
+            raise RuntimeError(
+                "candidate evidence has incomplete episode provenance"
+            )
+        for record in event_records:
+            capture_step = int(record["capture_step"])
+            candidate_index = int(record["candidate_index"])
+            identity_weight = float(record["identity_event_weight"])
+            if (
+                    capture_step < 0
+                    or capture_step >= delta.shape[0]
+                    or candidate_index < 0
+                    or candidate_index >= delta.shape[2]
+                    or terminal_step < capture_step):
+                raise RuntimeError(
+                    "candidate evidence capture provenance is invalid"
+                )
+            identity_allocated_quality = (
+                raw_event_quality * identity_weight
+            )
+            final_target_mass = (
+                identity_allocated_quality * coefficient
+            )
+            if final_target_mass <= 0.0:
+                continue
+            reconstructed_delta[
+                capture_step,
+                episode_ordinal,
+                candidate_index,
+            ] += float(target_sign) * final_target_mass
+            participants = tuple(
+                int(slot) for slot in record["participant_slots"]
+            )
+            event_key = (
+                environment_episode_id,
+                int(record["event_id"]),
+                int(record["target_id"]),
+            )
+            row = {
+                "diagnostic_version": int(
+                    CANDIDATE_EVIDENCE_PROVENANCE_DIAGNOSTIC_VERSION
+                ),
+                "replay_slot_index": replay_slot,
+                "replay_generation": replay_generation,
+                "environment_episode_id": environment_episode_id,
+                "episode_ordinal": int(episode_ordinal),
+                "capture_event_id": int(record["event_id"]),
+                "prey_id": int(record["target_id"]),
+                "capture_step": capture_step,
+                "terminal_step": terminal_step,
+                "capture_to_terminal_distance": int(
+                    terminal_step - capture_step
+                ),
+                "outcome_success": int(bool(
+                    vectors["outcome_success"][episode_ordinal]
+                )),
+                "candidate_index": candidate_index,
+                "candidate_identity": str(
+                    record["candidate_identity"]
+                ),
+                "candidate_order": int(record["candidate_order"]),
+                "participant_slots": "-".join(
+                    str(slot) for slot in participants
+                ),
+                "participant_count": int(len(participants)),
+                "static_dynamic_class": str(
+                    record["static_dynamic_class"]
+                ),
+                "target_sign": int(target_sign),
+                "raw_event_quality": float(raw_event_quality),
+                "identity_event_weight": float(identity_weight),
+                "identity_allocated_quality": float(
+                    identity_allocated_quality
+                ),
+                "candidate_coefficient": coefficient,
+                "final_target_mass": float(final_target_mass),
+                "target_bearing_transition_count": 1,
+                "base_selected": int(bool(
+                    vectors["base_selected"][episode_ordinal]
+                )),
+                "support_selected": int(bool(
+                    vectors["support_selected"][episode_ordinal]
+                )),
+                "behavior_policy_version": float(
+                    behavior[
+                        capture_step,
+                        episode_ordinal,
+                        candidate_index,
+                        3,
+                    ]
+                ),
+                "quality_reconstruction_error": 0.0,
+                "provenance_complete": 1,
+                "identity_contract_valid": 1,
+                "quality_contract_valid": 1,
+            }
+            if tuple(row.keys()) != (
+                    CANDIDATE_EVIDENCE_PROVENANCE_DRAFT_FIELDS):
+                raise RuntimeError(
+                    "candidate evidence provenance draft schema diverged"
+                )
+            event_row_groups.setdefault(event_key, []).append(row)
+            rows.append(row)
+
+    for event_key, event_rows in event_row_groups.items():
+        identity_mass = sum(
+            float(row["final_target_mass"]) for row in event_rows
+        )
+        expected_mass = (
+            float(event_rows[0]["raw_event_quality"]) * coefficient
+        )
+        reconstruction_error = abs(identity_mass - expected_mass)
+        valid = reconstruction_error <= 1e-6
+        if not valid:
+            raise RuntimeError(
+                "candidate evidence event quality does not reconstruct: "
+                "event={}, error={}".format(
+                    event_key,
+                    reconstruction_error,
+                )
+            )
+        for row in event_rows:
+            row["quality_reconstruction_error"] = reconstruction_error
+            row["quality_contract_valid"] = int(valid)
+
+    if not np.allclose(
+            reconstructed_delta,
+            delta,
+            rtol=0.0,
+            atol=1e-6):
+        raise RuntimeError(
+            "candidate evidence provenance rows do not reconstruct the final "
+            "candidate target tensor"
+        )
+    return rows
 
 
 class AdjBuffer(object):
@@ -52,7 +1122,9 @@ class AdjBuffer(object):
                  adj_pair_pursuit_credit_coef=0.0,
                  adj_pair_pursuit_credit_window=20,
                  adj_pair_pursuit_credit_cap=0.20,
-                 adj_pair_pursuit_credit_min_reward=0.0):
+                 adj_pair_pursuit_credit_min_reward=0.0,
+                 pair_bounded_pending_evidence=False,
+                 pair_pending_max_adj_updates=0):
         """
         Replay buffer class for training RNN policies. Stores entire episodes rather than single transitions.
 
@@ -109,6 +1181,13 @@ class AdjBuffer(object):
                 adj_pair_pursuit_credit_window=adj_pair_pursuit_credit_window,
                 adj_pair_pursuit_credit_cap=adj_pair_pursuit_credit_cap,
                 adj_pair_pursuit_credit_min_reward=adj_pair_pursuit_credit_min_reward,
+                pair_bounded_pending_evidence=(
+                    pair_bounded_pending_evidence
+                ),
+                pair_pending_max_adj_updates=(
+                    pair_pending_max_adj_updates
+                ),
+                policy_id=p_id,
             )
             for i, p_id in enumerate(self.policy_info.keys())
         }
@@ -122,7 +1201,11 @@ class AdjBuffer(object):
                capture_factor_matches=None,
                capture_candidate_only_matches=None,
                capture_candidate_behavior=None,
-               capture_identity_candidates=None):
+               capture_identity_candidates=None,
+               capture_candidate_event_provenance=None,
+               capture_active_event_provenance=None,
+               environment_episode_ids=None,
+               behavior_policy_versions=None):
         """
         Insert a set of episodes into buffer. If the buffer size overflows, old episodes are dropped.
 
@@ -170,6 +1253,21 @@ class AdjBuffer(object):
                 if isinstance(capture_candidate_behavior, dict)
                 else capture_candidate_behavior
             )
+            policy_candidate_event_provenance = (
+                capture_candidate_event_provenance.get(p_id)
+                if isinstance(capture_candidate_event_provenance, dict)
+                else capture_candidate_event_provenance
+            )
+            policy_active_event_provenance = (
+                capture_active_event_provenance.get(p_id)
+                if isinstance(capture_active_event_provenance, dict)
+                else capture_active_event_provenance
+            )
+            policy_behavior_versions = (
+                behavior_policy_versions.get(p_id)
+                if isinstance(behavior_policy_versions, dict)
+                else behavior_policy_versions
+            )
             if policy_capture_counts is None:
                 policy_capture_counts = np.zeros_like(
                     policy_dones_env,
@@ -193,7 +1291,11 @@ class AdjBuffer(object):
                                                           policy_capture_factor_matches,
                                                           policy_capture_candidate_only_matches,
                                                           policy_capture_candidate_behavior,
-                                                          policy_capture_identity_candidates)
+                                                          policy_capture_identity_candidates,
+                                                          policy_candidate_event_provenance,
+                                                          policy_active_event_provenance,
+                                                          environment_episode_ids,
+                                                          policy_behavior_versions)
         return idx_range
 
     '''def sample(self, batch_size,data_chunk_length,num_mini_batch):
@@ -224,6 +1326,54 @@ class AdjBuffer(object):
             self.policy_buffers[p_id].compute_advantage(idx)
         return idx
 
+    def set_pair_pending_clock(
+            self,
+            adjacency_update_index,
+            behavior_policy_version):
+        for policy_buffer in self.policy_buffers.values():
+            policy_buffer.set_pair_pending_clock(
+                adjacency_update_index,
+                behavior_policy_version,
+            )
+
+    def prepare_pair_pending_training_batches(self, expected_ppo_epochs):
+        return {
+            policy_id: policy_buffer.prepare_pair_pending_training_batch(
+                expected_ppo_epochs
+            )
+            for policy_id, policy_buffer in self.policy_buffers.items()
+        }
+
+    def pair_pending_state_dict(self):
+        return {
+            "version": 1,
+            "policies": {
+                policy_id: policy_buffer.pair_pending_state_dict()
+                for policy_id, policy_buffer in self.policy_buffers.items()
+            },
+        }
+
+    def load_pair_pending_state_dict(self, state):
+        if int(state.get("version", -1)) != 1:
+            raise RuntimeError(
+                "unsupported adjacency pair pending checkpoint version"
+            )
+        policies = state.get("policies", {})
+        if set(policies) != set(self.policy_buffers):
+            raise RuntimeError(
+                "pair pending checkpoint policy set mismatch"
+            )
+        for policy_id, policy_buffer in self.policy_buffers.items():
+            policy_buffer.load_pair_pending_state_dict(
+                policies[policy_id]
+            )
+
+    def pair_pending_update_diagnostics(self):
+        return {
+            policy_id: policy_buffer.pair_pending_update_diagnostics()
+            for policy_id, policy_buffer in self.policy_buffers.items()
+        }
+
 
 class AdjPolicyBuffer(object):
     def __init__(self, buffer_size, episode_length, num_agents, num_factor, obs_space, share_obs_space, act_space,
@@ -253,7 +1403,10 @@ class AdjPolicyBuffer(object):
                  adj_pair_pursuit_credit_coef=0.0,
                  adj_pair_pursuit_credit_window=20,
                  adj_pair_pursuit_credit_cap=0.20,
-                 adj_pair_pursuit_credit_min_reward=0.0):
+                 adj_pair_pursuit_credit_min_reward=0.0,
+                 pair_bounded_pending_evidence=False,
+                 pair_pending_max_adj_updates=0,
+                 policy_id="policy_0"):
         """
         Buffer class containing buffer data corresponding to a single policy.
 
@@ -286,6 +1439,25 @@ class AdjPolicyBuffer(object):
             -1,
             dtype=np.int64,
         )
+        self.environment_episode_id = np.full(
+            self.buffer_size,
+            -1,
+            dtype=np.int64,
+        )
+        self.episode_behavior_policy_version = np.full(
+            self.buffer_size,
+            -1,
+            dtype=np.int64,
+        )
+        self.capture_candidate_event_provenance = [
+            tuple() for _ in range(self.buffer_size)
+        ]
+        self.capture_active_event_provenance = [
+            tuple() for _ in range(self.buffer_size)
+        ]
+        self.strict_pair_event_provenance = [
+            tuple() for _ in range(self.buffer_size)
+        ]
         self.outcome_support_used = np.zeros(
             self.buffer_size,
             dtype=bool,
@@ -299,6 +1471,7 @@ class AdjPolicyBuffer(object):
         self.outcome_slot_overwrite_count = 0
         self.outcome_generation_conflict_count = 0
         self.outcome_invalid_used_state_count = 0
+        self.last_sample_candidate_evidence_provenance_rows = []
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.hidden_size = hidden_size
@@ -393,6 +1566,43 @@ class AdjPolicyBuffer(object):
         self.adj_pair_pursuit_credit_min_reward = float(
             adj_pair_pursuit_credit_min_reward
         )
+        self.pair_pending_store = PairPendingEvidenceStore(
+            enabled=bool(pair_bounded_pending_evidence),
+            max_adj_updates=int(pair_pending_max_adj_updates),
+        )
+        self.pair_pending_enabled = bool(pair_bounded_pending_evidence)
+        self.pair_pending_max_adj_updates = int(
+            pair_pending_max_adj_updates
+        )
+        self.pair_pending_current_adj_update = 0
+        self.pair_pending_behavior_policy_version = 0
+        self.policy_id = str(policy_id)
+        self.pair_pending_new_snapshot_count = 0
+        self.pair_pending_expired_ttl_count = 0
+        self.pair_pending_payload_contract_valid = 1.0
+        self.pair_pending_counter_update = -1
+        self.pair_pending_prepared_count = 0
+        self.pair_pending_aborted_count = 0
+        self.pair_pending_rolled_back_count = 0
+        self.pair_pending_committed_count = 0
+        self.pair_pending_class_complete_count = 0
+        self.pair_pending_pair_only_transaction_count = 0
+        self.pair_pending_zero_target_abort_count = 0
+        self.pair_pending_zero_gradient_abort_count = 0
+        self.pair_pending_early_stop_abort_count = 0
+        self.pair_pending_expired_provenance_count = 0
+        self.pair_pending_expired_population_mismatch_count = 0
+        self.pair_pending_stale_contract_valid = 1.0
+        self.pair_pending_mass_contract_valid = 1.0
+        self.pair_pending_objective_scope_contract_valid = 1.0
+        self.pair_pending_atomic_rollback_contract_valid = 1.0
+        self.pair_pending_checkpoint_contract_valid = 1.0
+        self.pair_pending_last_positive_stale_trust = 0.0
+        self.pair_pending_last_negative_stale_trust = 0.0
+        self.pair_pending_last_raw_positive_mass = 0.0
+        self.pair_pending_last_raw_negative_mass = 0.0
+        self.pair_pending_last_effective_positive_mass = 0.0
+        self.pair_pending_last_effective_negative_mass = 0.0
 
         self.rng = np.random.RandomState(int(seed))
         # obs
@@ -658,6 +1868,11 @@ class AdjPolicyBuffer(object):
             episode_idx,
             axis=1,
         ).astype(np.int64, copy=False)
+        current_prob_adj = np.take(
+            self.prob_adj[:-1, :, :, :self.num_factor],
+            episode_idx,
+            axis=1,
+        ).astype(np.float32, copy=False)
         current_obs = np.take(
             self.obs[:-1],
             episode_idx,
@@ -668,6 +1883,13 @@ class AdjPolicyBuffer(object):
             axis=-1,
         )
         factor_size = current_adj.sum(axis=2)
+        selected_factor_behavior_probability = (
+            (
+                current_prob_adj
+                * current_adj.astype(np.float32, copy=False)
+            ).sum(axis=2, dtype=np.float32)
+            / np.maximum(factor_size, 1).astype(np.float32, copy=False)
+        ).astype(np.float32, copy=False)
         factor_alive_count = (
             current_adj * current_active[:, :, :, None]
         ).sum(axis=2)
@@ -1138,10 +2360,27 @@ class AdjPolicyBuffer(object):
                 )
             )
 
+        outcome_diagnostics = compute_capture_to_win_outcome_gate(
+            success_now=success_now_ref,
+            capture_counts=capture_counts_ref,
+            valid_graph_transition=valid_graph_transition,
+        )
+        episode_success = outcome_diagnostics["episode_success"]
+        capture_to_win_episode_success_gate = outcome_diagnostics[
+            "episode_success_gate"
+        ]
+        failed_episode_capture_count = outcome_diagnostics[
+            "failed_episode_capture_count"
+        ]
+
         pair_credit_diagnostics = compute_capture_anchored_pair_credit(
             current_adj=current_adj,
             valid_factor=valid_factor,
             factor_size=factor_size,
+            active_agent_count=active_count_ref,
+            selected_factor_behavior_probability=(
+                selected_factor_behavior_probability
+            ),
             capture_counts=capture_counts_ref,
             capture_factor_match=capture_factor_matches_ref,
             valid_graph_transition=valid_graph_transition,
@@ -1149,7 +2388,28 @@ class AdjPolicyBuffer(object):
             team_rewards=team_rewards_ref,
             window=self.adj_pair_pursuit_credit_window,
             gamma=self.gamma,
+            capture_event_provenance_by_episode=(
+                [
+                    self.capture_active_event_provenance[int(replay_slot)]
+                    for replay_slot in reference_idx.tolist()
+                ]
+                if self.pair_pending_enabled
+                else None
+            ),
         )
+        strict_pair_event_provenance = pair_credit_diagnostics[
+            "strict_pair_event_provenance"
+        ]
+        if len(strict_pair_event_provenance) != reference_idx.size:
+            raise RuntimeError(
+                "strict pair event provenance episode axis is misaligned"
+            )
+        for episode_offset, replay_slot in enumerate(
+                reference_idx.tolist()):
+            self.strict_pair_event_provenance[int(replay_slot)] = tuple(
+                dict(record)
+                for record in strict_pair_event_provenance[episode_offset]
+            )
         pair_pursuit_credit = np.zeros_like(local_adv, dtype=np.float32)
         pair_pursuit_quality = pair_credit_diagnostics[
             "pair_pursuit_quality"
@@ -1185,10 +2445,7 @@ class AdjPolicyBuffer(object):
             self.use_adj_pair_triplet_complementary_credit
             and self.adj_pair_pursuit_credit_coef > 0.0
         ):
-            pair_pursuit_credit = (
-                pair_to_triplet_transition_score
-                * float(self.adj_pair_pursuit_credit_coef)
-            )
+            credit_cap = 0.0
             if self.adj_pair_pursuit_credit_cap > 0.0:
                 valid_abs_graph = np.abs(graph_adv[valid_graph_transition])
                 graph_abs_scale = (
@@ -1198,15 +2455,16 @@ class AdjPolicyBuffer(object):
                 )
                 if not np.isfinite(graph_abs_scale) or graph_abs_scale < 1e-6:
                     graph_abs_scale = 1.0
-                credit_cap = (
+                credit_cap = float(
                     graph_abs_scale
                     * float(self.adj_pair_pursuit_credit_cap)
                 )
-                pair_pursuit_credit = np.clip(
-                    pair_pursuit_credit,
-                    0.0,
-                    credit_cap,
-                )
+            pair_pursuit_credit = scale_optimizer_cohort_pair_credit(
+                pair_transition_score=pair_to_triplet_transition_score,
+                episode_success=episode_success,
+                coefficient=self.adj_pair_pursuit_credit_coef,
+                credit_cap=credit_cap,
+            )["credit"]
 
         capture_to_win_triplet_credit = np.zeros_like(
             local_adv,
@@ -1224,18 +2482,6 @@ class AdjPolicyBuffer(object):
             ),
             dtype=np.float32,
         )
-        outcome_diagnostics = compute_capture_to_win_outcome_gate(
-            success_now=success_now_ref,
-            capture_counts=capture_counts_ref,
-            valid_graph_transition=valid_graph_transition,
-        )
-        episode_success = outcome_diagnostics["episode_success"]
-        capture_to_win_episode_success_gate = outcome_diagnostics[
-            "episode_success_gate"
-        ]
-        failed_episode_capture_count = outcome_diagnostics[
-            "failed_episode_capture_count"
-        ]
         if (
             self.use_adj_capture_to_win_credit
             and self.adj_capture_to_win_credit_coef > 0.0
@@ -1457,7 +2703,6 @@ class AdjPolicyBuffer(object):
             self.adj_return_adv_coef * graph_factor_adv
             + self.adj_factor_adv_coef * local_adv
             + delayed_triplet_credit
-            + pair_pursuit_credit
         )
         combined_adv[~valid_factor] = 0.0
         f_advt_values = self.f_advt[..., 0]
@@ -1554,7 +2799,11 @@ class AdjPolicyBuffer(object):
                capture_factor_matches=None,
                capture_candidate_only_matches=None,
                capture_candidate_behavior=None,
-               capture_identity_candidates=None):
+               capture_identity_candidates=None,
+               capture_candidate_event_provenance=None,
+               capture_active_event_provenance=None,
+               environment_episode_ids=None,
+               behavior_policy_versions=None):
         """
         Insert a set of episodes corresponding to this policy into buffer. If the buffer size overflows, old transitions are dropped.
 
@@ -1575,6 +2824,33 @@ class AdjPolicyBuffer(object):
 
         episode_length = acts.shape[0]
         assert episode_length == self.episode_length, ("different dimension!")
+
+        if behavior_policy_versions is None:
+            behavior_policy_versions = np.zeros(
+                int(num_insert_episodes), dtype=np.int64
+            )
+        else:
+            behavior_policy_versions = np.asarray(
+                behavior_policy_versions, dtype=np.int64
+            )
+            if behavior_policy_versions.ndim == 0:
+                behavior_policy_versions = np.full(
+                    int(num_insert_episodes),
+                    int(behavior_policy_versions),
+                    dtype=np.int64,
+                )
+            else:
+                behavior_policy_versions = (
+                    behavior_policy_versions.reshape(-1)
+                )
+        if (
+                behavior_policy_versions.shape
+                != (int(num_insert_episodes),)
+                or np.any(behavior_policy_versions < 0)):
+            raise ValueError(
+                "behavior policy versions must contain one non-negative "
+                "version per inserted episode"
+            )
 
         expected_event_shape = (
             self.episode_length,
@@ -1688,7 +2964,8 @@ class AdjPolicyBuffer(object):
             if self.use_adj_capture_to_win_credit:
                 raise RuntimeError(
                     "capture-to-win candidate supervision requires rollout "
-                    "candidate score/rank/mask/policy-version metadata"
+                    "candidate active-replacement-logit/rank/mask/policy-version "
+                    "metadata"
                 )
             capture_candidate_behavior = np.zeros(
                 expected_candidate_behavior_shape,
@@ -1708,18 +2985,16 @@ class AdjPolicyBuffer(object):
             )
         if not np.isfinite(capture_candidate_behavior).all():
             raise ValueError("capture_candidate_behavior must be finite")
-        behavior_score = capture_candidate_behavior[..., 0]
         behavior_rank = capture_candidate_behavior[..., 1]
         behavior_valid = capture_candidate_behavior[..., 2]
         behavior_version = capture_candidate_behavior[..., 3]
         if (
-                np.any(behavior_score < 0.0)
-                or np.any(behavior_rank < 0.0)
+                np.any(behavior_rank < 0.0)
                 or np.any(behavior_version < 0.0)
                 or np.any((behavior_valid != 0.0) & (behavior_valid != 1.0))):
             raise ValueError(
-                "candidate behavior score/rank/version must be non-negative "
-                "and valid_mask must be binary"
+                "candidate behavior rank/version must be non-negative and "
+                "valid_mask must be binary"
             )
         candidate_target = capture_candidate_only_matches > 0.0
         if np.any(candidate_target & (behavior_valid <= 0.0)):
@@ -1758,6 +3033,394 @@ class AdjPolicyBuffer(object):
             raise ValueError(
                 "capture_identity_candidates must be finite and non-negative"
             )
+        has_candidate_capture = bool(np.any(
+            capture_candidate_only_matches > 0.0
+        ))
+        if capture_candidate_event_provenance is None:
+            if has_candidate_capture:
+                raise RuntimeError(
+                    "candidate-only capture targets require event-level "
+                    "provenance"
+                )
+            capture_candidate_event_provenance = [
+                tuple() for _ in range(num_insert_episodes)
+            ]
+        if (
+                not isinstance(capture_candidate_event_provenance, (list, tuple))
+                or len(capture_candidate_event_provenance)
+                != int(num_insert_episodes)):
+            raise ValueError(
+                "candidate event provenance must contain one event list per "
+                "inserted episode"
+            )
+        if environment_episode_ids is None:
+            if has_candidate_capture:
+                raise RuntimeError(
+                    "candidate-only capture targets require environment "
+                    "episode identities"
+                )
+            environment_episode_ids = np.full(
+                num_insert_episodes,
+                -1,
+                dtype=np.int64,
+            )
+        environment_episode_ids = np.asarray(
+            environment_episode_ids,
+            dtype=np.int64,
+        ).reshape(-1)
+        if environment_episode_ids.shape != (int(num_insert_episodes),):
+            raise ValueError(
+                "environment_episode_ids must have shape {}, got {}".format(
+                    (int(num_insert_episodes),),
+                    environment_episode_ids.shape,
+                )
+            )
+        if (
+                has_candidate_capture
+                and (
+                    np.any(environment_episode_ids < 0)
+                    or np.unique(environment_episode_ids).size
+                    != environment_episode_ids.size
+                )):
+            raise RuntimeError(
+                "candidate event provenance requires unique non-negative "
+                "environment episode identities"
+            )
+        candidate_catalog = canonical_capture_factor_catalog(
+            self.num_agents,
+            3,
+        )
+        normalized_event_provenance = []
+        for episode_offset, event_records in enumerate(
+                capture_candidate_event_provenance):
+            if not isinstance(event_records, (list, tuple)):
+                raise TypeError(
+                    "candidate event provenance for one episode must be a "
+                    "list or tuple"
+                )
+            normalized_records = []
+            event_identity_keys = set()
+            for record in event_records:
+                if not isinstance(record, dict):
+                    raise TypeError(
+                        "candidate event provenance record must be a dict"
+                    )
+                required_fields = (
+                    "environment_episode_id",
+                    "event_id",
+                    "target_id",
+                    "participant_slots",
+                    "candidate_index",
+                    "candidate_identity",
+                    "candidate_order",
+                    "identity_event_weight",
+                    "capture_step",
+                    "static_dynamic_class",
+                )
+                missing = [
+                    field for field in required_fields
+                    if field not in record
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "candidate event provenance is missing {}".format(
+                            ",".join(missing)
+                        )
+                    )
+                environment_episode_id = int(
+                    record["environment_episode_id"]
+                )
+                if environment_episode_id != int(
+                        environment_episode_ids[episode_offset]):
+                    raise RuntimeError(
+                        "candidate event provenance environment episode "
+                        "identity is misaligned"
+                    )
+                event_id = int(record["event_id"])
+                prey_id = int(record["target_id"])
+                capture_step = int(record["capture_step"])
+                candidate_index = int(record["candidate_index"])
+                candidate_order = int(record["candidate_order"])
+                participants = tuple(
+                    int(slot) for slot in record["participant_slots"]
+                )
+                identity = str(record["candidate_identity"])
+                static_dynamic_class = str(
+                    record["static_dynamic_class"]
+                )
+                identity_weight = float(record["identity_event_weight"])
+                if (
+                        event_id < 0
+                        or prey_id < 0
+                        or capture_step < 0
+                        or capture_step >= self.episode_length
+                        or candidate_index < 0
+                        or candidate_index >= len(candidate_catalog)
+                        or candidate_order not in (2, 3)
+                        or static_dynamic_class not in ("static", "dynamic")
+                        or not np.isfinite(identity_weight)
+                        or identity_weight <= 0.0):
+                    raise RuntimeError(
+                        "candidate event provenance contains an invalid value"
+                    )
+                expected_identity_nodes = candidate_catalog[candidate_index]
+                expected_identity = "-".join(
+                    str(int(node)) for node in expected_identity_nodes
+                )
+                if (
+                        identity != expected_identity
+                        or candidate_order != len(expected_identity_nodes)
+                        or participants != tuple(sorted(set(participants)))
+                        or not set(expected_identity_nodes).issubset(
+                            set(participants)
+                        )):
+                    raise RuntimeError(
+                        "candidate event provenance identity contract failed"
+                    )
+                event_identity_key = (
+                    environment_episode_id,
+                    event_id,
+                    prey_id,
+                    candidate_index,
+                )
+                if event_identity_key in event_identity_keys:
+                    raise RuntimeError(
+                        "candidate event provenance duplicates one event "
+                        "identity"
+                    )
+                event_identity_keys.add(event_identity_key)
+                normalized_records.append({
+                    "environment_episode_id": environment_episode_id,
+                    "event_id": event_id,
+                    "target_id": prey_id,
+                    "participant_slots": participants,
+                    "candidate_index": candidate_index,
+                    "candidate_identity": identity,
+                    "candidate_order": candidate_order,
+                    "identity_event_weight": identity_weight,
+                    "capture_step": capture_step,
+                    "static_dynamic_class": static_dynamic_class,
+                })
+            normalized_event_provenance.append(tuple(normalized_records))
+        if has_candidate_capture and not any(normalized_event_provenance):
+            raise RuntimeError(
+                "candidate-only capture tensor has no event provenance rows"
+            )
+        reconstructed_candidate_matches = np.zeros_like(
+            capture_candidate_only_matches,
+            dtype=np.float32,
+        )
+        for episode_offset, records in enumerate(
+                normalized_event_provenance):
+            event_mass = {}
+            for record in records:
+                event_key = (
+                    record["environment_episode_id"],
+                    record["event_id"],
+                    record["target_id"],
+                    record["capture_step"],
+                )
+                event_mass[event_key] = (
+                    event_mass.get(event_key, 0.0)
+                    + float(record["identity_event_weight"])
+                )
+                reconstructed_candidate_matches[
+                    record["capture_step"],
+                    episode_offset,
+                    record["candidate_index"],
+                ] += float(record["identity_event_weight"])
+            if any(
+                    abs(float(mass) - 1.0) > 1e-6
+                    for mass in event_mass.values()):
+                raise RuntimeError(
+                    "candidate event provenance does not conserve unit event "
+                    "quality across identities"
+                )
+        if not np.allclose(
+                reconstructed_candidate_matches,
+                capture_candidate_only_matches,
+                rtol=0.0,
+                atol=1e-6):
+            raise RuntimeError(
+                "candidate event provenance does not reconstruct the "
+                "candidate-only capture tensor"
+            )
+
+        has_active_capture = bool(np.any(capture_factor_matches > 0.0))
+        if capture_active_event_provenance is None:
+            if has_active_capture and self.pair_pending_enabled:
+                raise RuntimeError(
+                    "active identity-matched captures require event-level "
+                    "provenance"
+                )
+            capture_active_event_provenance = [
+                tuple() for _ in range(num_insert_episodes)
+            ]
+        if (
+                not isinstance(capture_active_event_provenance, (list, tuple))
+                or len(capture_active_event_provenance)
+                != int(num_insert_episodes)):
+            raise ValueError(
+                "active event provenance must contain one event list per "
+                "inserted episode"
+            )
+        normalized_active_event_provenance = []
+        reconstructed_active_matches = np.zeros_like(
+            capture_factor_matches,
+            dtype=np.float32,
+        )
+        for episode_offset, event_records in enumerate(
+                capture_active_event_provenance):
+            if not isinstance(event_records, (list, tuple)):
+                raise TypeError(
+                    "active event provenance for one episode must be a list "
+                    "or tuple"
+                )
+            normalized_records = []
+            logical_keys = set()
+            event_mass = {}
+            for record in event_records:
+                if not isinstance(record, dict):
+                    raise TypeError(
+                        "active event provenance record must be a dict"
+                    )
+                required_fields = (
+                    "environment_episode_id",
+                    "event_id",
+                    "target_id",
+                    "participant_slots",
+                    "factor_index",
+                    "factor_identity",
+                    "factor_order",
+                    "identity_event_weight",
+                    "factor_slot_weight",
+                    "capture_step",
+                    "static_dynamic_class",
+                )
+                missing = [
+                    field for field in required_fields
+                    if field not in record
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "active event provenance is missing {}".format(
+                            ",".join(missing)
+                        )
+                    )
+                environment_episode_id = int(
+                    record["environment_episode_id"]
+                )
+                if environment_episode_id != int(
+                        environment_episode_ids[episode_offset]):
+                    raise RuntimeError(
+                        "active event provenance environment episode "
+                        "identity is misaligned"
+                    )
+                event_id = int(record["event_id"])
+                prey_id = int(record["target_id"])
+                capture_step = int(record["capture_step"])
+                factor_index = int(record["factor_index"])
+                factor_order = int(record["factor_order"])
+                participants = tuple(
+                    sorted(int(slot)
+                           for slot in record["participant_slots"])
+                )
+                factor_identity = str(record["factor_identity"])
+                identity_nodes = tuple(
+                    int(node)
+                    for node in factor_identity.split("-")
+                    if node != ""
+                )
+                identity_weight = float(record["identity_event_weight"])
+                factor_slot_weight = float(record["factor_slot_weight"])
+                static_dynamic_class = str(
+                    record["static_dynamic_class"]
+                )
+                if (
+                        event_id < 0
+                        or prey_id < 0
+                        or capture_step < 0
+                        or capture_step >= self.episode_length
+                        or factor_index < 0
+                        or factor_index >= self.num_factor
+                        or factor_order not in (2, 3)
+                        or len(identity_nodes) != factor_order
+                        or tuple(sorted(identity_nodes)) != identity_nodes
+                        or not set(identity_nodes).issubset(participants)
+                        or static_dynamic_class not in ("static", "dynamic")
+                        or not np.isfinite(identity_weight)
+                        or identity_weight <= 0.0
+                        or not np.isfinite(factor_slot_weight)
+                        or factor_slot_weight <= 0.0):
+                    raise RuntimeError(
+                        "active event provenance contains an invalid value"
+                    )
+                rollout_nodes = tuple(sorted(
+                    np.flatnonzero(
+                        adj[
+                            capture_step,
+                            episode_offset,
+                            :,
+                            factor_index,
+                        ] > 0
+                    ).tolist()
+                ))
+                if rollout_nodes != identity_nodes:
+                    raise RuntimeError(
+                        "active event provenance identity does not match the "
+                        "rollout graph"
+                    )
+                logical_key = (
+                    environment_episode_id,
+                    event_id,
+                    prey_id,
+                    factor_index,
+                )
+                if logical_key in logical_keys:
+                    raise RuntimeError(
+                        "active event provenance duplicates one event factor"
+                    )
+                logical_keys.add(logical_key)
+                event_key = (
+                    environment_episode_id,
+                    event_id,
+                    prey_id,
+                    capture_step,
+                )
+                event_mass[event_key] = (
+                    event_mass.get(event_key, 0.0) + factor_slot_weight
+                )
+                reconstructed_active_matches[
+                    capture_step,
+                    episode_offset,
+                    factor_index,
+                ] += factor_slot_weight
+                normalized = dict(record)
+                normalized["participant_slots"] = participants
+                normalized["factor_identity_nodes"] = identity_nodes
+                normalized_records.append(normalized)
+            if any(
+                    abs(float(mass) - 1.0) > 1e-6
+                    for mass in event_mass.values()):
+                raise RuntimeError(
+                    "active event provenance does not conserve unit event "
+                    "quality"
+                )
+            normalized_active_event_provenance.append(
+                tuple(normalized_records)
+            )
+        if (
+                (self.pair_pending_enabled
+                 or any(normalized_active_event_provenance))
+                and not np.allclose(
+                reconstructed_active_matches,
+                capture_factor_matches,
+                rtol=0.0,
+                atol=1e-6)):
+            raise RuntimeError(
+                "active event provenance does not reconstruct the identity-"
+                "matched capture tensor"
+            )
 
         if self.current_i + num_insert_episodes <= self.buffer_size:
             idx_range = np.arange(self.current_i, self.current_i + num_insert_episodes)
@@ -1770,6 +3433,28 @@ class AdjPolicyBuffer(object):
             share_obs = share_obs[:, :, 0]
 
         overwritten_mask = self.episode_generation[idx_range] >= 0
+        if self.pair_pending_enabled:
+            for replay_slot in idx_range[overwritten_mask].tolist():
+                old_generation = int(self.episode_generation[replay_slot])
+                for pending_key in (
+                        self.pair_pending_store.keys_for_generation(
+                            self.policy_id,
+                            old_generation,
+                        )):
+                    entry = self.pair_pending_store.entries[pending_key]
+                    if entry["state"] == PAIR_EVIDENCE_AVAILABLE_IN_REPLAY:
+                        # TTL starts when the circular replay actually evicts
+                        # the episode, not when that episode happened to be
+                        # sampled most recently.
+                        self.pair_pending_store.refresh_available(
+                            pending_key,
+                            self.pair_pending_current_adj_update,
+                            self.pair_pending_behavior_policy_version,
+                        )
+                        self.pair_pending_store.mark_pending(
+                            pending_key,
+                            self.pair_pending_current_adj_update,
+                        )
         self.outcome_slot_overwrite_count += int(np.sum(overwritten_mask))
         if np.any(
                 self.outcome_support_used[idx_range]
@@ -1788,6 +3473,21 @@ class AdjPolicyBuffer(object):
         self._next_episode_generation += len(idx_range)
         self.outcome_generation_update_count += len(idx_range)
         self.episode_generation[idx_range] = generations
+        self.environment_episode_id[idx_range] = environment_episode_ids
+        self.episode_behavior_policy_version[idx_range] = (
+            behavior_policy_versions
+        )
+        for episode_offset, replay_slot in enumerate(idx_range.tolist()):
+            self.capture_candidate_event_provenance[replay_slot] = tuple(
+                dict(record)
+                for record in normalized_event_provenance[episode_offset]
+            )
+            self.capture_active_event_provenance[replay_slot] = tuple(
+                dict(record)
+                for record in
+                normalized_active_event_provenance[episode_offset]
+            )
+            self.strict_pair_event_provenance[replay_slot] = tuple()
         self.outcome_support_used[idx_range] = False
         # A circular-buffer overwrite cannot inherit the prior episode's graph
         # confidence. compute_advantage() repopulates both arrays before replay.
@@ -1967,6 +3667,789 @@ class AdjPolicyBuffer(object):
             % int(self.buffer_size)
         )
 
+    def set_pair_pending_clock(
+            self,
+            adjacency_update_index,
+            behavior_policy_version):
+        next_update = int(adjacency_update_index)
+        if next_update != self.pair_pending_current_adj_update:
+            self.pair_pending_new_snapshot_count = 0
+            self.pair_pending_expired_ttl_count = 0
+            self.pair_pending_prepared_count = 0
+            self.pair_pending_aborted_count = 0
+            self.pair_pending_rolled_back_count = 0
+            self.pair_pending_committed_count = 0
+            self.pair_pending_class_complete_count = 0
+            self.pair_pending_pair_only_transaction_count = 0
+            self.pair_pending_zero_target_abort_count = 0
+            self.pair_pending_zero_gradient_abort_count = 0
+            self.pair_pending_early_stop_abort_count = 0
+            self.pair_pending_expired_provenance_count = 0
+            self.pair_pending_expired_population_mismatch_count = 0
+            self.pair_pending_stale_contract_valid = 1.0
+            self.pair_pending_mass_contract_valid = 1.0
+            self.pair_pending_objective_scope_contract_valid = 1.0
+            self.pair_pending_atomic_rollback_contract_valid = 1.0
+            self.pair_pending_checkpoint_contract_valid = 1.0
+            self.pair_pending_last_positive_stale_trust = 0.0
+            self.pair_pending_last_negative_stale_trust = 0.0
+            self.pair_pending_last_raw_positive_mass = 0.0
+            self.pair_pending_last_raw_negative_mass = 0.0
+            self.pair_pending_last_effective_positive_mass = 0.0
+            self.pair_pending_last_effective_negative_mass = 0.0
+            self.pair_pending_counter_update = next_update
+        self.pair_pending_current_adj_update = next_update
+        self.pair_pending_behavior_policy_version = int(
+            behavior_policy_version
+        )
+        if (
+                self.pair_pending_current_adj_update < 0
+                or self.pair_pending_behavior_policy_version < 0):
+            raise ValueError("pair pending clocks must be non-negative")
+        if self.pair_pending_enabled:
+            expired = self.pair_pending_store.expire_out_of_horizon(
+                self.pair_pending_current_adj_update
+            )
+            self.pair_pending_expired_ttl_count += len(expired)
+
+    def pair_pending_update_diagnostics(self):
+        diagnostics = self.pair_pending_store.diagnostics(
+            self.pair_pending_current_adj_update,
+            self.pair_pending_behavior_policy_version,
+        )
+        diagnostics.update({
+            "policy_id": self.policy_id,
+            "adjacency_update_index": int(
+                self.pair_pending_current_adj_update
+            ),
+            "current_policy_version": int(
+                self.pair_pending_behavior_policy_version
+            ),
+            "new_snapshot_count": int(
+                self.pair_pending_new_snapshot_count
+            ),
+            "expired_by_ttl_count": int(
+                self.pair_pending_expired_ttl_count
+            ),
+            "payload_contract_valid": float(
+                self.pair_pending_payload_contract_valid
+            ),
+            "prepared_this_update_count": int(
+                self.pair_pending_prepared_count
+            ),
+            "aborted_this_update_count": int(
+                self.pair_pending_aborted_count
+            ),
+            "rolled_back_this_update_count": int(
+                self.pair_pending_rolled_back_count
+            ),
+            "committed_this_update_count": int(
+                self.pair_pending_committed_count
+            ),
+            "class_complete_from_pending_count": int(
+                self.pair_pending_class_complete_count
+            ),
+            "pair_only_transaction_count": int(
+                self.pair_pending_pair_only_transaction_count
+            ),
+            "zero_target_abort_count": int(
+                self.pair_pending_zero_target_abort_count
+            ),
+            "zero_gradient_abort_count": int(
+                self.pair_pending_zero_gradient_abort_count
+            ),
+            "early_stop_abort_count": int(
+                self.pair_pending_early_stop_abort_count
+            ),
+            "expired_by_provenance_count": int(
+                self.pair_pending_expired_provenance_count
+            ),
+            "expired_by_population_mismatch_count": int(
+                self.pair_pending_expired_population_mismatch_count
+            ),
+            "stale_contract_valid": float(
+                self.pair_pending_stale_contract_valid
+            ),
+            "mass_contract_valid": float(
+                self.pair_pending_mass_contract_valid
+            ),
+            "objective_scope_contract_valid": float(
+                self.pair_pending_objective_scope_contract_valid
+            ),
+            "atomic_rollback_contract_valid": float(
+                self.pair_pending_atomic_rollback_contract_valid
+            ),
+            "checkpoint_contract_valid": float(
+                self.pair_pending_checkpoint_contract_valid
+            ),
+            "positive_stale_trust": float(
+                self.pair_pending_last_positive_stale_trust
+            ),
+            "negative_stale_trust": float(
+                self.pair_pending_last_negative_stale_trust
+            ),
+            "raw_positive_mass": float(
+                self.pair_pending_last_raw_positive_mass
+            ),
+            "raw_negative_mass": float(
+                self.pair_pending_last_raw_negative_mass
+            ),
+            "effective_positive_mass": float(
+                self.pair_pending_last_effective_positive_mass
+            ),
+            "effective_negative_mass": float(
+                self.pair_pending_last_effective_negative_mass
+            ),
+        })
+        return diagnostics
+
+    def record_pair_pending_transaction_result(
+            self,
+            committed=False,
+            rolled_back=False,
+            abort_reason="",
+            objective_scope_contract_valid=True,
+            stale_contract_valid=True,
+            mass_contract_valid=True,
+            atomic_rollback_contract_valid=True,
+            checkpoint_contract_valid=True,
+            positive_stale_trust=0.0,
+            negative_stale_trust=0.0,
+            raw_positive_mass=0.0,
+            raw_negative_mass=0.0,
+            effective_positive_mass=0.0,
+            effective_negative_mass=0.0):
+        """Record one logical pending cohort result without training effects."""
+        if not self.pair_pending_enabled:
+            raise RuntimeError(
+                "cannot record a pending transaction while pending is disabled"
+            )
+        committed = bool(committed)
+        rolled_back = bool(rolled_back)
+        abort_reason = str(abort_reason or "")
+        if committed == bool(abort_reason):
+            raise RuntimeError(
+                "pending result must be exactly one of commit or abort"
+            )
+        if committed and rolled_back:
+            raise RuntimeError(
+                "committed pending transaction cannot also be rolled back"
+            )
+        if committed:
+            self.pair_pending_committed_count += 1
+        else:
+            self.pair_pending_aborted_count += 1
+            self.pair_pending_rolled_back_count += int(rolled_back)
+            normalized_reason = abort_reason.upper()
+            self.pair_pending_zero_target_abort_count += int(
+                "ZERO_TARGET" in normalized_reason
+                or "ZERO TARGET" in normalized_reason
+            )
+            self.pair_pending_zero_gradient_abort_count += int(
+                "ZERO_GRADIENT" in normalized_reason
+                or "ZERO GRADIENT" in normalized_reason
+            )
+            self.pair_pending_early_stop_abort_count += int(
+                "EARLY_STOP" in normalized_reason
+            )
+        self.pair_pending_objective_scope_contract_valid = min(
+            self.pair_pending_objective_scope_contract_valid,
+            float(bool(objective_scope_contract_valid)),
+        )
+        self.pair_pending_stale_contract_valid = min(
+            self.pair_pending_stale_contract_valid,
+            float(bool(stale_contract_valid)),
+        )
+        self.pair_pending_mass_contract_valid = min(
+            self.pair_pending_mass_contract_valid,
+            float(bool(mass_contract_valid)),
+        )
+        self.pair_pending_atomic_rollback_contract_valid = min(
+            self.pair_pending_atomic_rollback_contract_valid,
+            float(bool(atomic_rollback_contract_valid)),
+        )
+        self.pair_pending_checkpoint_contract_valid = min(
+            self.pair_pending_checkpoint_contract_valid,
+            float(bool(checkpoint_contract_valid)),
+        )
+        named_values = (
+            ("positive_stale_trust", positive_stale_trust),
+            ("negative_stale_trust", negative_stale_trust),
+            ("raw_positive_mass", raw_positive_mass),
+            ("raw_negative_mass", raw_negative_mass),
+            ("effective_positive_mass", effective_positive_mass),
+            ("effective_negative_mass", effective_negative_mass),
+        )
+        normalized_values = {}
+        for name, value in named_values:
+            value = float(value)
+            if not np.isfinite(value) or value < 0.0:
+                raise RuntimeError(
+                    "pending transaction {} is invalid".format(name)
+                )
+            normalized_values[name] = value
+        self.pair_pending_last_positive_stale_trust = normalized_values[
+            "positive_stale_trust"
+        ]
+        self.pair_pending_last_negative_stale_trust = normalized_values[
+            "negative_stale_trust"
+        ]
+        self.pair_pending_last_raw_positive_mass = normalized_values[
+            "raw_positive_mass"
+        ]
+        self.pair_pending_last_raw_negative_mass = normalized_values[
+            "raw_negative_mass"
+        ]
+        self.pair_pending_last_effective_positive_mass = normalized_values[
+            "effective_positive_mass"
+        ]
+        self.pair_pending_last_effective_negative_mass = normalized_values[
+            "effective_negative_mass"
+        ]
+
+    def pair_pending_state_dict(self):
+        return {
+            "policy_id": self.policy_id,
+            "current_adj_update": int(
+                self.pair_pending_current_adj_update
+            ),
+            "behavior_policy_version": int(
+                self.pair_pending_behavior_policy_version
+            ),
+            "store": self.pair_pending_store.state_dict(),
+        }
+
+    def load_pair_pending_state_dict(self, state):
+        if not isinstance(state, dict):
+            raise ValueError(
+                "pair pending policy checkpoint must be a dictionary"
+            )
+        if str(state.get("policy_id")) != self.policy_id:
+            raise RuntimeError(
+                "pair pending checkpoint policy identity mismatch"
+            )
+        self.pair_pending_current_adj_update = int(
+            state.get("current_adj_update", 0)
+        )
+        self.pair_pending_behavior_policy_version = int(
+            state.get("behavior_policy_version", 0)
+        )
+        self.pair_pending_store.load_state_dict(state["store"])
+
+    def _capture_pair_pending_snapshots(
+            self,
+            flat_fields,
+            episode_indices,
+            selected_pair_evidence,
+            base_episode_indices,
+            data_chunk_length):
+        if not self.pair_pending_enabled:
+            return
+        if len(flat_fields) != 35:
+            raise RuntimeError(
+                "production pair pending snapshot requires the real 35-field "
+                "adjacency batch"
+            )
+        episode_indices = np.asarray(
+            episode_indices, dtype=np.int64
+        ).reshape(-1)
+        selected_pair_evidence = np.asarray(
+            selected_pair_evidence, dtype=bool
+        ).reshape(-1)
+        if selected_pair_evidence.shape != episode_indices.shape:
+            raise RuntimeError(
+                "pair pending evidence and selected episode axes differ"
+            )
+        if self.episode_length % int(data_chunk_length) != 0:
+            raise RuntimeError(
+                "pair pending snapshot cannot split the episode into "
+                "complete recurrent chunks"
+            )
+        valid_episodes = int(episode_indices.size)
+        chunks_per_episode = (
+            int(self.episode_length) // int(data_chunk_length)
+        )
+        base_slots = set(
+            int(slot)
+            for slot in np.asarray(
+                base_episode_indices, dtype=np.int64
+            ).reshape(-1).tolist()
+        )
+        reshaped_fields = []
+        for field_index, field in enumerate(flat_fields):
+            array = np.asarray(field)
+            if array.shape[0] != valid_episodes * self.episode_length:
+                raise RuntimeError(
+                    "pair pending production field {} has transition axis "
+                    "{}, expected {}".format(
+                        field_index,
+                        array.shape[0],
+                        valid_episodes * self.episode_length,
+                    )
+                )
+            reshaped_fields.append(array.reshape(
+                (valid_episodes, self.episode_length) + array.shape[1:]
+            ))
+
+        for episode_ordinal in np.flatnonzero(
+                selected_pair_evidence).tolist():
+            replay_slot = int(episode_indices[episode_ordinal])
+            generation = int(self.episode_generation[replay_slot])
+            records = tuple(
+                self.strict_pair_event_provenance[replay_slot]
+            )
+            if not records:
+                raise RuntimeError(
+                    "strict pair evidence cannot be snapshotted without an "
+                    "event-local pair-to-capture join"
+                )
+            grouped_records = {}
+            for record in records:
+                event_key = (
+                    int(record["environment_episode_id"]),
+                    int(record["event_id"]),
+                    int(record["target_id"]),
+                    tuple(record["participant_slots"]),
+                )
+                grouped_records.setdefault(event_key, []).append(record)
+                transition_step = int(record["pair_transition_step"])
+                capture_step = int(record["capture_step"])
+                pair_factor = int(record["pair_factor_index"])
+                if (
+                        transition_step < 0
+                        or transition_step >= self.episode_length
+                        or capture_step <= transition_step
+                        or capture_step >= self.episode_length
+                        or pair_factor < 0
+                        or pair_factor >= self.num_factor
+                        or self.pair_to_triplet_transition_score[
+                            transition_step,
+                            replay_slot,
+                            pair_factor,
+                            0,
+                        ] <= 0.0):
+                    raise RuntimeError(
+                        "strict pair event provenance is not aligned with "
+                        "the target-bearing transition tensor"
+                    )
+
+            base_episode_batch = []
+            for field in reshaped_fields:
+                episode_values = np.array(
+                    field[episode_ordinal], copy=True, order="C"
+                )
+                base_episode_batch.append(episode_values.reshape(
+                    (chunks_per_episode, int(data_chunk_length))
+                    + episode_values.shape[1:]
+                ))
+            success = bool(np.any(
+                self.success_now[:, replay_slot, 0] > 0.0
+            ))
+            terminal_steps = np.flatnonzero(
+                self.dones_env[:, replay_slot, 0] > 0.0
+            )
+            terminal_step = (
+                int(terminal_steps[0])
+                if terminal_steps.size > 0
+                else self.episode_length - 1
+            )
+            for event_key, event_records in sorted(
+                    grouped_records.items()):
+                (
+                    environment_episode_id,
+                    event_id,
+                    prey_id,
+                    participants,
+                ) = event_key
+                if environment_episode_id != int(
+                        self.environment_episode_id[replay_slot]):
+                    raise RuntimeError(
+                        "strict pair event and replay episode identities differ"
+                    )
+                capture_steps = {
+                    int(record["capture_step"]) for record in event_records
+                }
+                if len(capture_steps) != 1:
+                    raise RuntimeError(
+                        "one capture event maps to multiple capture steps"
+                    )
+                capture_step = next(iter(capture_steps))
+                if capture_step > terminal_step:
+                    raise RuntimeError(
+                        "capture event occurs after the episode terminal step"
+                    )
+                pair_identities = tuple(sorted({
+                    tuple(
+                        int(node)
+                        for node in str(record["pair_identity"]).split("-")
+                    )
+                    for record in event_records
+                }))
+                episode_batch = [
+                    np.array(value, copy=True, order="C")
+                    for value in base_episode_batch
+                ]
+                full_raw_pair_score = np.asarray(base_episode_batch[17])
+                event_raw_pair_score = np.zeros_like(full_raw_pair_score)
+                for record in event_records:
+                    transition_step = int(record["pair_transition_step"])
+                    pair_factor = int(record["pair_factor_index"])
+                    chunk_index = (
+                        transition_step // int(data_chunk_length)
+                    )
+                    chunk_offset = (
+                        transition_step % int(data_chunk_length)
+                    )
+                    source_value = full_raw_pair_score[
+                        chunk_index, chunk_offset, pair_factor
+                    ]
+                    if not np.any(source_value > 0.0):
+                        raise RuntimeError(
+                            "event-local pair snapshot lost its target value"
+                        )
+                    event_raw_pair_score[
+                        chunk_index, chunk_offset, pair_factor
+                    ] = source_value
+                episode_batch[17] = event_raw_pair_score
+                target_count = int(np.sum(np.any(
+                    event_raw_pair_score > 0.0, axis=-1
+                )))
+                if target_count <= 0:
+                    raise RuntimeError(
+                        "strict pair snapshot has no target-bearing factor"
+                    )
+                metadata = {
+                    "policy_id": self.policy_id,
+                    "replay_generation": generation,
+                    "environment_episode_id": environment_episode_id,
+                    "episode_ordinal": int(episode_ordinal),
+                    "capture_event_id": event_id,
+                    "prey_id": prey_id,
+                    "participant_slots": participants,
+                    "canonical_pair_identities": pair_identities,
+                    "factor_order": 2,
+                    "sign": 1 if success else -1,
+                    "outcome_success": success,
+                    "first_seen_adj_update": int(
+                        self.pair_pending_current_adj_update
+                    ),
+                    "original_last_valid_adj_update": int(
+                        self.pair_pending_current_adj_update
+                    ),
+                    "behavior_policy_version": int(
+                        self.episode_behavior_policy_version[replay_slot]
+                    ),
+                    "source_class": (
+                        "base" if replay_slot in base_slots else "support"
+                    ),
+                    "target_bearing_transition_count": target_count,
+                    "raw_event_quality": float(1.0),
+                    "event_provenance_available": True,
+                    "capture_step": capture_step,
+                    "terminal_step": terminal_step,
+                    "capture_to_terminal_distance": (
+                        terminal_step - capture_step
+                    ),
+                }
+                key = pair_pending_entry_key(metadata)
+                existing = self.pair_pending_store.entries.get(key)
+                if existing is not None:
+                    self.pair_pending_store.refresh_available(
+                        key,
+                        self.pair_pending_current_adj_update,
+                        self.pair_pending_behavior_policy_version,
+                    )
+                    continue
+                self.pair_pending_store.add_available(
+                    metadata,
+                    tuple(episode_batch),
+                )
+                self.pair_pending_new_snapshot_count += 1
+
+    def prepare_pair_pending_training_batch(self, expected_ppo_epochs):
+        """Build one deterministic pair-only class-complete transaction."""
+        if not self.pair_pending_enabled:
+            return None
+        self.pair_pending_store.expire_out_of_horizon(
+            self.pair_pending_current_adj_update
+        )
+        selected = []
+        has_pending = False
+        signs = set()
+        for key, entry in sorted(self.pair_pending_store.entries.items()):
+            if entry["state"] not in (
+                    PAIR_EVIDENCE_AVAILABLE_IN_REPLAY,
+                    PAIR_EVIDENCE_PENDING):
+                continue
+            if (
+                    entry["state"] == PAIR_EVIDENCE_PENDING
+                    and self.pair_pending_store.pending_age(
+                        key,
+                        self.pair_pending_current_adj_update,
+                    ) > self.pair_pending_max_adj_updates):
+                continue
+            selected.append((key, entry))
+            signs.add(int(entry["metadata"]["sign"]))
+            has_pending = has_pending or (
+                entry["state"] == PAIR_EVIDENCE_PENDING
+            )
+        # Current replay overlap remains owned by support v6. The production
+        # pending transaction exists only to bridge an evicted strict-evidence
+        # side to a live opposite sign.
+        if not has_pending or signs != {-1, 1}:
+            return None
+
+        keys = tuple(key for key, _entry in selected)
+        source_states = tuple(
+            str(entry["state"]) for _key, entry in selected
+        )
+        store_state_before_prepare = self.pair_pending_store.state_dict()
+        cohort_id = self.pair_pending_store.prepare_class_complete(
+            keys=keys,
+            current_adj_update=self.pair_pending_current_adj_update,
+            current_policy_version=(
+                self.pair_pending_behavior_policy_version
+            ),
+            expected_ppo_epochs=expected_ppo_epochs,
+        )
+        self.pair_pending_prepared_count += 1
+        self.pair_pending_class_complete_count += 1
+        self.pair_pending_pair_only_transaction_count += 1
+        # One generation is one replay/training population even when the
+        # episode contains several capture events. Merge the event-local raw
+        # pair masks before constructing the batch so the old episode is never
+        # duplicated once per event.
+        grouped_selected = []
+        grouped_by_generation = {}
+        for key, entry in selected:
+            generation_key = (
+                str(entry["metadata"]["policy_id"]),
+                int(entry["metadata"]["replay_generation"]),
+            )
+            if generation_key not in grouped_by_generation:
+                group = {
+                    "generation_key": generation_key,
+                    "items": [],
+                }
+                grouped_by_generation[generation_key] = group
+                grouped_selected.append(group)
+            grouped_by_generation[generation_key]["items"].append(
+                (key, entry)
+            )
+        mutable_batches = []
+        grouped_metadata = []
+        for group in grouped_selected:
+            items = group["items"]
+            representative = [
+                np.array(value, copy=True) for value in items[0][1]["batch"]
+            ]
+            event_raw_scores = []
+            reference_metadata = items[0][1]["metadata"]
+            for _key, entry in items:
+                metadata = entry["metadata"]
+                if (
+                        int(metadata["environment_episode_id"])
+                        != int(reference_metadata["environment_episode_id"])
+                        or int(metadata["sign"])
+                        != int(reference_metadata["sign"])
+                        or bool(metadata["outcome_success"])
+                        != bool(reference_metadata["outcome_success"])):
+                    self.pair_pending_store.release_prepared(cohort_id)
+                    raise RuntimeError(
+                        "events from one replay generation disagree on "
+                        "episode identity or outcome"
+                    )
+                for field_index, (reference_value, event_value) in enumerate(
+                        zip(representative, entry["batch"])):
+                    if field_index == 17:
+                        continue
+                    if (
+                            reference_value.dtype != event_value.dtype
+                            or reference_value.shape != event_value.shape
+                            or not np.array_equal(
+                                reference_value, event_value
+                            )):
+                        self.pair_pending_store.release_prepared(cohort_id)
+                        raise RuntimeError(
+                            "event-local snapshots from one generation do "
+                            "not share an identical training population"
+                        )
+                event_raw_score = np.asarray(entry["batch"][17])
+                event_raw_scores.append(event_raw_score)
+            try:
+                # Distinct capture events remain distinct evidence keys, but
+                # their common immutable replay generation is optimized once.
+                # Shared causal transitions therefore form a set union rather
+                # than receiving duplicate pair-credit mass.
+                merged_raw_score = merge_generation_event_pair_scores(
+                    event_raw_scores
+                )
+            except Exception:
+                self.pair_pending_store.release_prepared(cohort_id)
+                raise
+            representative[17] = merged_raw_score
+            mutable_batches.append(representative)
+            grouped_metadata.append(dict(reference_metadata))
+        episode_scores = []
+        episode_success = []
+        for metadata, fields in zip(grouped_metadata, mutable_batches):
+            raw_score = np.asarray(fields[17], dtype=np.float32)
+            raw_score = raw_score.reshape(
+                self.episode_length,
+                self.num_factor,
+                -1,
+            )
+            if raw_score.shape[-1] != 1:
+                self.pair_pending_store.release_prepared(cohort_id)
+                raise RuntimeError(
+                    "pending raw pair score has an invalid final axis"
+                )
+            episode_scores.append(raw_score[..., 0])
+            episode_success.append(
+                bool(metadata["outcome_success"])
+            )
+        try:
+            mass = reconstruct_pending_pair_mass(
+                pair_transition_scores=episode_scores,
+                episode_success=episode_success,
+                coefficient=self.adj_pair_pursuit_credit_coef,
+                credit_cap=self.adj_pair_pursuit_credit_cap,
+            )
+        except Exception:
+            self.pair_pending_store.release_prepared(cohort_id)
+            raise
+        self.pair_pending_mass_contract_valid = min(
+            self.pair_pending_mass_contract_valid,
+            float(mass["contract_valid"]),
+        )
+
+        credit = np.asarray(mass["credit"], dtype=np.float32)
+        if credit.shape != (
+                self.episode_length,
+                len(grouped_selected),
+                self.num_factor):
+            self.pair_pending_store.release_prepared(cohort_id)
+            raise RuntimeError(
+                "pending pair credit reconstruction has an invalid shape"
+            )
+        concatenated_fields = []
+        try:
+            for field_index in range(35):
+                field_values = []
+                for episode_ordinal, fields in enumerate(mutable_batches):
+                    value = np.asarray(fields[field_index])
+                    if field_index == 15:
+                        episode_credit = (
+                            credit[:, episode_ordinal, :, None]
+                            .reshape(value.shape)
+                        )
+                        value = episode_credit.astype(
+                            value.dtype, copy=False
+                        )
+                    elif field_index == 33:
+                        value = np.array(value, copy=True)
+                        value[..., 0] = 1.0
+                        value[..., 1] = float(episode_ordinal)
+                    field_values.append(np.array(value, copy=True))
+                concatenated_fields.append(np.concatenate(
+                    field_values, axis=0
+                ))
+            batch = tuple(concatenated_fields)
+            if len(batch) != 35:
+                raise RuntimeError(
+                    "pending pair-only batch schema is incomplete"
+                )
+            target_count = int(np.sum(np.any(
+                np.asarray(batch[15]) != 0.0,
+                axis=-1,
+            )))
+            if target_count <= 0:
+                raise RuntimeError(
+                    "pending pair-only batch has zero target mass"
+                )
+        except Exception:
+            self.pair_pending_store.release_prepared(cohort_id)
+            raise
+        return {
+            "cohort_id": cohort_id,
+            "keys": keys,
+            "batch": batch,
+            "episode_count": len(grouped_selected),
+            "chunk_count": int(batch[0].shape[0]),
+            "target_bearing_transition_count": target_count,
+            "raw_positive_mass": float(mass["raw_positive_mass"]),
+            "raw_negative_mass": float(mass["raw_negative_mass"]),
+            "centered_mass_error": float(mass["raw_centered_error"]),
+            "source_states": source_states,
+            "entry_metadata": tuple(
+                dict(entry["metadata"]) for _key, entry in selected
+            ),
+            "pending_ages": tuple(
+                int(self.pair_pending_store.pending_age(
+                    key,
+                    self.pair_pending_current_adj_update,
+                ))
+                for key, _entry in selected
+            ),
+            "policy_ages": tuple(
+                int(self.pair_pending_store.policy_age(
+                    key,
+                    self.pair_pending_behavior_policy_version,
+                ))
+                for key, _entry in selected
+            ),
+            "current_policy_version": int(
+                self.pair_pending_behavior_policy_version
+            ),
+            "payload_contract_valid": 1.0,
+            "mass_contract_valid": float(mass["contract_valid"]),
+            "store_state_before_prepare": store_state_before_prepare,
+        }
+
+    def standard_pair_transaction_generation_keys(self):
+        if not self.pair_pending_enabled:
+            return tuple()
+        keys = []
+        for row in getattr(
+                self, "last_sample_pair_evidence_episode_rows", ()):
+            if (
+                    int(row.get("selected_for_training", 0)) != 1
+                    or int(row.get("pair_evidence_episode", 0)) != 1):
+                continue
+            for key in self.pair_pending_store.keys_for_generation(
+                    self.policy_id,
+                    int(row["episode_generation"])):
+                entry = self.pair_pending_store.entries.get(key)
+                if entry is None:
+                    continue
+                if entry["state"] not in (
+                        PAIR_EVIDENCE_AVAILABLE_IN_REPLAY,
+                        PAIR_EVIDENCE_COMMITTED):
+                    raise RuntimeError(
+                        "standard pair transaction selected evidence with "
+                        "an incompatible pending state"
+                    )
+                # Keep the complete trained class, including generations
+                # already mirrored as COMMITTED. The store validates the
+                # complete signed transaction and changes only newly
+                # AVAILABLE members, making the mirror operation idempotent.
+                keys.append(key)
+        return tuple(sorted(set(keys)))
+
+    def commit_standard_pair_transaction(
+            self,
+            keys,
+            adjacency_update_index):
+        if not self.pair_pending_enabled:
+            return tuple()
+        return (
+            self.pair_pending_store
+            .commit_available_from_standard_transaction(
+                keys,
+                adjacency_update_index,
+            )
+        )
+
     def sample_inds(
             self,
             data_chunk_length,
@@ -1979,6 +4462,7 @@ class AdjPolicyBuffer(object):
         base_episode_indices = self._recent_episode_indices(
             recent_episode_window
         )
+        self.last_sample_candidate_evidence_provenance_rows = []
         valid_slot_count = int(self.filled_i)
         end = int(self.current_i) % int(self.buffer_size)
         recency_order = (
@@ -2010,11 +4494,52 @@ class AdjPolicyBuffer(object):
             self.success_now[..., 0] > 0.0,
             axis=0,
         )
+        pair_evidence_episode_mask = np.any(
+            self.pair_to_triplet_transition_score[..., 0] > 0.0,
+            axis=(0, 2),
+        )
         positive_episode_mask = (
             capture_episode_mask & successful_episode_mask
         )
         negative_episode_mask = (
             capture_episode_mask & ~successful_episode_mask
+        )
+        pair_positive_episode_mask = (
+            pair_evidence_episode_mask & successful_episode_mask
+        )
+        pair_negative_episode_mask = (
+            pair_evidence_episode_mask & ~successful_episode_mask
+        )
+        pair_evidence_funnel = summarize_pair_evidence_episode_funnel(
+            occupied_episode_mask=(self.episode_generation >= 0),
+            successful_episode_mask=successful_episode_mask,
+            active_capture_episode_mask=active_capture_episode_mask,
+            candidate_capture_episode_mask=candidate_capture_episode_mask,
+            pair_evidence_episode_mask=pair_evidence_episode_mask,
+        )
+        pair_evidence_funnel.update(
+            summarize_successful_candidate_capture_context(
+                successful_episode_mask=successful_episode_mask,
+                pair_evidence_episode_mask=pair_evidence_episode_mask,
+                active_capture_episode_mask=active_capture_episode_mask,
+                candidate_capture_weights=(
+                    self.capture_candidate_only_matches
+                ),
+                candidate_behavior=self.capture_candidate_behavior,
+                capture_transition_mask=(
+                    np.any(
+                        self.triplet_capture_quality[..., 0] > 0.0,
+                        axis=2,
+                    )
+                    | np.any(
+                        self.capture_candidate_only_matches > 0.0,
+                        axis=2,
+                    )
+                ),
+                terminal_transition_mask=(
+                    self.dones_env[..., 0] > 0.0
+                ),
+            )
         )
         if outcome_support_round is None:
             outcome_support_round = self._next_outcome_support_round
@@ -2026,6 +4551,8 @@ class AdjPolicyBuffer(object):
             tuple(self.episode_generation[recency_order].tolist()),
             positive_episode_mask.tobytes(),
             negative_episode_mask.tobytes(),
+            pair_positive_episode_mask.tobytes(),
+            pair_negative_episode_mask.tobytes(),
         )
         cached_selection_reused = 0.0
         if self._cached_outcome_support_round == outcome_support_round:
@@ -2053,9 +4580,143 @@ class AdjPolicyBuffer(object):
                     negative_episode_mask & ~self.outcome_support_used
                 ),
             )
-            supplemented = contrast_selection[
+            # Generic capture support is not sufficient for the pair-local
+            # objective: a capture episode can have no strict-future pair
+            # evidence. Complete the selected population a second time using
+            # the exact population that can receive signed pair credit. Keep
+            # the pair-specific augmentation out of the disabled ablation.
+            pair_credit_enabled = bool(
+                self.use_adj_pair_triplet_complementary_credit
+                and self.adj_pair_pursuit_credit_coef > 0.0
+            )
+            if pair_credit_enabled:
+                pair_contrast_selection = (
+                    select_outcome_contrast_complete_episodes(
+                        contrast_selection["episode_indices"],
+                        pair_positive_episode_mask,
+                        pair_negative_episode_mask,
+                        recency_order,
+                        positive_eligible_mask=(
+                            pair_positive_episode_mask
+                            & ~self.outcome_support_used
+                        ),
+                        negative_eligible_mask=(
+                            pair_negative_episode_mask
+                            & ~self.outcome_support_used
+                        ),
+                    )
+                )
+            else:
+                selected_indices = contrast_selection["episode_indices"]
+                pair_positive_selected = int(
+                    np.sum(pair_positive_episode_mask[selected_indices])
+                )
+                pair_negative_selected = int(
+                    np.sum(pair_negative_episode_mask[selected_indices])
+                )
+                pair_contrast_available = bool(
+                    np.any(pair_positive_episode_mask)
+                    and np.any(pair_negative_episode_mask)
+                )
+                pair_contrast_selection = {
+                    "episode_indices": selected_indices,
+                    "supplemented_episode_indices": np.empty(
+                        (0,),
+                        dtype=np.int64,
+                    ),
+                    "positive_available": float(
+                        np.any(pair_positive_episode_mask)
+                    ),
+                    "negative_available": float(
+                        np.any(pair_negative_episode_mask)
+                    ),
+                    "positive_selected_count": pair_positive_selected,
+                    "negative_selected_count": pair_negative_selected,
+                    "class_complete": float(
+                        pair_positive_selected > 0
+                        and pair_negative_selected > 0
+                    ),
+                    "support_exhausted": float(
+                        pair_contrast_available
+                        and not (
+                            pair_positive_selected > 0
+                            and pair_negative_selected > 0
+                        )
+                    ),
+                }
+            capture_supplemented = contrast_selection[
                 "supplemented_episode_indices"
             ]
+            pair_supplemented = pair_contrast_selection[
+                "supplemented_episode_indices"
+            ]
+            supplemented = np.concatenate(
+                [capture_supplemented, pair_supplemented]
+            ).astype(np.int64, copy=False)
+            if np.unique(supplemented).size != supplemented.size:
+                raise RuntimeError(
+                    "capture and pair replay support selected a duplicate "
+                    "episode"
+                )
+            final_episode_indices = pair_contrast_selection[
+                "episode_indices"
+            ]
+            contrast_selection["episode_indices"] = final_episode_indices
+            contrast_selection["supplemented_episode_indices"] = supplemented
+            contrast_selection["augmented_count"] = int(
+                final_episode_indices.size - base_episode_indices.size
+            )
+            contrast_selection["positive_selected_count"] = int(
+                np.sum(positive_episode_mask[final_episode_indices])
+            )
+            contrast_selection["negative_selected_count"] = int(
+                np.sum(negative_episode_mask[final_episode_indices])
+            )
+            contrast_selection["augmented_positive_count"] = int(
+                np.sum(positive_episode_mask[supplemented])
+            )
+            contrast_selection["augmented_negative_count"] = int(
+                np.sum(negative_episode_mask[supplemented])
+            )
+            outcome_contrast_available = bool(
+                contrast_selection["positive_available"]
+                and contrast_selection["negative_available"]
+            )
+            outcome_class_complete = bool(
+                outcome_contrast_available
+                and contrast_selection["positive_selected_count"] > 0
+                and contrast_selection["negative_selected_count"] > 0
+            )
+            contrast_selection["class_complete"] = float(
+                outcome_class_complete
+            )
+            contrast_selection["support_exhausted"] = float(
+                outcome_contrast_available and not outcome_class_complete
+            )
+            contrast_selection["outcome_credit_enabled"] = float(
+                outcome_class_complete
+            )
+            contrast_selection["pair_positive_available"] = float(
+                pair_contrast_selection["positive_available"]
+            )
+            contrast_selection["pair_negative_available"] = float(
+                pair_contrast_selection["negative_available"]
+            )
+            contrast_selection["pair_positive_selected_count"] = int(
+                pair_contrast_selection["positive_selected_count"]
+            )
+            contrast_selection["pair_negative_selected_count"] = int(
+                pair_contrast_selection["negative_selected_count"]
+            )
+            contrast_selection["pair_class_complete"] = float(
+                pair_contrast_selection["class_complete"]
+            )
+            contrast_selection["pair_support_exhausted"] = float(
+                pair_contrast_selection["support_exhausted"]
+            )
+            contrast_selection["pair_augmented_count"] = int(
+                pair_supplemented.size
+            )
             if supplemented.size:
                 if np.any(self.outcome_support_used[supplemented]):
                     raise RuntimeError(
@@ -2122,6 +4783,68 @@ class AdjPolicyBuffer(object):
         self.last_sample_outcome_augmented_negative_count = int(
             contrast_selection["augmented_negative_count"]
         )
+        self.last_sample_pair_positive_available = float(
+            contrast_selection["pair_positive_available"]
+        )
+        self.last_sample_pair_negative_available = float(
+            contrast_selection["pair_negative_available"]
+        )
+        self.last_sample_pair_positive_episode_count = int(
+            contrast_selection["pair_positive_selected_count"]
+        )
+        self.last_sample_pair_negative_episode_count = int(
+            contrast_selection["pair_negative_selected_count"]
+        )
+        self.last_sample_pair_class_complete = float(
+            contrast_selection["pair_class_complete"]
+        )
+        self.last_sample_pair_support_exhausted = float(
+            contrast_selection["pair_support_exhausted"]
+        )
+        self.last_sample_pair_augmented_count = int(
+            contrast_selection["pair_augmented_count"]
+        )
+        self.last_sample_pair_evidence_funnel_version = float(
+            pair_evidence_funnel["version"]
+        )
+        for funnel_name in (
+                "occupied_episode_count",
+                "successful_episode_count",
+                "capture_episode_count",
+                "successful_capture_episode_count",
+                "successful_active_capture_episode_count",
+                "successful_candidate_capture_episode_count",
+                "pair_evidence_episode_count",
+                "pair_positive_episode_count",
+                "pair_negative_episode_count",
+                "successful_capture_without_pair_evidence_episode_count",
+                "pair_evidence_without_capture_episode_count",
+                "successful_capture_gap_candidate_only_not_active_episode_count",
+                "successful_capture_gap_active_without_strict_pair_episode_count",
+                "successful_capture_gap_unclassified_episode_count",
+                "successful_capture_gap_reject_reason_contract_valid",
+                "successful_candidate_gap_episode_count",
+                "successful_candidate_gap_identity_count",
+                "successful_candidate_gap_identity_mass",
+                "successful_candidate_gap_behavior_margin_mean",
+                "successful_candidate_gap_behavior_margin_min",
+                "successful_candidate_gap_behavior_margin_max",
+                "successful_candidate_gap_behavior_rank_mean",
+                "successful_candidate_gap_behavior_rank_min",
+                "successful_candidate_gap_behavior_rank_max",
+                "successful_candidate_gap_behavior_boundary_crossed_fraction",
+                "successful_candidate_gap_behavior_rank1_fraction",
+                "successful_capture_gap_terminal_capture_episode_count",
+                "successful_capture_gap_last_capture_to_terminal_step_mean",
+                "successful_capture_gap_last_capture_to_terminal_step_min",
+                "successful_capture_gap_last_capture_to_terminal_step_max",
+                "successful_candidate_gap_context_contract_valid",
+                "contract_valid"):
+            setattr(
+                self,
+                "last_sample_pair_evidence_funnel_{}".format(funnel_name),
+                float(pair_evidence_funnel[funnel_name]),
+            )
         recency_age = np.full(self.buffer_size, -1, dtype=np.int64)
         recency_age[recency_order] = np.arange(
             recency_order.size,
@@ -2130,6 +4853,58 @@ class AdjPolicyBuffer(object):
         supplemented = contrast_selection["supplemented_episode_indices"]
         base_ages = recency_age[base_episode_indices]
         supplemented_ages = recency_age[supplemented]
+        self.last_sample_pair_evidence_episode_rows = (
+            build_pair_evidence_episode_diagnostic_rows(
+                episode_generation=self.episode_generation,
+                selected_episode_indices=episode_indices,
+                base_episode_indices=base_episode_indices,
+                supplemented_episode_indices=supplemented,
+                outcome_support_used=self.outcome_support_used,
+                successful_episode_mask=successful_episode_mask,
+                active_capture_episode_mask=active_capture_episode_mask,
+                candidate_capture_weights=(
+                    self.capture_candidate_only_matches
+                ),
+                candidate_behavior=self.capture_candidate_behavior,
+                pair_evidence_transition_mask=(
+                    np.any(
+                        self.pair_to_triplet_transition_score[..., 0] > 0.0,
+                        axis=2,
+                    )
+                ),
+                capture_transition_mask=(
+                    np.any(
+                        self.triplet_capture_quality[..., 0] > 0.0,
+                        axis=2,
+                    )
+                    | np.any(
+                        self.capture_candidate_only_matches > 0.0,
+                        axis=2,
+                    )
+                ),
+                terminal_transition_mask=(
+                    self.dones_env[..., 0] > 0.0
+                ),
+                capture_identity_candidate_count=(
+                    self.capture_identity_candidates[..., 0]
+                ),
+                recency_age=recency_age,
+                num_agents=self.num_agents,
+                configured_pair_window=self.adj_pair_pursuit_credit_window,
+                outcome_class_complete=contrast_selection[
+                    "class_complete"
+                ],
+                pair_class_complete=contrast_selection[
+                    "pair_class_complete"
+                ],
+                active_capture_event_provenance=(
+                    self.capture_active_event_provenance
+                ),
+                require_active_capture_event_provenance=(
+                    self.pair_pending_enabled
+                ),
+            )
+        )
         self.last_sample_outcome_base_age_mean = float(
             np.mean(base_ages) if base_ages.size else np.nan
         )
@@ -2251,16 +5026,140 @@ class AdjPolicyBuffer(object):
 
         batch_size = self.episode_length * valid_episodes
         data_chunk_length = min(int(data_chunk_length), batch_size)
+        if batch_size % data_chunk_length != 0:
+            raise RuntimeError(
+                "adjacency replay chunks must cover the selected transition "
+                "population without a truncated tail"
+            )
 
         data_chunks = max(1, batch_size // data_chunk_length)
         num_mini_batch = max(1, min(int(num_mini_batch), data_chunks))
-        mini_batch_size = max(1, data_chunks // num_mini_batch)
-
-        rand = self.rng.permutation(data_chunks)
-        sampler = [
-            rand[i * mini_batch_size:(i + 1) * mini_batch_size]
-            for i in range(num_mini_batch)
+        chunk_starts = (
+            np.arange(data_chunks, dtype=np.int64) * data_chunk_length
+        )
+        chunk_ends = chunk_starts + data_chunk_length - 1
+        chunk_episode_membership = np.zeros(
+            (data_chunks, valid_episodes),
+            dtype=bool,
+        )
+        for chunk_index in range(data_chunks):
+            transition_start = int(chunk_starts[chunk_index])
+            transition_end = int(chunk_ends[chunk_index])
+            episode_start = transition_start // self.episode_length
+            episode_end_inclusive = transition_end // self.episode_length
+            if (
+                    episode_start != episode_end_inclusive
+                    and (
+                        transition_start % self.episode_length != 0
+                        or (transition_end + 1) % self.episode_length != 0
+                    )):
+                raise RuntimeError(
+                    "adjacency replay chunk crosses a partial episode boundary"
+                )
+            chunk_episode_membership[
+                chunk_index,
+                episode_start:episode_end_inclusive + 1,
+            ] = True
+        pair_credit_partition_enabled = bool(
+            self.use_adj_pair_triplet_complementary_credit
+            and self.adj_pair_pursuit_credit_coef > 0.0
+        )
+        selected_pair_evidence = pair_evidence_episode_mask[episode_indices]
+        if not pair_credit_partition_enabled:
+            selected_pair_evidence = np.zeros_like(
+                selected_pair_evidence,
+                dtype=bool,
+            )
+        selected_success = successful_episode_mask[episode_indices]
+        pair_partition = partition_pair_contrast_optimizer_chunks(
+            chunk_permutation=self.rng.permutation(data_chunks),
+            chunk_episode_membership=chunk_episode_membership,
+            pair_evidence_episode_mask=selected_pair_evidence,
+            episode_success=selected_success,
+            num_mini_batch=num_mini_batch,
+            pair_partition_slot=0,
+        )
+        sampler = pair_partition["partitions"]
+        self.last_sample_pair_optimizer_atomic_partition = float(
+            pair_partition["class_complete"]
+        )
+        self.last_sample_pair_optimizer_evidence_episode_count = int(
+            pair_partition["pair_evidence_episode_count"]
+        )
+        self.last_sample_pair_optimizer_positive_episode_count = int(
+            pair_partition["successful_evidence_episode_count"]
+        )
+        self.last_sample_pair_optimizer_negative_episode_count = int(
+            pair_partition["failed_evidence_episode_count"]
+        )
+        self.last_sample_pair_optimizer_zero_credit_filler_chunk_count = int(
+            pair_partition["pair_zero_credit_filler_chunk_count"]
+        )
+        self.last_sample_pair_optimizer_pair_partition_chunk_count = int(
+            pair_partition["pair_partition_chunk_count"]
+        )
+        self.last_sample_pair_optimizer_partition_slot = int(
+            pair_partition["pair_partition_slot"]
+        )
+        self.last_sample_pair_optimizer_partition_size_min = int(
+            pair_partition["partition_size_min"]
+        )
+        self.last_sample_pair_optimizer_partition_size_max = int(
+            pair_partition["partition_size_max"]
+        )
+        self.last_sample_pair_optimizer_partition_size_imbalance = int(
+            pair_partition["partition_size_imbalance"]
+        )
+        covered_chunks = np.concatenate(sampler)
+        covered_transition_indices = np.concatenate(
+            [
+                np.arange(
+                    int(chunk_index) * data_chunk_length,
+                    (int(chunk_index) + 1) * data_chunk_length,
+                    dtype=np.int64,
+                )
+                for chunk_index in covered_chunks
+            ]
+        )
+        if (
+                covered_transition_indices.size != batch_size
+                or np.unique(covered_transition_indices).size != batch_size):
+            raise RuntimeError(
+                "adjacency replay mini-batches must cover every selected "
+                "transition exactly once"
+            )
+        covered_episode_offsets = np.unique(
+            covered_transition_indices // self.episode_length
+        )
+        if covered_episode_offsets.size != valid_episodes:
+            raise RuntimeError(
+                "adjacency replay mini-batches did not train every selected "
+                "episode"
+            )
+        covered_generations = self.episode_generation[
+            episode_indices[covered_episode_offsets]
         ]
+        if np.unique(covered_generations).size != valid_episodes:
+            raise RuntimeError(
+                "adjacency replay selected duplicate episode generations"
+            )
+        self.last_sample_trained_episode_count = int(
+            covered_episode_offsets.size
+        )
+        self.last_sample_dropped_episode_count = int(
+            valid_episodes - covered_episode_offsets.size
+        )
+        self.last_sample_unique_generation_count = int(
+            np.unique(covered_generations).size
+        )
+        self.last_sample_selected_chunk_count = int(data_chunks)
+        self.last_sample_yielded_chunk_count = 0
+        self.last_sample_dropped_chunk_count = 0
+        self.last_sample_duplicate_chunk_count = 0
+        self.last_sample_remainder_chunk_count = int(
+            data_chunks % num_mini_batch
+        )
+        self.last_sample_partition_valid = 1.0
 
         obs_seq = np.take(self.obs[:-1], episode_indices, axis=1)
         obs = obs_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
@@ -2310,6 +5209,35 @@ class AdjPolicyBuffer(object):
         )
         prob_adj = prob_adj_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
         rnn_obs = rnn_obs_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents, -1)
+        if self.use_avail_acts:
+            available_actions_seq = np.take(
+                self.avail_acts[:-1],
+                episode_indices,
+                axis=1,
+            )
+        else:
+            available_actions_seq = np.ones(
+                (
+                    self.episode_length,
+                    valid_episodes,
+                    self.num_agents,
+                    self.acts.shape[-1],
+                ),
+                dtype=np.float32,
+            )
+        available_actions = (
+            available_actions_seq
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_agents, -1)
+        )
+        if (
+                not np.all(np.isfinite(available_actions))
+                or np.any(available_actions < 0.0)
+                or np.any(available_actions > 1.0)
+                or np.any(np.sum(available_actions, axis=-1) < 1.0)):
+            raise RuntimeError(
+                "adjacency replay contains an invalid available-action mask"
+            )
 
         advantage = np.take(self.advantage, episode_indices, axis=1)
         graph_advantage_ready = np.take(
@@ -2449,6 +5377,56 @@ class AdjPolicyBuffer(object):
             & (previous_dones_env_seq[..., 0, None] < 0.5)
         )
 
+        selected_success = np.any(
+            np.take(self.success_now, episode_indices, axis=1)[..., 0] > 0.0,
+            axis=0,
+        )
+        # Stored pair credit is centered over the complete circular buffer.
+        # Reusing a slice of it can expose only one signed branch to the
+        # optimizer (71% of run93 pair-target updates), even though the stored
+        # full-buffer tensor conserves mass.  Rebuild the exact pair contrast
+        # over the final selected/trained episode cohort instead.
+        selected_pair_score = (
+            pair_to_triplet_transition_score[..., 0]
+            * valid_factor.astype(np.float32)
+        ).astype(np.float32, copy=False)
+        if (
+            self.use_adj_pair_triplet_complementary_credit
+            and self.adj_pair_pursuit_credit_coef > 0.0
+        ):
+            selected_pair_credit_cap = 0.0
+            if self.adj_pair_pursuit_credit_cap > 0.0:
+                selected_valid_graph = np.any(valid_factor, axis=2)
+                selected_graph_values = advantage[..., 0][
+                    selected_valid_graph
+                ]
+                if (
+                    selected_graph_values.size > 0
+                    and not np.isfinite(selected_graph_values).all()
+                ):
+                    raise RuntimeError(
+                        "non-finite graph advantage reached pair cohort scale"
+                    )
+                selected_graph_abs_scale = (
+                    float(np.abs(selected_graph_values).mean())
+                    if selected_graph_values.size > 0 else 1.0
+                )
+                if selected_graph_abs_scale < 1e-6:
+                    selected_graph_abs_scale = 1.0
+                selected_pair_credit_cap = float(
+                    selected_graph_abs_scale
+                    * float(self.adj_pair_pursuit_credit_cap)
+                )
+            selected_pair_credit = scale_optimizer_cohort_pair_credit(
+                pair_transition_score=selected_pair_score,
+                episode_success=selected_success,
+                coefficient=self.adj_pair_pursuit_credit_coef,
+                credit_cap=selected_pair_credit_cap,
+            )
+            pair_pursuit_credit = selected_pair_credit["credit"][..., None]
+        else:
+            pair_pursuit_credit.fill(0.0)
+
         # The centered outcome baseline must be defined over the episodes that
         # actually reach this optimizer update.  compute_advantage() maintains
         # a full-buffer diagnostic population, whereas replay support may add
@@ -2457,11 +5435,6 @@ class AdjPolicyBuffer(object):
         # cohort carry a non-zero raw centered sum whenever the full-buffer
         # success rate differs from 0.5.
         if bool(contrast_selection["outcome_credit_enabled"]):
-            selected_success = np.any(
-                np.take(self.success_now, episode_indices, axis=1)[..., 0]
-                > 0.0,
-                axis=0,
-            )
             selected_active_capture_quality = (
                 triplet_capture_quality[..., 0].astype(
                     np.float32,
@@ -2547,6 +5520,61 @@ class AdjPolicyBuffer(object):
                     -float(self.adj_capture_to_win_credit_cap),
                     float(self.adj_capture_to_win_credit_cap),
                 )
+            terminal_steps = []
+            for replay_slot in episode_indices.tolist():
+                terminal_locations = np.flatnonzero(
+                    self.dones_env[:, replay_slot, 0] > 0.0
+                )
+                if terminal_locations.size == 0:
+                    raise RuntimeError(
+                        "candidate evidence episode has no terminal step"
+                    )
+                terminal_steps.append(int(terminal_locations[0]))
+            base_episode_set = {
+                int(index) for index in base_episode_indices.tolist()
+            }
+            supplemented_episode_set = {
+                int(index) for index in supplemented.tolist()
+            }
+            self.last_sample_candidate_evidence_provenance_rows = (
+                build_candidate_evidence_provenance_rows(
+                    event_records_by_episode=[
+                        self.capture_candidate_event_provenance[int(index)]
+                        for index in episode_indices.tolist()
+                    ],
+                    replay_slot_indices=episode_indices,
+                    replay_generations=self.episode_generation[
+                        episode_indices
+                    ],
+                    environment_episode_ids=self.environment_episode_id[
+                        episode_indices
+                    ],
+                    base_selected=np.asarray([
+                        int(index) in base_episode_set
+                        for index in episode_indices.tolist()
+                    ], dtype=np.int64),
+                    support_selected=np.asarray([
+                        int(index) in supplemented_episode_set
+                        for index in episode_indices.tolist()
+                    ], dtype=np.int64),
+                    outcome_success=selected_success,
+                    episode_outcome_advantage=selected_contrast[
+                        "episode_outcome_advantage"
+                    ],
+                    capture_event_mass_per_episode=selected_contrast[
+                        "capture_triplet_count_per_episode"
+                    ],
+                    candidate_coefficient=(
+                        self.adj_capture_to_win_credit_coef
+                    ),
+                    candidate_identity_delta=candidate_identity_delta,
+                    candidate_behavior=candidate_behavior,
+                    terminal_steps=np.asarray(
+                        terminal_steps,
+                        dtype=np.int64,
+                    ),
+                )
+            )
             capture_to_win_quality_gate = cohort_gate[..., None]
             capture_to_win_triplet_credit = scaled_cohort_credit[
                 "credit"
@@ -2768,6 +5796,16 @@ class AdjPolicyBuffer(object):
             .transpose(1, 0, 2, 3)
             .reshape(batch_size, self.num_candidate_factor, -1)
         )
+        candidate_capture_context = np.where(
+            np.isfinite(candidate_only_capture_quality),
+            np.maximum(candidate_only_capture_quality, 0.0),
+            0.0,
+        ).astype(np.float32, copy=False)
+        candidate_capture_contexts = (
+            candidate_capture_context[..., None]
+            .transpose(1, 0, 2, 3)
+            .reshape(batch_size, self.num_candidate_factor, -1)
+        )
         candidate_behaviors = (
             candidate_behavior
             .transpose(1, 0, 2, 3)
@@ -2803,6 +5841,40 @@ class AdjPolicyBuffer(object):
             .transpose(1, 0, 2, 3)
             .reshape(batch_size, self.num_factor, -1)
         )
+        pair_evidence_transition = np.repeat(
+            selected_pair_evidence.astype(np.float32, copy=False),
+            self.episode_length,
+        ).reshape(batch_size, 1)
+        episode_ordinal_transition = np.repeat(
+            np.arange(valid_episodes, dtype=np.float32),
+            self.episode_length,
+        ).reshape(batch_size, 1)
+        episode_step_transition = np.tile(
+            np.arange(self.episode_length, dtype=np.float32),
+            valid_episodes,
+        ).reshape(batch_size, 1)
+        replay_population_provenance = np.concatenate(
+            [
+                pair_evidence_transition,
+                episode_ordinal_transition,
+                episode_step_transition,
+            ],
+            axis=1,
+        )
+        if replay_population_provenance.shape != (batch_size, 3):
+            raise RuntimeError(
+                "replay population provenance has shape {}, expected {}"
+                .format(
+                    replay_population_provenance.shape,
+                    (batch_size, 3),
+                )
+            )
+        if not np.all(
+                (pair_evidence_transition == 0.0)
+                | (pair_evidence_transition == 1.0)):
+            raise RuntimeError(
+                "pair-evidence transition provenance must be binary"
+            )
         pair_pursuit_quality = np.where(
             np.isfinite(pair_pursuit_quality),
             pair_pursuit_quality,
@@ -2930,6 +6002,51 @@ class AdjPolicyBuffer(object):
             share_obs = share_obs_seq.transpose(1, 0, 2, 3).reshape(batch_size, self.num_agents,
                                                                     -1)
 
+        production_flat_fields = (
+            obs,
+            share_obs,
+            dones,
+            dones_env,
+            adj,
+            prob_adj,
+            advantages,
+            f_advts,
+            delayed_triplet_credits,
+            delayed_triplet_success_gates,
+            delayed_triplet_future_matches,
+            delayed_triplet_future_exacts,
+            delayed_triplet_future_partials,
+            capture_to_win_triplet_credits,
+            capture_to_win_quality_gates,
+            pair_pursuit_credits,
+            pair_pursuit_qualities,
+            pair_to_triplet_transition_scores,
+            triplet_capture_qualities,
+            rnn_obs,
+            pair_transition_delays,
+            capture_counts_flat,
+            capture_matched_count_flat,
+            positive_reward_without_capture_flat,
+            offset0_candidate_count_flat,
+            positive_reward_step_flat,
+            previous_adj,
+            capture_to_win_episode_success_gate_flat,
+            failed_episode_capture_count_flat,
+            capture_outcome_diagnostics_flat,
+            candidate_identity_deltas,
+            candidate_capture_contexts,
+            candidate_behaviors,
+            replay_population_provenance,
+            available_actions,
+        )
+        self._capture_pair_pending_snapshots(
+            production_flat_fields,
+            episode_indices=episode_indices,
+            selected_pair_evidence=selected_pair_evidence,
+            base_episode_indices=base_episode_indices,
+            data_chunk_length=data_chunk_length,
+        )
+
         for indices in sampler:
             obs_batch = []
             share_obs_batch = []
@@ -2962,7 +6079,10 @@ class AdjPolicyBuffer(object):
             failed_episode_capture_count_batch = []
             capture_outcome_diagnostics_batch = []
             candidate_identity_delta_batch = []
+            candidate_capture_context_batch = []
             candidate_behavior_batch = []
+            replay_population_provenance_batch = []
+            available_actions_batch = []
 
             for i in indices:
                 ind = i * data_chunk_length
@@ -3053,10 +6173,28 @@ class AdjPolicyBuffer(object):
                         ind:ind + data_chunk_length
                     ]
                 )
+                candidate_capture_context_batch.append(
+                    candidate_capture_contexts[
+                        ind:ind + data_chunk_length
+                    ]
+                )
                 candidate_behavior_batch.append(
                     candidate_behaviors[ind:ind + data_chunk_length]
                 )
+                replay_population_provenance_batch.append(
+                    replay_population_provenance[
+                        ind:ind + data_chunk_length
+                    ]
+                )
+                available_actions_batch.append(
+                    available_actions[ind:ind + data_chunk_length]
+                )
 
+            # This is the execution-side count: a partition is considered
+            # yielded only when the consumer receives its training sample.
+            # The runner independently counts chunks after train_adj_on_batch
+            # returns, closing selected -> yielded -> trained accounting.
+            self.last_sample_yielded_chunk_count += int(len(indices))
             yield (
                 np.stack(obs_batch, axis=0),
                 np.stack(share_obs_batch, axis=0),
@@ -3089,5 +6227,8 @@ class AdjPolicyBuffer(object):
                 np.stack(failed_episode_capture_count_batch, axis=0),
                 np.stack(capture_outcome_diagnostics_batch, axis=0),
                 np.stack(candidate_identity_delta_batch, axis=0),
+                np.stack(candidate_capture_context_batch, axis=0),
                 np.stack(candidate_behavior_batch, axis=0),
+                np.stack(replay_population_provenance_batch, axis=0),
+                np.stack(available_actions_batch, axis=0),
             )

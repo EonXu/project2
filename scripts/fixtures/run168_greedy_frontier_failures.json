@@ -1,0 +1,35 @@
+[
+  {
+    "name": "run168_far_episode_30_step_12425",
+    "episode": 30,
+    "training_step": 12425,
+    "alive": [1, 1, 1, 1, 0, 0],
+    "visible": [[0, 0], [0, 1], [0, 1], [0, 0], [0, 0], [0, 0]],
+    "offsets": [[[null, null], [null, null]], [[null, null], [0, 8]], [[null, null], [0, 4]], [[null, null], [null, null]], [[null, null], [null, null]], [[null, null], [null, null]]],
+    "raw_greedy": [4, 2, 6, 1, 4, 4],
+    "leaving_slot": 1,
+    "expected_safe_actions": [1]
+  },
+  {
+    "name": "run168_far_episode_48_step_16005",
+    "episode": 48,
+    "training_step": 16005,
+    "alive": [1, 1, 1, 1, 0, 0],
+    "visible": [[0, 1], [0, 0], [0, 1], [1, 0], [0, 0], [0, 0]],
+    "offsets": [[[null, null], [-6, -2]], [[null, null], [null, null]], [[null, null], [2, -1]], [[2, -4], [null, null]], [[null, null], [null, null]], [[null, null], [null, null]]],
+    "raw_greedy": [6, 5, 5, 3, 4, 4],
+    "leaving_slot": 0,
+    "expected_safe_actions": [0, 3]
+  },
+  {
+    "name": "run168_far_episode_60_step_18407",
+    "episode": 60,
+    "training_step": 18407,
+    "alive": [1, 1, 1, 1, 0, 0],
+    "visible": [[0, 0], [1, 1], [0, 1], [0, 0], [0, 0], [0, 0]],
+    "offsets": [[[null, null], [null, null]], [[1, -1], [-2, -6]], [[null, null], [3, 4]], [[null, null], [null, null]], [[null, null], [null, null]], [[null, null], [null, null]]],
+    "raw_greedy": [0, 2, 4, 1, 4, 4],
+    "leaving_slot": 1,
+    "expected_safe_actions": [0, 3]
+  }
+]

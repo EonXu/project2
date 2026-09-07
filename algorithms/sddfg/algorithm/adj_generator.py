@@ -6,6 +6,30 @@ from utils.util import DecayThenFlatSchedule, to_torch
 import numpy as np
 
 
+class SelectedFactorInactiveCandidateError(RuntimeError):
+    """A stored factor crossed out of the positive-score candidate set.
+
+    Production replay requires every stored selected factor to remain a real
+    positive-score candidate.  Exact optimizer line search, however, also
+    evaluates deliberately oversized temporary writebacks.  This typed error
+    lets that one caller classify the oversized point as infeasible without
+    weakening the default production contract or matching exception strings.
+    """
+
+    def __init__(self, batch_index, factor_index, candidate_index):
+        self.batch_index = int(batch_index)
+        self.factor_index = int(factor_index)
+        self.candidate_index = int(candidate_index)
+        super().__init__(
+            "selected factor became an inactive canonical candidate at "
+            "batch={}, factor={}, candidate={}".format(
+                self.batch_index,
+                self.factor_index,
+                self.candidate_index,
+            )
+        )
+
+
 class _GATLayer(nn.Module):
     def __init__(self, in_dim, num_heads=4, negative_slope=0.2):
         super().__init__()
@@ -361,6 +385,10 @@ class Adj_Generator(nn.Module):
         # are retrospective; persisting this snapshot prevents training-time
         # recomputation from being mistaken for the behavior-policy score.
         self.candidate_policy_version = 0
+        # Separate finite-lifecycle time from the committed candidate-policy
+        # version.  A rejected candidate-sensitive transaction consumes TTL but
+        # must not advertise a policy version whose parameters were rolled back.
+        self.candidate_lifecycle_clock = 0
         self.last_candidate_behavior_metadata = None
 
         gat_heads = args.gat_heads
@@ -694,9 +722,10 @@ class Adj_Generator(nn.Module):
             alpha = float(self.triplet_credit_ema_alpha)
             pair_updates = 0
             triplet_updates = 0
-            triplet_credit_sum = 0.0
-            triplet_marginal_sum = 0.0
-            triplet_marginal_positive = 0
+            pair_credit_sum = torch.zeros_like(self.pair_credit_ema)
+            pair_credit_count = torch.zeros_like(self.pair_credit_seen)
+            triplet_credit_sum = torch.zeros_like(self.triplet_credit_ema)
+            triplet_credit_count = torch.zeros_like(self.triplet_credit_seen)
 
             B, _, F = adj_t.shape
             for b in range(B):
@@ -724,16 +753,8 @@ class Adj_Generator(nn.Module):
                             -1,
                         )
                         if pair_id >= 0:
-                            old = self.pair_credit_ema[pair_id]
-                            self.pair_credit_ema[pair_id] = (
-                                (1.0 - alpha) * old
-                                + alpha * self.pair_credit_ema.new_tensor(
-                                    credit
-                                )
-                            )
-                            self.pair_credit_seen[pair_id] = (
-                                self.pair_credit_seen[pair_id] + 1.0
-                            )
+                            pair_credit_sum[pair_id] += credit
+                            pair_credit_count[pair_id] += 1.0
                             pair_updates += 1
                     else:
                         triplet_id = self._triplet_index_map.get(
@@ -741,44 +762,69 @@ class Adj_Generator(nn.Module):
                             -1,
                         )
                         if triplet_id >= 0:
-                            old = self.triplet_credit_ema[triplet_id]
-                            self.triplet_credit_ema[triplet_id] = (
-                                (1.0 - alpha) * old
-                                + alpha * self.triplet_credit_ema.new_tensor(
-                                    credit
-                                )
-                            )
-                            self.triplet_credit_seen[triplet_id] = (
-                                self.triplet_credit_seen[triplet_id] + 1.0
-                            )
-                            pair_ids = [
-                                self._pair_index_map[(nodes[0], nodes[1])],
-                                self._pair_index_map[(nodes[0], nodes[2])],
-                                self._pair_index_map[(nodes[1], nodes[2])],
-                            ]
-                            pair_credit = self.pair_credit_ema[
-                                torch.tensor(
-                                    pair_ids,
-                                    dtype=torch.long,
-                                    device=self.device,
-                                )
-                            ].mean()
-                            marginal = (
-                                self.triplet_credit_ema[triplet_id]
-                                - pair_credit
-                            )
-                            triplet_credit_sum += float(
-                                self.triplet_credit_ema[triplet_id]
-                                .detach()
-                                .cpu()
-                                .item()
-                            )
-                            triplet_marginal_sum += float(
-                                marginal.detach().cpu().item()
-                            )
-                            if float(marginal.detach().cpu().item()) > 0.0:
-                                triplet_marginal_positive += 1
+                            triplet_credit_sum[triplet_id] += credit
+                            triplet_credit_count[triplet_id] += 1.0
                             triplet_updates += 1
+
+            # ``alpha`` is the memory update rate, not a per-factor learning
+            # rate.  Applying it once for every factor in a PPO minibatch makes
+            # the effective old-state weight ``(1-alpha)**count``.  Run134 had
+            # 2344 pair observations in one transaction, so the old pair credit
+            # was practically replaced by the tail of the minibatch and became
+            # batch-order dependent.  Aggregate each canonical candidate first,
+            # then make one EMA write from its minibatch mean.  Seen counts still
+            # record every real observation.
+            pair_observed = pair_credit_count > 0.0
+            pair_mean = pair_credit_sum / pair_credit_count.clamp_min(1.0)
+            pair_updated = (
+                (1.0 - alpha) * self.pair_credit_ema
+                + alpha * pair_mean
+            )
+            self.pair_credit_ema.copy_(torch.where(
+                pair_observed,
+                pair_updated,
+                self.pair_credit_ema,
+            ))
+            self.pair_credit_seen.add_(pair_credit_count)
+
+            triplet_observed = triplet_credit_count > 0.0
+            triplet_mean = (
+                triplet_credit_sum / triplet_credit_count.clamp_min(1.0)
+            )
+            triplet_updated = (
+                (1.0 - alpha) * self.triplet_credit_ema
+                + alpha * triplet_mean
+            )
+            self.triplet_credit_ema.copy_(torch.where(
+                triplet_observed,
+                triplet_updated,
+                self.triplet_credit_ema,
+            ))
+            self.triplet_credit_seen.add_(triplet_credit_count)
+
+            triplet_pair_ids = self._triplet_pair_flat_ids(
+                self._triplet_indices(self.num_variable, self.device)
+            ).clamp_min(0)
+            current_pair_credit = self.pair_credit_ema[
+                triplet_pair_ids
+            ].mean(dim=-1)
+            current_marginal = (
+                self.triplet_credit_ema - current_pair_credit
+            )
+            observed_weight = triplet_credit_count.to(
+                self.triplet_credit_ema.dtype
+            )
+            observed_count = observed_weight.sum().clamp_min(1.0)
+            observed_triplet_credit_mean = (
+                self.triplet_credit_ema * observed_weight
+            ).sum() / observed_count
+            observed_marginal_mean = (
+                current_marginal * observed_weight
+            ).sum() / observed_count
+            observed_marginal_positive_fraction = (
+                (current_marginal > 0.0).to(current_marginal.dtype)
+                * observed_weight
+            ).sum() / observed_count
 
             seen_triplets = (
                 self.triplet_credit_seen > 0.0
@@ -789,20 +835,27 @@ class Adj_Generator(nn.Module):
             return {
                 "adv_triplet_credit_pair_updates": float(pair_updates),
                 "adv_triplet_credit_triplet_updates": float(triplet_updates),
+                "adv_triplet_credit_pair_state_updates": float(
+                    pair_observed.to(torch.float32).sum().detach().cpu().item()
+                ),
+                "adv_triplet_credit_triplet_state_updates": float(
+                    triplet_observed.to(torch.float32).sum().detach().cpu().item()
+                ),
                 "adv_triplet_credit_seen_ratio": float(
                     seen_triplets.detach().cpu().item()
                 ),
                 "adv_pair_credit_seen_ratio": float(
                     seen_pairs.detach().cpu().item()
                 ),
-                "adv_triplet_credit_mean": (
-                    triplet_credit_sum / max(triplet_updates, 1)
+                "adv_triplet_credit_mean": float(
+                    observed_triplet_credit_mean.detach().cpu().item()
                 ),
-                "adv_triplet_marginal_mean": (
-                    triplet_marginal_sum / max(triplet_updates, 1)
+                "adv_triplet_marginal_mean": float(
+                    observed_marginal_mean.detach().cpu().item()
                 ),
-                "adv_triplet_marginal_positive_fraction": (
-                    triplet_marginal_positive / max(triplet_updates, 1)
+                "adv_triplet_marginal_positive_fraction": float(
+                    observed_marginal_positive_fraction
+                    .detach().cpu().item()
                 ),
             }
 
@@ -1107,42 +1160,675 @@ class Adj_Generator(nn.Module):
 
         return torch.cat(scores, dim=1), torch.cat(node_masks, dim=0)
 
-    def evaluate_candidate_identity_scores(self, rnn_obs, dones):
-        """Return canonical candidate scores for exact-identity supervision.
+    def _candidate_behavior_distribution(
+            self,
+            policy_probs,
+            eligible,
+            candidate_nodes,
+            previous_nodes=None):
+        """Return the exact train-time factor distribution for one slot.
 
-        This path does not sample a graph and does not pretend an unselected
-        candidate was active.  It exposes the same pair/triplet catalog used
-        by graph selection so a real candidate-only capture can update only
-        its exact candidate score through a separate supervised objective.
+        The rollout sampler is a mixture of the constrained learnable policy
+        and a point mass on either the previous same-slot factor or the current
+        greedy factor. This helper is used for behavior likelihood and PPO.
+        Candidate supervision intentionally targets the differentiable greedy
+        competitor boundary instead of treating this non-learnable point mass
+        as part of an attainable logit target.
         """
+        eligible_count = int(eligible.long().sum().item())
+        if eligible_count <= 0:
+            return (
+                torch.zeros_like(policy_probs),
+                torch.zeros_like(policy_probs),
+                -1,
+                False,
+            )
+
+        stochastic_probs = policy_probs
+        if self.exploration_mix > 0.0:
+            uniform_probs = (
+                eligible.to(policy_probs.dtype) / float(eligible_count)
+            )
+            stochastic_probs = (
+                (1.0 - self.exploration_mix) * policy_probs
+                + self.exploration_mix * uniform_probs
+            )
+
+        greedy_idx = int(torch.argmax(policy_probs).item())
+        mixture_idx = greedy_idx
+        has_persistence_candidate = False
+        if previous_nodes is not None:
+            previous_order = int(previous_nodes.long().sum().item())
+            if previous_order in (2, 3):
+                previous_match = torch.all(
+                    candidate_nodes == previous_nodes.unsqueeze(0),
+                    dim=1,
+                ) & eligible
+                matched_previous = torch.where(previous_match)[0]
+                if matched_previous.numel() > 0:
+                    mixture_idx = int(matched_previous[0].item())
+                    has_persistence_candidate = True
+
+        greedy_prob = float(self.current_greedy_sample_prob)
+        behavior_probs = (1.0 - greedy_prob) * stochastic_probs
+        if greedy_prob > 0.0:
+            point_mass = torch.zeros_like(behavior_probs)
+            point_mass[mixture_idx] = greedy_prob
+            behavior_probs = behavior_probs + point_mass
+        return (
+            stochastic_probs,
+            behavior_probs,
+            mixture_idx,
+            has_persistence_candidate,
+        )
+
+    def _candidate_identity_replay_competitor_margins(
+            self,
+            candidate_scores,
+            candidate_nodes,
+            exist_mask,
+            adj):
+        """Return the first reachable active-slot competitor margin.
+
+        Candidate execution is a sequential constrained choice.  At the first
+        replay prefix where an inactive candidate is legal, the candidate enters
+        the greedy active set exactly when its constrained policy probability is
+        larger than every other legal candidate.  Its decision-aligned margin is
+
+            log p(candidate | replay prefix)
+            - log p(hardest other legal candidate | replay prefix).
+
+        Only the first reachable replay slot is used.  Taking the best of later
+        hypothetical slots is optimistic because changing an earlier choice also
+        changes coverage and connectivity.  Multiplying by the probability of
+        replaying the entire prefix is also inappropriate: it turns a local
+        top-k boundary into a global 50-percent replacement event that sparse
+        candidate updates cannot reach and that is not used by greedy execution.
+
+        The constrained probabilities use unit temperature.  Temperature and
+        exploration alter stochastic sampling frequency but not the argmax
+        boundary that determines rank and greedy active membership.
+        """
+        if candidate_scores.dim() != 2:
+            raise ValueError(
+                "candidate scores must be rank 2, got {}".format(
+                    tuple(candidate_scores.shape)
+                )
+            )
+        if candidate_nodes.dim() != 2:
+            raise ValueError(
+                "candidate nodes must be rank 2, got {}".format(
+                    tuple(candidate_nodes.shape)
+                )
+            )
+        if (
+                candidate_scores.shape[1] != candidate_nodes.shape[0]
+                or candidate_scores.shape[0] != exist_mask.shape[0]
+                or candidate_nodes.shape[1] != exist_mask.shape[1]):
+            raise ValueError(
+                "candidate insertion shapes are inconsistent: scores={}, "
+                "nodes={}, exist={}".format(
+                    tuple(candidate_scores.shape),
+                    tuple(candidate_nodes.shape),
+                    tuple(exist_mask.shape),
+                )
+            )
+
+        adj_t = to_torch(adj).to(candidate_scores.device)
+        if adj_t.dim() == 2:
+            adj_t = adj_t.unsqueeze(0)
+        adj_t = adj_t[:, :, :self.num_factor]
+        if (
+                adj_t.dim() != 3
+                or adj_t.shape[0] != candidate_scores.shape[0]
+                or adj_t.shape[1] != candidate_nodes.shape[1]):
+            raise ValueError(
+                "candidate insertion adj shape is inconsistent: adj={}, "
+                "scores={}, nodes={}".format(
+                    tuple(adj_t.shape),
+                    tuple(candidate_scores.shape),
+                    tuple(candidate_nodes.shape),
+                )
+            )
+        margin_rows = []
+        valid_rows = []
+        for batch_index in range(candidate_scores.shape[0]):
+            scores = candidate_scores[batch_index]
+            active_nodes = exist_mask[batch_index] > 0.5
+            remaining = scores > 0.0
+            num_active = int(active_nodes.long().sum().item())
+            factor_budget = self._active_factor_budget(
+                num_active=num_active,
+                num_valid_candidates=int(remaining.long().sum().item()),
+            )
+            if factor_budget <= 0:
+                margin_rows.append(torch.zeros_like(scores))
+                valid_rows.append(torch.zeros_like(remaining))
+                continue
+
+            active_candidate = torch.zeros_like(remaining)
+            for factor_index in range(adj_t.shape[-1]):
+                selected_nodes = adj_t[
+                    batch_index, :, factor_index
+                ] > 0.5
+                selected_order = int(
+                    selected_nodes.long().sum().item()
+                )
+                if selected_order not in (2, 3):
+                    continue
+                membership_match = torch.all(
+                    candidate_nodes == selected_nodes.unsqueeze(0),
+                    dim=1,
+                )
+                active_candidate = active_candidate | membership_match
+
+            competitor_margin = torch.zeros_like(scores)
+            has_competitor_margin = torch.zeros_like(remaining)
+            covered = torch.zeros_like(active_nodes)
+            selected_order3 = 0
+            sequential_slot = 0
+            for factor_index in range(adj_t.shape[-1]):
+                selected_nodes = adj_t[
+                    batch_index, :, factor_index
+                ] > 0.5
+                selected_order = int(
+                    selected_nodes.long().sum().item()
+                )
+                if selected_order == 0:
+                    continue
+                if selected_order not in (2, 3):
+                    # Dynamic SDDFG has no self-factor action.  Do not invent a
+                    # ranking boundary for a legacy/corrupted column.
+                    sequential_slot += 1
+                    continue
+
+                policy_probs, eligible = self._constrained_probabilities(
+                    scores=scores,
+                    candidate_nodes=candidate_nodes,
+                    remaining=remaining,
+                    covered=covered,
+                    active_nodes=active_nodes,
+                    slots_after=max(
+                        factor_budget - sequential_slot - 1,
+                        0,
+                    ),
+                    max_factor_order=self.highest_orders,
+                    require_connected=self.require_connected,
+                    temperature=1.0,
+                )
+                policy_probs, eligible, _ = self._apply_order3_band(
+                    policy_probs=policy_probs,
+                    eligible=eligible,
+                    candidate_nodes=candidate_nodes,
+                    scores=scores,
+                    selected_order3=selected_order3,
+                    factor_budget=factor_budget,
+                    slot=sequential_slot,
+                    num_active=num_active,
+                )
+                membership_match = torch.all(
+                    candidate_nodes == selected_nodes.unsqueeze(0),
+                    dim=1,
+                ) & remaining
+                matched = torch.where(membership_match)[0]
+                if matched.numel() != 1:
+                    raise RuntimeError(
+                        "active factor must match exactly one canonical "
+                        "candidate, got {}".format(int(matched.numel()))
+                    )
+                selected_idx = int(matched[0].item())
+                if not bool(eligible[selected_idx].item()):
+                    raise RuntimeError(
+                        "replay factor is not eligible at its stored sequential "
+                        "prefix"
+                    )
+
+                first_reachable = (
+                    eligible
+                    & remaining
+                    & (~active_candidate)
+                    & (~has_competitor_margin)
+                    & (policy_probs > 0.0)
+                )
+                reachable_indices = torch.where(first_reachable)[0]
+                for candidate_idx_t in reachable_indices:
+                    candidate_idx = int(candidate_idx_t.item())
+                    competitor_eligible = eligible.clone()
+                    competitor_eligible[candidate_idx] = False
+                    competitor_probabilities = torch.where(
+                        competitor_eligible,
+                        policy_probs,
+                        torch.zeros_like(policy_probs),
+                    )
+                    hardest_probability = competitor_probabilities.max()
+                    if not bool((hardest_probability > 0.0).item()):
+                        continue
+                    candidate_probability = policy_probs[candidate_idx]
+                    local_margin = (
+                        torch.log(candidate_probability.clamp_min(1e-12))
+                        - torch.log(hardest_probability.clamp_min(1e-12))
+                    )
+                    one_hot = torch.zeros_like(scores)
+                    one_hot[candidate_idx] = 1.0
+                    competitor_margin = (
+                        competitor_margin + one_hot * local_margin
+                    )
+                    has_competitor_margin[candidate_idx] = True
+
+                if selected_order == 3:
+                    selected_order3 += 1
+                remaining[selected_idx] = False
+                covered = covered | candidate_nodes[selected_idx]
+                sequential_slot += 1
+
+            competitor_margin = torch.where(
+                has_competitor_margin,
+                competitor_margin,
+                torch.zeros_like(competitor_margin),
+            )
+            if not bool(torch.isfinite(competitor_margin).all().item()):
+                raise FloatingPointError(
+                    "non-finite candidate replay-prefix competitor margin"
+                )
+            margin_rows.append(competitor_margin)
+            valid_rows.append(has_competitor_margin)
+
+        return (
+            torch.stack(margin_rows, dim=0),
+            torch.stack(valid_rows, dim=0),
+        )
+
+    def evaluate_candidate_identity_active_competitor_margins(
+            self, rnn_obs, dones, adj):
+        """Return greedy active-boundary margins by exact candidate identity."""
         rnn_obs, exist_mask = self._prepare_inputs(rnn_obs, dones)
         attention = self.gat(rnn_obs, exist_mask)
         pair_score, _ = self._pair_score(attention, exist_mask)
         candidate_scores, candidate_nodes = self._candidate_catalog(
             pair_score
         )
-        active_nodes = exist_mask > 0.5
-        candidate_valid = torch.all(
-            (~candidate_nodes.unsqueeze(0)) | active_nodes.unsqueeze(1),
-            dim=2,
-        ) & (candidate_scores > 0.0)
-        if candidate_scores.shape != candidate_valid.shape:
+        competitor_margin, candidate_valid = (
+            self._candidate_identity_replay_competitor_margins(
+                candidate_scores,
+                candidate_nodes,
+                exist_mask,
+                adj,
+            )
+        )
+        if competitor_margin.shape != candidate_valid.shape:
             raise RuntimeError(
-                "candidate score/mask shape mismatch: {} vs {}".format(
-                    tuple(candidate_scores.shape),
+                "candidate competitor-margin/mask shape mismatch: {} vs {}"
+                .format(
+                    tuple(competitor_margin.shape),
                     tuple(candidate_valid.shape),
                 )
             )
-        return candidate_scores, candidate_valid.to(candidate_scores.dtype)
+        return (
+            competitor_margin,
+            candidate_valid.to(competitor_margin.dtype),
+        )
+
+    def evaluate_selected_factor_replay_boundaries(
+            self,
+            rnn_obs,
+            dones,
+            adj,
+            previous_adj=None,
+            include_behavior_logp=False):
+        """Replay each selected slot against its real reachable competitor.
+
+        Pair supervision is attached to a selected order-2 factor column.  Its
+        absolute conditional log-probability is not the generator's selection
+        boundary: constrained execution compares that factor with the other
+        candidates which are legal at the same sequential prefix.  This method
+        reuses the production coverage, connectivity, order-band, quota, and
+        canonical-catalog rules and returns, for every stored factor slot,
+
+            selected log p - hardest-other-legal log p.
+
+        A slot with no legal alternative is explicitly ``forced`` and has no
+        trainable boundary.  The boundary itself never uses sampling RNG,
+        persistence, or exploration because those do not change the learnable
+        greedy argmax boundary.
+
+        ``include_behavior_logp`` additionally replays the selected factor's
+        *actual PPO behavior likelihood* (scheduled temperature, exploration
+        mixture, and topology-persistence point mass).  It reuses this method's
+        GAT output and canonical catalog, so strict-pair nonlinear validation
+        can join to the same score used by ``evaluate_prob`` without paying for
+        a second graph forward.  This path is deterministic and consumes no
+        sampling RNG.
+        """
+        rnn_obs, exist_mask = self._prepare_inputs(rnn_obs, dones)
+        sampling_temperature = None
+        previous_adj_t = None
+        if bool(include_behavior_logp):
+            _, sampling_temperature, _, _, _ = self._update_graph_schedules(
+                None
+            )
+        attention = self.gat(rnn_obs, exist_mask)
+        pair_score, _ = self._pair_score(attention, exist_mask)
+        candidate_scores, candidate_nodes = self._candidate_catalog(
+            pair_score
+        )
+        adj_t = to_torch(adj).to(candidate_scores.device)
+        if adj_t.dim() == 2:
+            adj_t = adj_t.unsqueeze(0)
+        adj_t = adj_t[:, :, :self.num_factor]
+        if (
+                adj_t.dim() != 3
+                or adj_t.shape[0] != candidate_scores.shape[0]
+                or adj_t.shape[1] != candidate_nodes.shape[1]):
+            raise ValueError(
+                "selected-factor boundary adj shape is inconsistent: "
+                "adj={}, scores={}, nodes={}".format(
+                    tuple(adj_t.shape),
+                    tuple(candidate_scores.shape),
+                    tuple(candidate_nodes.shape),
+                )
+            )
+
+        if (
+                bool(include_behavior_logp)
+                and self.use_topology_persistence
+                and previous_adj is not None):
+            previous_adj_t = to_torch(previous_adj).to(candidate_scores.device)
+            if previous_adj_t.dim() == 2:
+                previous_adj_t = previous_adj_t.unsqueeze(0)
+            previous_adj_t = previous_adj_t[:, :, :self.num_factor]
+            if previous_adj_t.shape[:2] != adj_t.shape[:2]:
+                raise ValueError(
+                    "previous_adj must have batch/agent shape {}, got {}"
+                    .format(
+                        tuple(adj_t.shape[:2]),
+                        tuple(previous_adj_t.shape[:2]),
+                    )
+                )
+
+        margin_rows = []
+        selected_logp_rows = []
+        competitor_logp_rows = []
+        selected_index_rows = []
+        competitor_index_rows = []
+        rank_rows = []
+        valid_rows = []
+        forced_rows = []
+        order_rows = []
+        behavior_selected_logp_rows = []
+        for batch_index in range(candidate_scores.shape[0]):
+            scores = candidate_scores[batch_index]
+            active_nodes = exist_mask[batch_index] > 0.5
+            remaining = scores > 0.0
+            num_active = int(active_nodes.long().sum().item())
+            factor_budget = self._active_factor_budget(
+                num_active=num_active,
+                num_valid_candidates=int(remaining.long().sum().item()),
+            )
+            covered = torch.zeros_like(active_nodes)
+            selected_order3 = 0
+            sequential_slot = 0
+            margin_values = []
+            selected_logp_values = []
+            competitor_logp_values = []
+            selected_index_values = []
+            competitor_index_values = []
+            rank_values = []
+            valid_values = []
+            forced_values = []
+            order_values = []
+            behavior_selected_logp_values = []
+            differentiable_zero = scores.sum() * 0.0
+            for factor_index in range(adj_t.shape[-1]):
+                selected_nodes = (
+                    adj_t[batch_index, :, factor_index] > 0.5
+                )
+                selected_order = int(
+                    selected_nodes.long().sum().item()
+                )
+                if selected_order == 0:
+                    margin_values.append(differentiable_zero)
+                    selected_logp_values.append(differentiable_zero)
+                    competitor_logp_values.append(differentiable_zero)
+                    selected_index_values.append(-1.0)
+                    competitor_index_values.append(-1.0)
+                    rank_values.append(0.0)
+                    valid_values.append(0.0)
+                    forced_values.append(0.0)
+                    order_values.append(0.0)
+                    if bool(include_behavior_logp):
+                        behavior_selected_logp_values.append(
+                            differentiable_zero
+                        )
+                    continue
+                if selected_order not in (2, 3):
+                    raise RuntimeError(
+                        "selected-factor boundary found invalid factor order "
+                        "{}".format(selected_order)
+                    )
+                policy_probs, eligible = self._constrained_probabilities(
+                    scores=scores,
+                    candidate_nodes=candidate_nodes,
+                    remaining=remaining,
+                    covered=covered,
+                    active_nodes=active_nodes,
+                    slots_after=max(
+                        factor_budget - sequential_slot - 1,
+                        0,
+                    ),
+                    max_factor_order=self.highest_orders,
+                    require_connected=self.require_connected,
+                    temperature=1.0,
+                )
+                policy_probs, eligible, _ = self._apply_order3_band(
+                    policy_probs=policy_probs,
+                    eligible=eligible,
+                    candidate_nodes=candidate_nodes,
+                    scores=scores,
+                    selected_order3=selected_order3,
+                    factor_budget=factor_budget,
+                    slot=sequential_slot,
+                    num_active=num_active,
+                )
+                membership_match = torch.all(
+                    candidate_nodes == selected_nodes.unsqueeze(0),
+                    dim=1,
+                ) & remaining
+                matched = torch.where(membership_match)[0]
+                if matched.numel() != 1:
+                    canonical_match = torch.where(torch.all(
+                        candidate_nodes == selected_nodes.unsqueeze(0),
+                        dim=1,
+                    ))[0]
+                    if canonical_match.numel() == 1:
+                        canonical_index = int(canonical_match[0].item())
+                        if not bool((scores[canonical_index] > 0.0).item()):
+                            raise SelectedFactorInactiveCandidateError(
+                                batch_index=batch_index,
+                                factor_index=factor_index,
+                                candidate_index=canonical_index,
+                            )
+                    raise RuntimeError(
+                        "selected factor must match exactly one canonical "
+                        "candidate, got {}".format(int(matched.numel()))
+                    )
+                selected_index = int(matched[0].item())
+                if not bool(eligible[selected_index].item()):
+                    raise RuntimeError(
+                        "selected factor is not eligible at its stored "
+                        "sequential prefix"
+                    )
+                selected_probability = policy_probs[selected_index]
+                if bool(include_behavior_logp):
+                    if float(sampling_temperature) == 1.0:
+                        behavior_policy_probs = policy_probs
+                        behavior_eligible = eligible
+                    else:
+                        behavior_policy_probs, behavior_eligible = (
+                            self._constrained_probabilities(
+                                scores=scores,
+                                candidate_nodes=candidate_nodes,
+                                remaining=remaining,
+                                covered=covered,
+                                active_nodes=active_nodes,
+                                slots_after=max(
+                                    factor_budget - sequential_slot - 1,
+                                    0,
+                                ),
+                                max_factor_order=self.highest_orders,
+                                require_connected=self.require_connected,
+                                temperature=sampling_temperature,
+                            )
+                        )
+                        (
+                            behavior_policy_probs,
+                            behavior_eligible,
+                            _,
+                        ) = self._apply_order3_band(
+                            policy_probs=behavior_policy_probs,
+                            eligible=behavior_eligible,
+                            candidate_nodes=candidate_nodes,
+                            scores=scores,
+                            selected_order3=selected_order3,
+                            factor_budget=factor_budget,
+                            slot=sequential_slot,
+                            num_active=num_active,
+                        )
+                    if not bool(torch.equal(
+                            behavior_eligible,
+                            eligible,
+                    )):
+                        raise RuntimeError(
+                            "selected-factor boundary and behavior replay "
+                            "eligibility differ"
+                        )
+                    previous_nodes = None
+                    if (
+                            previous_adj_t is not None
+                            and factor_index < previous_adj_t.shape[-1]):
+                        previous_nodes = (
+                            previous_adj_t[batch_index, :, factor_index] > 0.5
+                        )
+                    _, behavior_probs, _, _ = (
+                        self._candidate_behavior_distribution(
+                            policy_probs=behavior_policy_probs,
+                            eligible=behavior_eligible,
+                            candidate_nodes=candidate_nodes,
+                            previous_nodes=previous_nodes,
+                        )
+                    )
+                    behavior_selected_logp_values.append(torch.log(
+                        behavior_probs[selected_index].clamp_min(1e-8)
+                    ))
+                alternatives = eligible.clone()
+                alternatives[selected_index] = False
+                alternative_indices = torch.where(
+                    alternatives & (policy_probs > 0.0)
+                )[0]
+                selected_logp = torch.log(
+                    selected_probability.clamp_min(1e-12)
+                )
+                if alternative_indices.numel() == 0:
+                    margin = differentiable_zero
+                    competitor_logp = differentiable_zero
+                    competitor_index = -1
+                    selected_rank = 1
+                    boundary_valid = 0.0
+                    forced = 1.0
+                else:
+                    alternative_probs = policy_probs[alternative_indices]
+                    relative_index = int(
+                        torch.argmax(alternative_probs).item()
+                    )
+                    competitor_index = int(
+                        alternative_indices[relative_index].item()
+                    )
+                    competitor_probability = policy_probs[competitor_index]
+                    competitor_logp = torch.log(
+                        competitor_probability.clamp_min(1e-12)
+                    )
+                    margin = selected_logp - competitor_logp
+                    canonical_indices = torch.arange(
+                        policy_probs.shape[0],
+                        device=policy_probs.device,
+                    )
+                    strictly_better = (
+                        eligible
+                        & (policy_probs > selected_probability)
+                    )
+                    tie_precedes = (
+                        eligible
+                        & (policy_probs == selected_probability)
+                        & (canonical_indices < selected_index)
+                    )
+                    selected_rank = 1 + int(
+                        (strictly_better | tie_precedes)
+                        .long().sum().item()
+                    )
+                    boundary_valid = 1.0
+                    forced = 0.0
+                margin_values.append(margin)
+                selected_logp_values.append(selected_logp)
+                competitor_logp_values.append(competitor_logp)
+                selected_index_values.append(float(selected_index))
+                competitor_index_values.append(float(competitor_index))
+                rank_values.append(float(selected_rank))
+                valid_values.append(boundary_valid)
+                forced_values.append(forced)
+                order_values.append(float(selected_order))
+
+                if selected_order == 3:
+                    selected_order3 += 1
+                remaining[selected_index] = False
+                covered = covered | candidate_nodes[selected_index]
+                sequential_slot += 1
+
+            margin_rows.append(torch.stack(margin_values))
+            selected_logp_rows.append(torch.stack(selected_logp_values))
+            competitor_logp_rows.append(torch.stack(competitor_logp_values))
+            selected_index_rows.append(
+                candidate_scores.new_tensor(selected_index_values)
+            )
+            competitor_index_rows.append(
+                candidate_scores.new_tensor(competitor_index_values)
+            )
+            rank_rows.append(candidate_scores.new_tensor(rank_values))
+            valid_rows.append(candidate_scores.new_tensor(valid_values))
+            forced_rows.append(candidate_scores.new_tensor(forced_values))
+            order_rows.append(candidate_scores.new_tensor(order_values))
+            if bool(include_behavior_logp):
+                behavior_selected_logp_rows.append(torch.stack(
+                    behavior_selected_logp_values
+                ))
+
+        result = {
+            "selected_margin": torch.stack(margin_rows),
+            "selected_logp": torch.stack(selected_logp_rows),
+            "competitor_logp": torch.stack(competitor_logp_rows),
+            "selected_candidate_index": torch.stack(selected_index_rows),
+            "competitor_candidate_index": torch.stack(competitor_index_rows),
+            "selected_rank": torch.stack(rank_rows),
+            "valid": torch.stack(valid_rows),
+            "forced": torch.stack(forced_rows),
+            "factor_order": torch.stack(order_rows),
+        }
+        if bool(include_behavior_logp):
+            result["behavior_selected_logp"] = torch.stack(
+                behavior_selected_logp_rows
+            )
+        for field_name, field_value in result.items():
+            if not bool(torch.isfinite(field_value).all().item()):
+                raise FloatingPointError(
+                    "non-finite selected-factor boundary field {}".format(
+                        field_name
+                    )
+                )
+        return result
 
     @staticmethod
     def canonical_candidate_ranks(candidate_scores, candidate_valid):
         """Rank canonical candidates with deterministic identity tie breaks.
 
-        The score is a positive graph-selection weight, not an independent
-        Bernoulli probability.  Ranks therefore provide the policy-relevant
-        relative diagnostic while preserving the fixed canonical catalog axis.
-        Invalid candidates receive rank zero.
+        Higher values have better rank. Invalid candidates receive rank zero.
         """
         if candidate_scores.shape != candidate_valid.shape:
             raise ValueError(
@@ -1181,26 +1867,33 @@ class Adj_Generator(nn.Module):
         return rank * valid.long()
 
     def _cache_candidate_behavior_metadata(
-            self, candidate_scores, candidate_nodes, exist_mask):
-        """Cache score/rank/valid/version in canonical candidate order."""
-        active_nodes = exist_mask > 0.5
-        candidate_valid = torch.all(
-            (~candidate_nodes.unsqueeze(0)) | active_nodes.unsqueeze(1),
-            dim=2,
-        ) & (candidate_scores > 0.0)
-        rank = self.canonical_candidate_ranks(
+            self,
             candidate_scores,
-            candidate_valid.to(candidate_scores.dtype),
+            candidate_nodes,
+            exist_mask,
+            adj):
+        """Cache first-reachable competitor margin/rank/valid/version."""
+        candidate_margin, candidate_valid = (
+            self._candidate_identity_replay_competitor_margins(
+                candidate_scores,
+                candidate_nodes,
+                exist_mask,
+                adj,
+            )
+        )
+        rank = self.canonical_candidate_ranks(
+            candidate_margin,
+            candidate_valid.to(candidate_margin.dtype),
         )
         policy_version = torch.full_like(
-            candidate_scores,
+            candidate_margin,
             float(self.candidate_policy_version),
         )
         self.last_candidate_behavior_metadata = torch.stack(
             [
-                candidate_scores.detach(),
-                rank.to(candidate_scores.dtype).detach(),
-                candidate_valid.to(candidate_scores.dtype).detach(),
+                candidate_margin.detach(),
+                rank.to(candidate_margin.dtype).detach(),
+                candidate_valid.to(candidate_margin.dtype).detach(),
                 policy_version.detach(),
             ],
             dim=-1,
@@ -1567,46 +2260,34 @@ class Adj_Generator(nn.Module):
                     break
 
                 if explore:
-                    epsilon = self.exploration_mix
-                    uniform_probs = (
-                        eligible.to(policy_probs.dtype)
-                        / float(eligible_count)
-                    )
-                    behavior_probs = (
-                        (1.0 - epsilon) * policy_probs
-                        + epsilon * uniform_probs
-                    )
-                    greedy_prob = float(self.current_greedy_sample_prob)
-                    greedy_idx = int(torch.argmax(policy_probs).item())
-                    mixture_idx = greedy_idx
-                    has_persistence_candidate = False
+                    previous_nodes = None
                     if (
                         previous_adj_t is not None
                         and slot < previous_adj_t.shape[-1]
                     ):
-                        previous_nodes = previous_adj_t[b, :, slot] > 0.5
-                        previous_order = int(
-                            previous_nodes.long().sum().item()
+                        previous_nodes = (
+                            previous_adj_t[b, :, slot] > 0.5
                         )
-                        if previous_order in (2, 3):
-                            previous_match = torch.all(
-                                candidate_nodes
-                                == previous_nodes.unsqueeze(0),
-                                dim=1,
-                            ) & eligible
-                            matched_previous = torch.where(previous_match)[0]
-                            if matched_previous.numel() > 0:
-                                mixture_idx = int(
-                                    matched_previous[0].item()
-                                )
-                                has_persistence_candidate = True
-                                persistence_candidate_count += 1
+                    (
+                        stochastic_probs,
+                        behavior_probs,
+                        mixture_idx,
+                        has_persistence_candidate,
+                    ) = self._candidate_behavior_distribution(
+                        policy_probs=policy_probs,
+                        eligible=eligible,
+                        candidate_nodes=candidate_nodes,
+                        previous_nodes=previous_nodes,
+                    )
+                    if has_persistence_candidate:
+                        persistence_candidate_count += 1
                     explored_decision_count += 1
+                    greedy_prob = float(self.current_greedy_sample_prob)
                     if sampling_rng.rand() < greedy_prob:
                         selected_idx = mixture_idx
                     else:
                         sample_probs = (
-                            behavior_probs.detach().cpu().numpy()
+                            stochastic_probs.detach().cpu().numpy()
                         )
                         sample_probs = np.maximum(sample_probs, 0.0)
                         sample_probs = sample_probs / max(
@@ -1619,14 +2300,7 @@ class Adj_Generator(nn.Module):
                                 p=sample_probs,
                             )
                         )
-                    selected_probability = (
-                        (1.0 - greedy_prob) * behavior_probs[selected_idx]
-                    )
-                    if selected_idx == mixture_idx:
-                        selected_probability = (
-                            selected_probability
-                            + behavior_probs.new_tensor(greedy_prob)
-                        )
+                    selected_probability = behavior_probs[selected_idx]
                     if has_persistence_candidate and selected_idx == mixture_idx:
                         persistence_selected_count += 1
                 else:
@@ -1690,15 +2364,6 @@ class Adj_Generator(nn.Module):
 
         A = self.gat(rnn_obs, exist_mask)
         pair_score, _ = self._pair_score(A, exist_mask)
-        behavior_candidate_scores, behavior_candidate_nodes = (
-            self._candidate_catalog(pair_score)
-        )
-        self._cache_candidate_behavior_metadata(
-            behavior_candidate_scores,
-            behavior_candidate_nodes,
-            exist_mask,
-        )
-
         # Training uses an epsilon mixture over the exact constrained policy;
         # the selected conditional behavior probability is stored for PPO.
         prob_adj, cond_adj = self._select_candidates(
@@ -1708,6 +2373,15 @@ class Adj_Generator(nn.Module):
             t_env=t_env,
             sampling_rng=self.eval_rng if use_eval_rng else self.rng,
             previous_adj=previous_adj,
+        )
+        behavior_candidate_scores, behavior_candidate_nodes = (
+            self._candidate_catalog(pair_score)
+        )
+        self._cache_candidate_behavior_metadata(
+            behavior_candidate_scores,
+            behavior_candidate_nodes,
+            exist_mask,
+            cond_adj,
         )
 
         entropy = self._candidate_entropy(pair_score, exist_mask)
@@ -1821,44 +2495,20 @@ class Adj_Generator(nn.Module):
                     slot=f,
                     num_active=num_active,
                 )
-                if self.exploration_mix > 0.0:
-                    eligible_count = eligible.float().sum().clamp_min(1.0)
-                    uniform_probs = (
-                        eligible.to(policy_probs.dtype) / eligible_count
+                previous_nodes = None
+                if (
+                    previous_adj_t is not None
+                    and f < previous_adj_t.shape[-1]
+                ):
+                    previous_nodes = previous_adj_t[b, :, f] > 0.5
+                _, behavior_probs, _, _ = (
+                    self._candidate_behavior_distribution(
+                        policy_probs=policy_probs,
+                        eligible=eligible,
+                        candidate_nodes=candidate_nodes,
+                        previous_nodes=previous_nodes,
                     )
-                    policy_probs = (
-                        (1.0 - self.exploration_mix) * policy_probs
-                        + self.exploration_mix * uniform_probs
-                    )
-                greedy_prob = float(self.current_greedy_sample_prob)
-                if greedy_prob > 0.0:
-                    greedy_idx = int(torch.argmax(policy_probs).item())
-                    mixture_idx = greedy_idx
-                    if (
-                        previous_adj_t is not None
-                        and f < previous_adj_t.shape[-1]
-                    ):
-                        previous_nodes = previous_adj_t[b, :, f] > 0.5
-                        previous_order = int(
-                            previous_nodes.long().sum().item()
-                        )
-                        if previous_order in (2, 3):
-                            previous_match = torch.all(
-                                candidate_nodes
-                                == previous_nodes.unsqueeze(0),
-                                dim=1,
-                            ) & eligible
-                            matched_previous = torch.where(previous_match)[0]
-                            if matched_previous.numel() > 0:
-                                mixture_idx = int(
-                                    matched_previous[0].item()
-                                )
-                    greedy_mass = torch.zeros_like(policy_probs)
-                    greedy_mass[mixture_idx] = greedy_prob
-                    policy_probs = (
-                        (1.0 - greedy_prob) * policy_probs
-                        + greedy_mass
-                    )
+                )
                 membership_match = torch.all(
                     candidate_nodes
                     == selected_nodes.unsqueeze(0),
@@ -1873,7 +2523,7 @@ class Adj_Generator(nn.Module):
                     continue
 
                 selected_idx = int(matched[0].item())
-                selected_probability = policy_probs[
+                selected_probability = behavior_probs[
                     selected_idx
                 ].clamp_min(eps)
                 prob_adj[b, selected_nodes, f] = selected_probability

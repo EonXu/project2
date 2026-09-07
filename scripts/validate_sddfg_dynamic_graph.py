@@ -28,8 +28,10 @@ from algorithms.sddfg.algorithm.rSDDFGPolicy import (
 )
 from algorithms.sddfg.r_sddfg import (
     R_SDDFG,
-    compute_capture_candidate_identity_loss,
-    compute_capture_outcome_factor_ppo_loss,
+    _project_gradients_onto_nonincreasing_halfspaces,
+    _project_with_current_candidate_priority,
+    compute_capture_candidate_identity_active_competitor_loss,
+    compute_identity_local_factor_ppo_loss,
 )
 from utils.adj_buffer import AdjPolicyBuffer
 from utils.graph_sampling import select_outcome_contrast_complete_episodes
@@ -87,7 +89,7 @@ def validate_capture_outcome_factor_loss():
     """Outcome mass must not shrink when unrelated factor slots are added."""
     ratio_small = torch.ones((2, 2), requires_grad=True)
     delta_small = torch.tensor([[0.25, 0.0], [-0.25, 0.0]])
-    small = compute_capture_outcome_factor_ppo_loss(
+    small = compute_identity_local_factor_ppo_loss(
         ratio_small,
         torch.clamp(ratio_small, 0.8, 1.2),
         delta_small,
@@ -97,7 +99,7 @@ def validate_capture_outcome_factor_loss():
     ratio_large = torch.ones((2, 6), requires_grad=True)
     delta_large = torch.zeros((2, 6))
     delta_large[:, 0] = delta_small[:, 0]
-    large = compute_capture_outcome_factor_ppo_loss(
+    large = compute_identity_local_factor_ppo_loss(
         ratio_large,
         torch.clamp(ratio_large, 0.8, 1.2),
         delta_large,
@@ -110,6 +112,28 @@ def validate_capture_outcome_factor_loss():
     assert small["negative_loss"].item() > 0.0
     large["positive_loss"].backward(retain_graph=True)
     assert ratio_large.grad[0, 0].item() < 0.0
+
+    sparse_delta = torch.zeros((3, 6))
+    sparse_delta[0, 0] = 0.25
+    sparse = compute_identity_local_factor_ppo_loss(
+        torch.ones((3, 6)),
+        torch.ones((3, 6)),
+        sparse_delta,
+        torch.ones((3, 6)),
+        torch.ones((3, 1)),
+        normalize_by_target_transitions=True,
+    )
+    single = compute_identity_local_factor_ppo_loss(
+        torch.ones((1, 6)),
+        torch.ones((1, 6)),
+        sparse_delta[:1],
+        torch.ones((1, 6)),
+        torch.ones((1, 1)),
+        normalize_by_target_transitions=True,
+    )
+    assert torch.allclose(sparse["loss"], single["loss"], atol=1e-7)
+    assert sparse["target_transition_count"].item() == 1.0
+    assert sparse["normalization_denominator"].item() == 1.0
     # Keep the preflight compatible with the older PyTorch used by the
     # training server, where torch.count_nonzero is not available.  These
     # entries must be exactly zero because none of the unrelated factors
@@ -118,29 +142,122 @@ def validate_capture_outcome_factor_loss():
 
 
 def validate_capture_candidate_identity_loss():
-    """Candidate-only supervision must be exact, signed and target-local."""
-    scores = torch.tensor(
-        [[0.5, 0.7, 0.9], [0.5, 0.7, 0.9]],
+    """Candidate supervision must optimize signed active-slot competition."""
+    margins = torch.tensor(
+        [[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]],
         requires_grad=True,
     )
     delta = torch.tensor([[0.2, 0.0, 0.0], [-0.2, 0.0, 0.0]])
-    result = compute_capture_candidate_identity_loss(
-        scores,
+    result = compute_capture_candidate_identity_active_competitor_loss(
+        margins,
+        margins.detach().clone(),
         delta,
-        torch.ones_like(scores),
+        torch.ones_like(margins),
         torch.ones((2, 1)),
     )
     assert result["positive_loss"].item() > 0.0
-    assert result["negative_loss"].item() < 0.0
+    assert result["negative_loss"].item() > 0.0
     result["positive_loss"].backward(retain_graph=True)
-    assert scores.grad[0, 0].item() < 0.0
-    assert torch.all(scores.grad[0, 1:] > 0.0).item()
-    assert torch.abs(scores.grad[1]).sum().item() == 0.0
-    scores.grad.zero_()
+    assert margins.grad[0, 0].item() < 0.0
+    assert torch.abs(margins.grad[0, 1:]).sum().item() == 0.0
+    assert torch.abs(margins.grad[1]).sum().item() == 0.0
+    margins.grad.zero_()
     result["negative_loss"].backward()
-    assert scores.grad[1, 0].item() > 0.0
-    assert torch.all(scores.grad[1, 1:] < 0.0).item()
-    assert torch.abs(scores.grad[0]).sum().item() == 0.0
+    assert margins.grad[1, 0].item() > 0.0
+    assert torch.abs(margins.grad[1, 1:]).sum().item() == 0.0
+    assert torch.abs(margins.grad[0]).sum().item() == 0.0
+
+    # Unsatisfied-target-transition normalization remains invariant. Adding
+    # an unrelated valid replay transition must not dilute the exact-identity
+    # objective or consume supervision mass.
+    augmented = compute_capture_candidate_identity_active_competitor_loss(
+        torch.tensor(
+            [
+                [-0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+            ]
+        ),
+        torch.tensor(
+            [
+                [-0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+            ]
+        ),
+        torch.tensor(
+            [
+                [0.2, 0.0, 0.0],
+                [-0.2, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        ),
+        torch.ones((3, 3)),
+        torch.ones((3, 1)),
+    )
+    assert torch.allclose(augmented["loss"], result["loss"], atol=1e-7)
+    assert augmented["valid_transition_count"].item() == 3.0
+    assert augmented["target_transition_count"].item() == 2.0
+
+    # Lifecycle v1 protected only the summed cached gradient.  Here that sum
+    # has a positive dot with the proposed update even though the first exact
+    # transition is harmed.  Version 2 must satisfy both transition-local
+    # halfspaces while retaining the orthogonal base component.
+    proposed = [torch.tensor([1.0, 0.0])]
+    constraints = [
+        [torch.tensor([-1.0, 1.0])],
+        [torch.tensor([2.0, -1.0])],
+    ]
+    projected, projection_info = (
+        _project_gradients_onto_nonincreasing_halfspaces(
+            proposed,
+            constraints,
+            proposed[0],
+        )
+    )
+    assert projection_info["constraint_count"] == 2.0
+    assert projection_info["active_constraint_count"] >= 1.0
+    assert all(
+        torch.dot(projected[0], constraint[0]).item() >= -1e-6
+        for constraint in constraints
+    )
+
+    # Lifecycle v3 must not turn a genuine current target into a fatal
+    # infeasible strict-descent assertion.  The compatible cached row remains
+    # protected and the exactly opposing stale row is explicitly superseded.
+    current = [torch.tensor([1.0, 0.0])]
+    projected, accepted, superseded, priority_info = (
+        _project_with_current_candidate_priority(
+            [torch.tensor([1.0, 1.0])],
+            current,
+            [
+                [torch.tensor([0.0, 1.0])],
+                [torch.tensor([-1.0, 0.0])],
+            ],
+            current[0],
+        )
+    )
+    assert accepted == [0]
+    assert superseded == [1]
+    assert priority_info["superseded_constraint_count"] == 1.0
+    assert torch.dot(projected[0], current[0]).item() > 0.0
+
+    raw_parameter_delta = torch.tensor([1.0, -0.5])
+    realized_descent = [-raw_parameter_delta]
+    displacement_constraints = [
+        [torch.tensor([1.0, 0.0])],
+        [torch.tensor([0.0, -1.0])],
+    ]
+    safe_descent, _ = _project_gradients_onto_nonincreasing_halfspaces(
+        realized_descent,
+        displacement_constraints,
+        realized_descent[0],
+    )
+    safe_parameter_delta = -safe_descent[0]
+    assert all(
+        torch.dot(item[0], safe_parameter_delta).item() <= 1e-6
+        for item in displacement_constraints
+    )
 
 
 def validate_adj_buffer():
@@ -269,6 +386,7 @@ def validate_adj_buffer():
                         buffer.success_now[step, episode_idx, 0] = 1.0
             buffer.dones_env[-1, episode_idx, 0] = 1.0
 
+        buffer.prob_adj[buffer.adj > 0] = 0.5
         buffer.compute_advantage(np.arange(num_episodes))
         expected_graph_ready = np.any(
             buffer.adj[
@@ -293,7 +411,15 @@ def validate_adj_buffer():
         )
         assert np.isfinite(computed).all()
         assert np.abs(computed).sum() > 0.0
-        assert buffer.pair_pursuit_credit[:, :num_episodes].sum() > 0.0
+        pair_credit = buffer.pair_pursuit_credit[:, :num_episodes]
+        if num_episodes == 1:
+            # Pair evidence with only one terminal-outcome class has no
+            # counterfactual baseline and must not invent positive credit.
+            assert np.count_nonzero(pair_credit) == 0
+        else:
+            assert np.any(pair_credit > 0.0)
+            assert np.any(pair_credit < 0.0)
+            assert abs(float(pair_credit.sum())) < 1e-6
         assert buffer.pair_transition_delay[:, :num_episodes].max() >= 1.0
         assert buffer.triplet_capture_quality[:, :num_episodes].sum() > 0.0
         assert np.all(
@@ -346,6 +472,13 @@ def validate_adj_buffer():
         expected_recent = min(num_episodes, 2)
         assert buffer.last_sample_episode_count == expected_recent
         assert buffer.last_sample_episode_indices.size == expected_recent
+        assert (
+            buffer.last_sample_selected_chunk_count
+            == buffer.last_sample_yielded_chunk_count
+        )
+        assert buffer.last_sample_dropped_chunk_count == 0
+        assert buffer.last_sample_duplicate_chunk_count == 0
+        assert buffer.last_sample_partition_valid == 1.0
         assert recent_samples[0][0].shape[0] >= 1
         assert len(recent_samples[0]) >= 30
         assert np.count_nonzero(recent_samples[0][3]) == 0, (
@@ -360,6 +493,17 @@ def validate_adj_buffer():
                 "negative capture outcome gate was lost before the "
                 "adjacency batch"
             )
+            sampled_pair_credit = recent_samples[0][15]
+            assert np.any(sampled_pair_credit > 0.0)
+            assert np.any(sampled_pair_credit < 0.0)
+            assert abs(float(sampled_pair_credit.sum())) <= 1e-6, (
+                "final optimizer pair cohort lost signed mass conservation"
+            )
+        if num_episodes <= 1:
+            assert np.count_nonzero(recent_samples[0][15]) == 0, (
+                "single-outcome optimizer pair cohort produced credit"
+            )
+        if num_episodes > 1:
             # Isolate replay-support rotation from outcome-credit scaling.
             # A successful episode may legitimately have zero final credit
             # when its graph advantage is non-positive, so the computed
@@ -557,6 +701,13 @@ def validate_adj_buffer():
             )
         )
         assert len(split_samples) == 2
+        assert (
+            buffer.last_sample_selected_chunk_count
+            == buffer.last_sample_yielded_chunk_count
+        )
+        assert buffer.last_sample_dropped_chunk_count == 0
+        assert buffer.last_sample_duplicate_chunk_count == 0
+        assert buffer.last_sample_partition_valid == 1.0
         for split_sample in split_samples:
             diagnostics = split_sample[29]
             # Window-class diagnostics are global to the current buffer and
@@ -596,6 +747,7 @@ def validate_candidate_only_replay_path():
     buffer.filled_i = 2
     buffer.current_i = 0
     buffer.episode_generation[:] = np.asarray([0, 1], dtype=np.int64)
+    buffer.environment_episode_id[:] = np.asarray([100, 101], dtype=np.int64)
     buffer._next_episode_generation = 2
     buffer.obs[:, :, :, :] = 0.1
     buffer.dones_env[:, :, 0] = 0.0
@@ -604,7 +756,21 @@ def validate_candidate_only_replay_path():
         # Exact capture pair (0, 1) is deliberately not active.
         buffer.adj[step, :, [0, 2], 0] = 1
         buffer.adj[step, :, [1, 3], 1] = 1
+    buffer.prob_adj[buffer.adj > 0] = 0.5
     pair_index = canonical_capture_factor_catalog(num_agents, 3).index((0, 1))
+    for episode in range(2):
+        buffer.capture_candidate_event_provenance[episode] = ({
+            "event_id": 10 + episode,
+            "target_id": 20 + episode,
+            "participant_slots": (0, 1),
+            "candidate_index": pair_index,
+            "candidate_identity": "0-1",
+            "candidate_order": 2,
+            "identity_event_weight": 1.0,
+            "environment_episode_id": 100 + episode,
+            "capture_step": 1,
+            "static_dynamic_class": "static",
+        },)
     buffer.capture_counts[1, :, 0] = 1.0
     buffer.capture_candidate_only_matches[1, :, pair_index] = 1.0
     buffer.capture_candidate_behavior[1, :, pair_index, :] = np.asarray(
@@ -618,12 +784,22 @@ def validate_candidate_only_replay_path():
         num_mini_batch=1,
         recent_episode_window=2,
     ))[0]
-    assert len(sample) >= 32
+    assert len(sample) == 35
     assert np.count_nonzero(sample[13]) == 0, (
         "candidate-only event leaked into active factor outcome credit"
     )
     candidate_delta = sample[30]
-    candidate_behavior = sample[31]
+    candidate_capture_context = sample[31]
+    candidate_behavior = sample[32]
+    replay_population_provenance = sample[33]
+    assert np.count_nonzero(candidate_capture_context) > 0
+    assert np.all(candidate_capture_context >= 0.0)
+    assert replay_population_provenance.shape == (
+        sample[0].shape[0],
+        sample[0].shape[1],
+        3,
+    )
+    assert np.count_nonzero(replay_population_provenance[..., 0]) == 0
     assert np.any(candidate_delta > 0.0)
     assert np.any(candidate_delta < 0.0)
     nonzero_candidates = np.any(
@@ -1153,18 +1329,25 @@ def main():
         assert bool(torch.isfinite(tensor).all().item())
 
     graph.zero_grad()
-    candidate_scores, candidate_valid = (
-        graph.evaluate_candidate_identity_scores(rnn_obs, dones)
+    candidate_margins, candidate_valid = (
+        graph.evaluate_candidate_identity_active_competitor_margins(
+            rnn_obs, dones, adj
+        )
     )
-    candidate_delta = torch.zeros_like(candidate_scores)
+    candidate_delta = torch.zeros_like(candidate_margins)
     # Use the three-active-agent row.  With exactly two active agents each GAT
     # row has only one legal neighbor, so softmax is identically one and the
     # exact pair score is mathematically parameter-independent (zero gradient).
     # The candidate objective must be checked where graph selection has a real
     # alternative.
-    candidate_delta[1, 0] = 0.2  # canonical pair (0, 1)
-    candidate_loss = compute_capture_candidate_identity_loss(
-        candidate_scores,
+    target_row = 1
+    target_columns = torch.where(candidate_valid[target_row] > 0.0)[0]
+    assert target_columns.numel() > 0
+    target_col = int(target_columns[0].item())
+    candidate_delta[target_row, target_col] = 0.2
+    candidate_loss = compute_capture_candidate_identity_active_competitor_loss(
+        candidate_margins,
+        candidate_margins.detach().clone(),
         candidate_delta,
         candidate_valid,
         torch.ones((batch_size, 1)),
@@ -1178,90 +1361,103 @@ def main():
     assert candidate_grad > 0.0
     graph.zero_grad()
 
-    # The production current-score path must move the exact pair weight in the
-    # signed direction after a real optimizer step.  Stored behavior metadata
-    # is detached and cannot satisfy this check.
+    # The production path must move the exact active-slot competitor margin in
+    # the signed direction after a real optimizer step.
     candidate_graph = copy.deepcopy(graph)
-    target_row = 1
-    target_col = 0
-    positive_before_scores, positive_before_valid = (
-        candidate_graph.evaluate_candidate_identity_scores(rnn_obs, dones)
+    positive_before_margins, positive_before_valid = (
+        candidate_graph.evaluate_candidate_identity_active_competitor_margins(
+            rnn_obs, dones, adj
+        )
     )
-    positive_before = float((
-        positive_before_scores[target_row, target_col]
-        / (
-            positive_before_scores[target_row]
-            * positive_before_valid[target_row]
-        ).sum()
-    ).detach().cpu().item())
+    assert positive_before_valid[target_row, target_col].item() == 1.0
+    positive_before = float(
+        positive_before_margins[
+            target_row, target_col
+        ].detach().cpu().item()
+    )
     positive_optimizer = torch.optim.SGD(
         candidate_graph.gat.parameters(), lr=1e-3
     )
     positive_optimizer.zero_grad()
-    positive_scores, positive_valid = (
-        candidate_graph.evaluate_candidate_identity_scores(rnn_obs, dones)
+    positive_margins, positive_valid = (
+        candidate_graph.evaluate_candidate_identity_active_competitor_margins(
+            rnn_obs, dones, adj
+        )
     )
-    positive_delta = torch.zeros_like(positive_scores)
+    positive_delta = torch.zeros_like(positive_margins)
     positive_delta[target_row, target_col] = 0.2
-    positive_loss = compute_capture_candidate_identity_loss(
-        positive_scores,
+    positive_loss = compute_capture_candidate_identity_active_competitor_loss(
+        positive_margins,
+        positive_before_margins.detach().clone(),
         positive_delta,
         positive_valid,
         torch.ones((batch_size, 1)),
     )["loss"]
     positive_loss.backward()
     positive_optimizer.step()
-    positive_after_scores, positive_after_valid = (
-        candidate_graph.evaluate_candidate_identity_scores(rnn_obs, dones)
+    positive_after_margins, positive_after_valid = (
+        candidate_graph.evaluate_candidate_identity_active_competitor_margins(
+            rnn_obs, dones, adj
+        )
     )
-    positive_after = float((
-        positive_after_scores[target_row, target_col]
-        / (
-            positive_after_scores[target_row]
-            * positive_after_valid[target_row]
-        ).sum()
-    ).detach().cpu().item())
+    assert positive_after_valid[target_row, target_col].item() == 1.0
+    positive_after = float(
+        positive_after_margins[
+            target_row, target_col
+        ].detach().cpu().item()
+    )
     assert positive_after > positive_before
 
     candidate_graph = copy.deepcopy(graph)
-    negative_before_scores, negative_before_valid = (
-        candidate_graph.evaluate_candidate_identity_scores(rnn_obs, dones)
+    negative_before_margins, negative_before_valid = (
+        candidate_graph.evaluate_candidate_identity_active_competitor_margins(
+            rnn_obs, dones, adj
+        )
     )
-    negative_before = float((
-        negative_before_scores[target_row, target_col]
-        / (
-            negative_before_scores[target_row]
-            * negative_before_valid[target_row]
-        ).sum()
-    ).detach().cpu().item())
+    assert negative_before_valid[target_row, target_col].item() == 1.0
+    negative_before = float(
+        negative_before_margins[
+            target_row, target_col
+        ].detach().cpu().item()
+    )
     negative_optimizer = torch.optim.SGD(
         candidate_graph.gat.parameters(), lr=1e-3
     )
     negative_optimizer.zero_grad()
-    negative_scores, negative_valid = (
-        candidate_graph.evaluate_candidate_identity_scores(rnn_obs, dones)
+    negative_margins, negative_valid = (
+        candidate_graph.evaluate_candidate_identity_active_competitor_margins(
+            rnn_obs, dones, adj
+        )
     )
-    negative_delta = torch.zeros_like(negative_scores)
+    negative_delta = torch.zeros_like(negative_margins)
     negative_delta[target_row, target_col] = -0.2
-    negative_loss = compute_capture_candidate_identity_loss(
-        negative_scores,
+    negative_loss = compute_capture_candidate_identity_active_competitor_loss(
+        negative_margins,
+        negative_before_margins.detach().clone(),
         negative_delta,
         negative_valid,
         torch.ones((batch_size, 1)),
     )["loss"]
+    negative_was_unsatisfied = negative_before > 0.0
+    if not negative_was_unsatisfied:
+        assert negative_loss.item() == 0.0
     negative_loss.backward()
     negative_optimizer.step()
-    negative_after_scores, negative_after_valid = (
-        candidate_graph.evaluate_candidate_identity_scores(rnn_obs, dones)
+    negative_after_margins, negative_after_valid = (
+        candidate_graph.evaluate_candidate_identity_active_competitor_margins(
+            rnn_obs, dones, adj
+        )
     )
-    negative_after = float((
-        negative_after_scores[target_row, target_col]
-        / (
-            negative_after_scores[target_row]
-            * negative_after_valid[target_row]
-        ).sum()
-    ).detach().cpu().item())
-    assert negative_after < negative_before
+    assert negative_after_valid[target_row, target_col].item() == 1.0
+    negative_after = float(
+        negative_after_margins[
+            target_row, target_col
+        ].detach().cpu().item()
+    )
+    if negative_was_unsatisfied:
+        assert negative_after < negative_before
+    else:
+        assert abs(negative_after - negative_before) <= 1e-8
     graph.zero_grad()
 
     # With persistence mass set to one in this isolated fixture, every
