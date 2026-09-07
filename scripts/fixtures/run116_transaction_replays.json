@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "source_run": "run116+run118",
+  "fixture_kind": "minimal_gradient_geometry_reconstruction",
+  "exact_failed_tensor_dump_available": false,
+  "limitations": "The two interrupted attempts retained only their tracebacks. Their pre-step model, batch, and optimizer tensors were not persisted. The fixtures therefore preserve the observed failure geometry and the final-v11 transaction metadata without claiming bitwise replay.",
+  "cases": [
+    {
+      "name": "run116_float32_lifecycle_residual",
+      "source": "interrupted_pre_v10_traceback",
+      "dtype": "float32",
+      "proposed": [1.0, 0.0],
+      "constraint": [-1e-08, 1.0],
+      "exact_signed_floor": 0.125,
+      "exact_signed_margin_after": 0.125,
+      "expected_linear_classification": "rounding_residual",
+      "expected_exact_classification": "held"
+    },
+    {
+      "name": "run116_material_lifecycle_reverse_control",
+      "source": "negative_control",
+      "dtype": "float32",
+      "proposed": [1.0, 0.0],
+      "constraint": [-0.01, 1.0],
+      "exact_signed_floor": 0.125,
+      "exact_signed_margin_after": 0.12,
+      "expected_linear_classification": "material_reverse",
+      "expected_exact_classification": "violated"
+    },
+    {
+      "name": "run116_current_priority_ordering",
+      "source": "interrupted_v10_priority_4_traceback",
+      "dtype": "float32",
+      "proposed": [1.0, 0.0],
+      "current_priorities": [
+        [1.0, 0.0],
+        [0.5, 0.5],
+        [1.0, 1.0],
+        [0.25, 1.0],
+        [-1.0, 2.0]
+      ],
+      "lifecycle_constraints": [
+        [0.0, 1.0]
+      ],
+      "expected_negative_priority_index_before": 4,
+      "expected_current_priorities_after": "strict_descent",
+      "expected_lifecycle_result": "accepted"
+    },
+    {
+      "name": "run115_multitarget_pending_equivalent",
+      "source": "run115_163200_equivalent_geometry",
+      "dtype": "float32",
+      "positive_target_count": 1,
+      "negative_target_count": 16,
+      "target_count": 17,
+      "expected_after": "all_strict_descent"
+    },
+    {
+      "name": "run116_final_v11_candidate_pair_lifecycle",
+      "source": "run116_progress_train_adj_transaction.csv",
+      "env_step": 176000,
+      "ppo_epoch_index": 0,
+      "optimizer_kind": "standard_adam",
+      "candidate_active": true,
+      "pair_target_count": 4,
+      "lifecycle_gradient_projection_intervened": true,
+      "lifecycle_actual_update_correction_intervened": true,
+      "pair_target_actual_min_descent_dot_before": 0.0001570029417052865,
+      "pair_target_actual_min_descent_dot_after": 0.0002547848562244326,
+      "score_correct_target_count": 4,
+      "score_reverse_target_count": 0,
+      "score_zero_target_count": 0,
+      "rollback_occurred": false
+    },
+    {
+      "name": "run118_boundary_after_step_lifecycle_violation",
+      "source": "run118_traceback_and_v13_boundary_transaction_csv",
+      "env_step": 182400,
+      "optimizer_step_occurred": true,
+      "transaction_row_persisted": false,
+      "observed_exact_lifecycle_violation_count": 1,
+      "boundary_signed_changes": [0.004, 0.002],
+      "candidate_loss_change": -0.01,
+      "lifecycle_signed_floor": [0.25, -0.1],
+      "full_step_lifecycle_signed_margin": [0.249, -0.09],
+      "backtracked_lifecycle_signed_margin": [0.2500002, -0.09],
+      "lifecycle_tolerance": [1e-06, 1e-06],
+      "expected_full_step": "reject",
+      "expected_backtracked_step": "accept",
+      "fixture_kind": "equivalent_exact_constraint_geometry"
+    },
+    {
+      "name": "run118_boundary_deficit_epoch_168800_3",
+      "source": "run118_progress_train_pair_selection_boundary_transaction.csv",
+      "env_step": 168800,
+      "ppo_epoch_index": 3,
+      "optimizer_kind": "pair_pending_adam",
+      "target_signs": [-1, 1, 1, 1, 1],
+      "target_weights": [
+        0.05000000074505806,
+        0.011442516930401325,
+        0.011796410195529461,
+        0.012161246500909328,
+        0.014599827118217945
+      ],
+      "pre_signed_margins": [
+        0.18732357025146484,
+        0.10160839557647705,
+        0.07509458065032959,
+        -0.8997468948364258,
+        -0.05443310737609863
+      ],
+      "observed_signed_margin_improvements": [
+        0.02542901039123535,
+        0.015077829360961914,
+        0.015339970588684082,
+        0.025307178497314453,
+        0.021888017654418945
+      ],
+      "expected_deficit_target_count": 2,
+      "expected_affordable_crossing_target": 4,
+      "fixture_kind": "exact_logged_boundary_rows_with_equivalent_linear_budget"
+    }
+  ]
+}
